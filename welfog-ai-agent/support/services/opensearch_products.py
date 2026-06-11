@@ -1,0 +1,3538 @@
+"""OpenSearch product search — filters by size, color, brand, price, SKU, pro_id, pagination."""
+import os
+import re
+from html import escape as html_escape
+from typing import Any, Optional
+
+import requests
+
+from services.welfog_api import _normalize_color, fetch_products_from_api
+
+IMAGE_BASE_URL = "https://d1f02fefkbso7w.cloudfront.net/"
+PAGE_SIZE = 8
+MAX_PAGE_SIZE = 20
+# Hide "View more" when the first page already shows fewer than this (avoids dead pagination).
+MIN_PRODUCTS_FOR_VIEW_MORE = 3
+
+_FILTER_STOP = frozenset(
+    {
+        "show", "dikha", "dikhao", "dikho", "dikhado", "de", "do", "please", "product", "products",
+        "item", "items", "kuch", "koi", "mujhe", "mere", "ko", "me", "mai", "main", "wala", "wali",
+        "wale", "according", "acc", "ke", "ki", "ka", "se", "par", "pe", "liye", "only", "sirf",
+        "bas", "sort", "sorted", "order", "by", "filter", "filtered", "with", "having", "h", "hai",
+        "kya", "ky", "hain", "the", "a", "an", "is", "are", "ka", "ke",
+        "neeche", "niche", "upar", "tak", "bhai", "sir", "dikana", "dikhao",
+        "batana", "batanao", "mereko", "mujhe", "dikjan", "dikjan", "maang", "mang",
+        "rha", "rhe", "fir", "firse", "phir", "phirse", "hisb", "hisaab", "hisab",
+        "accord", "options", "option", "available", "mil", "mile", "mila", "milna",
+        "kr", "krna", "karna", "bol", "bolo", "sun", "suno", "bta", "btana", "btado",
+        "coverz", "wala", "wali", "wale", "hue", "huye", "hain", "tha",
+        "the", "unka", "unki", "unke", "uske", "uska", "iski",
+        "color", "colour", "rang", "hu", "hun", "hoon", "hain", "rah", "raha", "rahe",
+        "rahi", "dikha", "dikhe", "dikhen", "chahiye", "chahie", "chaahiye",
+        "jara", "zara", "thoda", "thodi", "zaraa", "jarra", "dekho", "dekhna",
+        "bata", "batana", "batanaa", "dikana", "dikhana", "please", "plz",
+        "kesa", "kesa", "kaise", "kese", "kaisa", "kaisi", "theek", "thik",
+        "achha", "acha", "accha", "badhiya", "badiya", "shukriya", "thanks",
+        "puchh", "puch", "puchna", "bolna", "bolo", "bol", "sunna", "sunn",
+        "search", "krke", "krke", "bta", "btao", "dega", "karega", "krega",
+    }
+)
+
+_SIZE_PATTERNS = (
+    r"\bsize\s*[:=\-]?\s*(free\s*size|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?\s*(?:inch|in|cm)?)\b",
+    r"\bsize\s+(free\s*size|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?)\b",
+    r"\b(free\s*size)\b",
+    r"\b(\d+(?:\.\d+)?)\s*(?:inch|in|cm)\s+size\b",
+)
+_BRAND_STOP = frozenset(
+    {
+        "cheapest", "sasta", "saste", "expensive", "mehnga", "rating", "price", "sort",
+        "products", "product", "items", "item", "mobile", "phone", "case", "cover",
+        "ka", "ke", "ki", "ko", "hai", "h", "kya",
+    }
+)
+_BRAND_PATTERNS = (
+    r"\b([a-z0-9][a-z0-9\-]{1,30})\s+brand\s+ka\b",
+    r"\b([a-z0-9][a-z0-9\-]{1,30})\s+brand\s+ke\b",
+    r"\b([a-z0-9][a-z0-9\-]{1,30})\s+brand\b",
+    r"\bbrand\s*[:\-]?\s*([a-z0-9][a-z0-9\-]{1,30})(?!\s+ka\b)(?!\s+ke\b)",
+)
+# Hinglish: samsung ke liye cover, iphone ka case
+_BRAND_KE_KI_KA_PATTERNS = (
+    r"\b(samsung|iphone|apple|vivo|oppo|realme|redmi|xiaomi|oneplus|poco|motorola|nokia|honor|infinix|lg|tecno|itel)\s+(?:mobile|phone)?\s*(?:ke|ki|ka)\s+liye\b",
+    r"\b(samsung|iphone|apple|vivo|oppo|realme|redmi|xiaomi|oneplus|poco|motorola|nokia|honor|infinix|lg|tecno|itel)\s+(?:ke|ki|ka)\b",
+    r"\b(?:ke|ki|ka)\s+(samsung|iphone|apple|vivo|oppo|realme|redmi|xiaomi|oneplus|poco|motorola|nokia|honor|infinix|lg|tecno|itel)\b",
+)
+_PRICE_UNDER = (
+    r"(?:under|below|less\s+than|max|upto|up\s+to|within)\s*(?:rs\.?|₹|inr)?\s*(\d{2,7})",
+    r"(?:under|below|less\s+than|max|upto|up\s+to|within)\s*(\d{2,7})\s*(?:rs\.?|₹|inr)?",
+    r"(\d{2,7})\s*(?:rs\.?|₹|inr)?\s*(?:se\s+kam|tak|ya\s+kam|ya\s+niche|se\s+niche|se\s+under|wale|wali|walon)",
+    r"(?:sasta|saste|cheap|cheapest|kam\s+price|low\s+price|minimum\s+price)",
+)
+_PRICE_OVER = (
+    r"(?:above|over|more\s+than|min|at\s+least)\s*(?:rs\.?|₹|inr)?\s*(\d{2,7})",
+    r"(\d{2,7})\s*(?:rs\.?|₹|inr)?\s*(?:se\s+(?:zyada|upar|jyada|jyaada)|ya\s+(?:zyada|upar))",
+    r"(?:mehnga|mehenga|expensive|costly|high\s+price|maximum\s+price)",
+)
+_RATING_PATTERNS = (
+    r"(?:rating|rated|stars?)\s*(?:of\s+)?(?:at\s+least|min|minimum|>=?|above)?\s*(\d(?:\.\d)?)",
+    r"(\d(?:\.\d)?)\s*(?:star|stars|rating)",
+    r"\b(best|highest|top|acha|acchi|achha)\s+(?:rated|rating|stars?)\b",
+    r"\b(high|good)\s+rating\b",
+)
+_RATING_UNDER_PATTERNS = (
+    r"(?:under|below|less\s+than|low|kam|se\s+kam|se\s+niche)\s*(?:(\d(?:\.\d)?)\s*)?(?:star|stars|rating)",
+    r"(?:rating|stars?)\s*(?:under|below|low|kam|se\s+kam|se\s+niche)\s*(\d(?:\.\d)?)",
+    r"(\d(?:\.\d)?)\s*(?:star|stars|rating)\s*(?:se\s+kam|se\s+niche|ya\s+kam|under|below|tak)",
+    r"\blow\s+rating\b",
+)
+_GENERIC_BRAND_WORDS = frozenset(
+    {
+        "welfog", "no brand", "generic", "unbranded", "mobile", "phone", "product", "products",
+        "item", "items", "cover", "case", "your", "search", "brand",
+    }
+)
+_SKU_PATTERNS = (r"\bsku\s*[:\-#]?\s*([A-Za-z0-9][A-Za-z0-9_\-]{2,60})",)
+_PRO_ID_PATTERNS = (
+    r"\b(?:pro[_\s-]?id|product[_\s-]?id|pid)\s*[:\-#]?\s*(\d{4,12})",
+    r"\bproduct\s+id\s+(?:de\s+rha\s+hu|de\s+raha\s+hu|de\s+rahi\s+hu)\s+(\d{4,12})",
+    r"\b(\d{4,12})\s+iska\s+product\b",
+    r"\b(\d{6,12})\s+is\s+id\s+ke",
+    r"\bid\s+(\d{6,12})\s+ke\s+products?",
+    r"\bproducts?\s+(?:for|of)\s+(?:id\s+)?(\d{6,12})",
+)
+_SORT_PRICE_ASC = (
+    "cheapest", "sasta", "saste", "kam price", "low price", "price low", "price ascending",
+    "sort by price", "price sort low", "sabse sasta",
+)
+_SORT_PRICE_DESC = (
+    "expensive", "mehnga", "mehenga", "high price", "price high", "price descending",
+    "sabse mehnga",
+)
+_SORT_RATING = (
+    "best rating", "highest rating", "top rated", "rating high", "rating desc", "best rated",
+    "acha rating", "acchi rating",
+)
+_SORT_PURCHASE_ASC = ("low purchase", "purchase price low", "kam purchase")
+
+_COLOR_TYPO_MAP = {
+    "aasmani": "sky blue",
+    "asmani": "sky blue",
+    "aasmaani": "sky blue",
+    "neela": "blue",
+    "neeli": "blue",
+    "kala": "black",
+    "kaala": "black",
+    "safed": "white",
+    "laal": "red",
+    "lal": "red",
+    "hara": "green",
+    "peela": "yellow",
+    "blaack": "black",
+    "blak": "black",
+    "blck": "black",
+    "blk": "black",
+    "whit": "white",
+    "whte": "white",
+    "greeen": "green",
+    "gren": "green",
+    "grean": "green",
+    "grenn": "green",
+    "grenen": "green",
+    "blew": "blue",
+    "blu": "blue",
+    "rd": "red",
+    "yelow": "yellow",
+    "purpel": "purple",
+    "greay": "grey",
+    "gray": "grey",
+    "grey": "grey",
+    "orang": "orange",
+    "multicolour": "multicolor",
+}
+# American/British spellings stripped from title_query when a colour filter is active.
+_COLOR_SPELLING_VARIANTS: dict[str, tuple[str, ...]] = {
+    "grey": ("grey", "gray"),
+    "gray": ("grey", "gray"),
+    "black": ("black",),
+    "white": ("white",),
+    "green": ("green",),
+}
+# Title tokens that mean the same product type (cover vs bumper vs case).
+_PRODUCT_TYPE_SYNONYMS: dict[str, tuple[str, ...]] = {
+    "cover": ("cover", "covers", "case", "cases", "bumper", "back cover", "backcover", "skin"),
+    "case": ("case", "cases", "cover", "covers", "bumper", "back cover", "backcover"),
+    "bumper": ("bumper", "cover", "covers", "case", "cases", "back cover", "backcover"),
+    "charger": ("charger", "chargers", "charging", "adapter", "adaptor", "power bank", "powerbank"),
+}
+
+# Title phrases to drop when product_type is X (stops charger query showing covers).
+_TYPE_CONFLICT_EXCLUDES: dict[str, tuple[str, ...]] = {
+    "charger": ("cover", "case", "cases", "bumper", "back cover", "screen guard", "tempered glass", "protector glass"),
+    "adapter": ("cover", "case", "bumper", "back cover"),
+    "cable": ("cover", "case", "bumper", "back cover"),
+    "cover": ("charger", "charging cable", "usb cable", "power adapter", "wall charger", "car charger", "power bank"),
+    "case": ("charger", "charging cable", "power adapter", "wall charger", "car charger"),
+    "bumper": ("charger", "charging cable", "power adapter", "wall charger"),
+}
+_PRODUCT_NOUNS = frozenset(
+    {
+        "cover", "covers", "case", "cases", "bumper", "mobile", "phone", "charger",
+        "cable", "adapter", "earphone", "headphone", "earbuds", "watch", "shirt",
+        "shirts", "tshirt", "jeans", "jean", "shoe", "shoes", "sandal", "sandals",
+        "rice", "wheat", "jug", "bottle", "flour", "atta", "dal", "lentil", "oil",
+        "milk", "bread", "soap", "cream", "laptop", "tv", "fan", "bag", "bags",
+        "wallet", "belt", "kurta", "saree", "dress", "hoodie", "socks", "sock",
+        "pant", "pants", "trouser", "shorts", "toy", "book", "pen", "notebook",
+        "keyboard", "mouse", "speaker", "trimmer", "razor", "perfume", "lipstick",
+        "foundation", "serum", "shampoo", "conditioner", "towel", "bedsheet",
+        "pillow", "curtain", "mug", "glass", "spoon", "knife", "pan", "pot",
+    }
+)
+_COLOR_NAME_TOKENS = frozenset(
+    {
+        "black", "white", "red", "green", "blue", "yellow", "pink", "purple", "grey",
+        "gray", "orange", "brown", "silver", "gold", "navy", "maroon", "beige",
+        "kala", "safed", "laal", "lal", "neela", "hara", "peela",
+    }
+)
+# Material/finish in product title — NOT catalog colour (transparent cover ≠ color Transparent).
+_MATERIAL_TITLE_TOKENS = frozenset(
+    {
+        "transparent", "translucent", "crystal", "clear", "matte", "glossy", "frosted",
+        "silicone", "leather", "velvet", "rubber", "hybrid", "tempered",
+    }
+)
+_NOUN_TYPO_MAP = {
+    "covr": "cover", "covar": "cover", "cvr": "cover", "coverz": "cover", "coverzs": "cover",
+    "moblie": "mobile", "mobail": "mobile",
+    "tshrt": "tshirt", "tshirt": "tshirt", "jean": "jeans", "chargr": "charger", "botle": "bottle",
+    "shrt": "shirt", "sare": "saree", "kurtaa": "kurta",
+}
+# Words that must NEVER be treated as warehouse SKU codes (colours, product types, brands).
+_SKU_ATTRIBUTE_STOP = _COLOR_NAME_TOKENS | _PRODUCT_NOUNS | frozenset(
+    {
+        "multicolor", "multicolour", "multicoloured", "multicolored",
+        "oneplus", "iphone", "samsung", "redmi", "infinix", "vivo", "oppo", "realme",
+        "xiaomi", "poco", "motorola", "nokia", "apple", "google", "nothing", "honor",
+        "transparent", "crystal", "bumper", "tempered", "glass", "protector",
+    }
+)
+_SKU_STOP = frozenset(
+    {
+        "product", "products", "dikhao", "dikha", "dikho", "dikhado", "batao", "bata", "batana",
+        "batanao", "please", "welfog", "yah", "yh", "ye", "yeh", "he", "hai", "h", "iska", "iski",
+        "isko", "iske", "mereko", "mujhe", "mera", "mere", "dikana", "dikhaa", "search", "query",
+        "iska", "iski", "isko", "sku", "code", "number", "id",
+        "chahiye", "chahie", "chaahiye", "chahiyee", "chahiyye", "chahiyya", "chahiy",
+        "milega", "milegi", "chahiy", "lena", "dena", "lao", "laao", "dikhe", "dikhen",
+        "mast", "shaadi", "pehan", "pehn", "pehnna", "pehanne", "wedding", "liye", "ke",
+    }
+) | _SKU_ATTRIBUTE_STOP
+_CONFLICTING_COLOR_HINTS = {
+    "black": ("green", "red", "blue", "yellow", "pink", "orange", "purple", "multicolor", "multi color"),
+    "white": ("black", "green", "red", "blue", "multicolor"),
+    "green": ("red", "blue", "pink", "orange", "purple", "black"),
+    "red": ("green", "blue", "black"),
+    "blue": ("green", "red", "orange"),
+    "yellow": ("black", "blue", "green"),
+    "multicolor": (),
+}
+_UNDER_PRICE_MARKERS = re.compile(
+    r"(?:\bunder\b|\bbelow\b|less\s+than|\bupto\b|up\s+to|\bwithin\b|\bmax\b|"
+    r"\bse\s+kam\b|\bse\s+niche\b|\bke\s+neeche\b|\bke\s+niche\b|kam\s+price|kam\s+me|"
+    r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*(?:budget|range)\b|"
+    r"\bi\s+have\s+(?:only\s+)?(?:rs|₹|inr|\d)|\bbudget\s+of\b|"
+    r"இன்\s*கீழ்|கீழ்|க்கு\s*கீழ்|"
+    r"से\s*कम|से\s*नीचे|"
+    r"below\s+rs|rs\s+se\s+kam)",
+    re.IGNORECASE,
+)
+_BUDGET_AMOUNT_PATTERNS = (
+    r"\bi\s+have\s+(?:only\s+)?(?:rs\.?|₹|inr)?\s*(\d{2,7})\b",
+    r"\bi\s+have\s+(\d{2,7})\s*(?:rs\.?|₹|inr)\b",
+    r"\bbudget\s+(?:of|is)?\s*(?:rs\.?|₹|inr)?\s*(\d{2,7})\b",
+    r"(?:within|in)\s+(?:my|their|this|the)?\s*(?:budget|range)\s+(?:of\s+)?(?:rs\.?|₹|inr)?\s*(\d{2,7})\b",
+    r"(\d{2,7})\s*(?:rs\.?|₹|inr)\s+(?:budget|range|only|max)\b",
+    r"(?:rs\.?|₹|inr)\s*(\d{2,7})\s+(?:budget|range|only|max)\b",
+    r"(?:show|dikha\w*|get)\s+(?:me\s+)?(?:\w+\s+){0,6}(?:under|within|in)\s+(?:rs\.?|₹|inr)?\s*(\d{2,7})\b",
+    r"\b(?:mere|meri)\s+(?:pass|paas)\s+(?:\w+\s+){0,6}?(\d{2,7})\s*(?:rs\.?|₹|inr)?\b",
+    r"\b(?:pass|paas)\s+(?:\w+\s+){0,4}?(\d{2,7})\s*(?:rs\.?|₹|inr)\b",
+    r"(\d{2,7})\s*(?:rs\.?|₹|inr)\s+(?:h|hai|he|ha)\b",
+)
+_OVER_PRICE_MARKERS = re.compile(
+    r"(?:\babove\b|\bover\b|more\s+than|\bmin\b|at\s+least|\bse\s+upar\b|\bse\s+jyada\b|"
+    r"से\s*ज्यादा|இன்\s*மேல்|மேல்)",
+    re.IGNORECASE,
+)
+_RATING_CONTEXT = re.compile(
+    r"\b(?:rating|rated|stars?|star)\b|"
+    r"\b(?:jin|jinki|jo)\b[^\n]{0,80}\b(?:rating|stars?)\b",
+    re.IGNORECASE,
+)
+_RATING_ABOVE_PATTERNS = (
+    r"\b(?:rating|stars?)\s*(?:above|over|>\s*)\s*(\d(?:\.\d)?)\b",
+    r"\b(?:above|over)\s*(\d(?:\.\d)?)\s*(?:star|stars?|rating)\b",
+    r"\b(?:rating|stars?)\s+(?:more|greater|higher)\s+than\s+(\d(?:\.\d)?)\b",
+    r"\bhaving\s+rating\s+(?:more|greater|higher)\s+than\s+(\d(?:\.\d)?)\b",
+    r"\b(?:jin|jinki|jo)\b.*\b(?:rating|stars?)\b.*\b(?:above|over|upar|jyada|zyada|zada)\b.*?(\d(?:\.\d)?)",
+    r"\b(?:rating|stars?)\s*(\d(?:\.\d)?)\s*se\s+(?:jyada|zyada|zada|upar|zyaada)\b",
+)
+
+
+def _collapse_repeated_chars(word: str) -> str:
+    if not word:
+        return word
+    prev = None
+    w = word.lower()
+    while prev != w:
+        prev = w
+        w = re.sub(r"(.)\1+", r"\1", w)
+    return w
+
+
+def _catalog_colors_equivalent(card_color: str, requested: str) -> bool:
+    """Strict match on catalog color_name field (API uses e.g. Black, Green, Sky Blue)."""
+    if not card_color or not requested:
+        return False
+    a = card_color.strip().lower()
+    b = requested.strip().lower()
+    if a == b:
+        return True
+    if a in ("grey", "gray") and b in ("grey", "gray"):
+        return True
+    if a in ("sky blue", "light blue") and b in ("sky blue", "light blue"):
+        return True
+    na = _normalize_color(a) or a.title()
+    nb = _normalize_color(b) or b.title()
+    return na.lower() == nb.lower()
+
+
+def extract_color_and_product_title(text: str) -> tuple[Optional[str], str]:
+    """
+    Split user message into catalog colour + product-type title (cover, shirt…).
+    Avoids searching the whole sentence as product name.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return None, ""
+    low = raw.lower()
+    color: Optional[str] = None
+
+    short_hue = re.search(
+        r"\b(black|white|green|red|blue|yellow|pink|purple|orange|brown|grey|gray|navy|maroon|beige|silver|gold|linen)\s+(?:color|colour|rang)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if short_hue:
+        hue = normalize_color_fuzzy(short_hue.group(1))
+        if hue:
+            color = hue
+
+    compound_color = re.search(
+        r"\b([A-Za-z]{4,32})\s+(?:color|colour|rang)\b",
+        raw,
+        re.IGNORECASE,
+    )
+    if compound_color and not color:
+        cword = compound_color.group(1).strip()
+        if cword.lower() not in _FILTER_STOP and cword.lower() not in _PRODUCT_NOUNS:
+            hue = normalize_color_fuzzy(cword)
+            color = hue or (cword.title() if cword.islower() else cword)
+        elif not color:
+            color = normalize_color_fuzzy(raw)
+    for pat in (
+        r"\b(black|white|green|red|blue|yellow|pink|purple|orange|brown|grey|gray|navy|maroon|beige|silver|gold)\s+(?:color|colour|rang)\b",
+        r"\b(?:color|colour|rang)\s+(?:ke|ki|ka|me|mein)?\s*(black|white|green|red|blue|yellow|pink|purple|orange|brown|grey|gray|navy|maroon|beige|silver|gold)\b",
+        r"\b(black|white|green|red|blue|yellow|pink|purple|orange|brown|grey|gray)\s+(?:ke|ki|ka)\s+(?:cover|covers|case|shirt|mobile|phone)\b",
+    ):
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            hue = normalize_color_fuzzy(m.group(1))
+            if hue:
+                color = hue
+                break
+
+    title_parts: list[str] = []
+    for tok in re.findall(r"[a-z]+", low):
+        if tok in _FILTER_STOP or tok in _COLOR_NAME_TOKENS:
+            continue
+        mapped = _NOUN_TYPO_MAP.get(tok, tok)
+        collapsed = _collapse_repeated_chars(mapped)
+        mapped = _NOUN_TYPO_MAP.get(collapsed, collapsed)
+        if re.fullmatch(r"cover\w{0,4}", mapped) and mapped not in _PRODUCT_NOUNS:
+            mapped = "cover"
+        noun = mapped.rstrip("s") if mapped.endswith("s") and mapped[:-1] in _PRODUCT_NOUNS else mapped
+        if noun in _PRODUCT_NOUNS:
+            title_parts.append(noun)
+        elif mapped in _PRODUCT_NOUNS:
+            title_parts.append(mapped)
+    seen: set[str] = set()
+    nouns: list[str] = []
+    for n in title_parts:
+        if n not in seen:
+            seen.add(n)
+            nouns.append(n)
+    title = " ".join(nouns[:4])
+    if not title:
+        title = _extract_product_keywords(low)
+    if color and title:
+        title = _strip_color_from_title_query(title, color)
+    elif color:
+        scrub = low
+        for hue in _color_spelling_variants(color):
+            scrub = re.sub(rf"\b{re.escape(hue)}\b", " ", scrub, flags=re.IGNORECASE)
+        for w in ("color", "colour", "rang", "ke", "ki", "ka", "se", "me", "mein"):
+            scrub = re.sub(rf"\b{w}\b", " ", scrub)
+        title = _extract_product_keywords(scrub) or ""
+    if color:
+        if re.search(r"[a-z][A-Z]", color) or (len(color) >= 8 and color[0].isupper()):
+            pass
+        else:
+            color = _normalize_color(color) or color
+    return color, (title or "").strip()
+
+
+def normalize_color_fuzzy(text: str) -> Optional[str]:
+    """Map Hinglish / typo color words to catalog color_name (e.g. blaack → Black)."""
+    if not text:
+        return None
+    low = text.lower()
+    for token in re.findall(r"[a-z]+", low):
+        collapsed = _collapse_repeated_chars(token)
+        for candidate in (token, collapsed, _COLOR_TYPO_MAP.get(token), _COLOR_TYPO_MAP.get(collapsed)):
+            if not candidate:
+                continue
+            c = _normalize_color(candidate)
+            if c:
+                return c
+        if collapsed.startswith("blac") or token.startswith("blac"):
+            return "Black"
+        if collapsed.startswith("gre") or token.startswith("gre"):
+            return "Green"
+    return _normalize_color(low)
+
+
+def _looks_like_warehouse_sku(tok: str) -> bool:
+    """
+    Warehouse / catalog codes — not conversational words (any language).
+    Must contain a digit, or underscore/hyphen with alnum mix; not plain lowercase prose.
+    """
+    if not tok:
+        return False
+    t = tok.strip()
+    if len(t) < 4 or len(t) > 80:
+        return False
+    if t.isalpha() and t.islower():
+        return False
+    if re.fullmatch(r"(?i)sku", t):
+        return False
+    if re.search(r"\d", t):
+        if "_" in t or "-" in t:
+            return True
+        if sum(1 for c in t if c.isupper()) >= 1 and sum(1 for c in t if c.isdigit()) >= 1:
+            return True
+        if t.isupper() and len(t) >= 5:
+            return True
+        if len(t) >= 6:
+            return True
+    if "_" in t and re.search(r"[A-Za-z0-9]", t):
+        return True
+    return False
+
+
+def _is_valid_sku_token(tok: str, *, explicit_sku_mention: bool = False) -> bool:
+    """Safety net only — shape + stop lists; meaning comes from Groq product AI."""
+    if not tok:
+        return False
+    t = tok.strip()
+    if explicit_sku_mention and 4 <= len(t) <= 80 and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_\-]*", t):
+        tl = t.lower()
+        if tl not in _SKU_STOP and tl not in _FILTER_STOP and tl not in _SKU_ATTRIBUTE_STOP:
+            if t.isupper() and sum(1 for c in t if c.isalpha()) >= 3:
+                return True
+            if re.search(r"[\-_]", t) and sum(1 for c in t if c.isalpha()) >= 3:
+                return True
+    if not _looks_like_warehouse_sku(tok):
+        return False
+    tl = tok.strip().lower()
+    norm = _collapse_repeated_chars(tl)
+    if (
+        tl in _SKU_STOP
+        or norm in _SKU_STOP
+        or tl in _FILTER_STOP
+        or norm in _FILTER_STOP
+        or tl in _SKU_ATTRIBUTE_STOP
+        or norm in _SKU_ATTRIBUTE_STOP
+    ):
+        return False
+    if re.fullmatch(r"(?i)sku", tok):
+        return False
+    if tok[0].isupper() and tok[1:].islower() and tok.isalpha():
+        try:
+            from services.welfog_api import get_category_id_from_text
+
+            if get_category_id_from_text(tok):
+                return False
+        except ImportError:
+            pass
+    return True
+
+
+def _sku_token_acceptable(tok: str, *, explicit_sku_mention: bool = False) -> bool:
+    if not tok:
+        return False
+    if _is_valid_sku_token(tok, explicit_sku_mention=explicit_sku_mention):
+        return True
+    return explicit_sku_mention and _looks_like_spaced_catalog_sku(tok)
+
+
+def _normalize_explicit_sku_capture(raw_tok: str) -> str:
+    tok = re.sub(r"\s+", " ", (raw_tok or "").strip())
+    if not tok:
+        return ""
+    tok = re.split(
+        r"\s+(?:yeh|ye|this)\s+(?:sku|product)\b",
+        tok,
+        maxsplit=1,
+        flags=re.I,
+    )[0].strip()
+    return tok
+
+
+def _looks_like_spaced_catalog_sku(tok: str) -> bool:
+    """Warehouse SKUs like 'NFINIX HOT 10 PLAY-EGL-SP' after explicit sku ka product."""
+    if not tok or len(tok) < 6 or len(tok) > 80:
+        return False
+    t = re.sub(r"\s+", " ", tok.strip())
+    if not re.search(r"[A-Za-z]", t) or not re.search(r"[\-_]", t):
+        return False
+    if sum(1 for c in t if c.isupper()) < 3:
+        return False
+    tl = t.lower()
+    if tl in _SKU_STOP or tl in _FILTER_STOP:
+        return False
+    return True
+
+
+def _extract_sku_from_text(raw: str) -> Optional[str]:
+    """
+    Explicit SKU mentions only — never guess SKU from random long words (any language).
+    """
+    if not raw:
+        return None
+    candidates: list[tuple[int, str]] = []
+
+    for m in re.finditer(
+        r"\b([A-Za-z0-9][A-Za-z0-9_\-]{3,80})\s+(?:is\s+|ka\s+)?sku\b",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = m.group(1).strip()
+        if _is_valid_sku_token(tok, explicit_sku_mention=True):
+            candidates.append((100, tok))
+    for m in re.finditer(
+        r"\b([A-Za-z0-9][A-Za-z0-9_\-]{3,80})\s+is\s+sku\s+ka\b",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = m.group(1).strip()
+        if _sku_token_acceptable(tok, explicit_sku_mention=True):
+            candidates.append((101, tok))
+    for m in re.finditer(
+        r"\b([A-Za-z0-9][A-Za-z0-9_\-]{3,80})\s+sku\b",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = m.group(1).strip()
+        if _is_valid_sku_token(tok, explicit_sku_mention=True):
+            candidates.append((100, tok))
+
+    for m in re.finditer(
+        r"\bsku\s*[:\-#]?\s*([A-Za-z0-9][A-Za-z0-9_\-]{3,80})",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = m.group(1).strip()
+        if _is_valid_sku_token(tok, explicit_sku_mention=True):
+            candidates.append((90, tok))
+
+    for m in re.finditer(
+        r"\b(?:product|item|warehouse)\s+code\s*[:\-#]?\s*([A-Za-z0-9][A-Za-z0-9_\-]{3,80})",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = m.group(1).strip()
+        if _is_valid_sku_token(tok):
+            candidates.append((85, tok))
+
+    for m in re.finditer(
+        r"\bsku\s+ka\s+product\b[^\n]{0,50}?(?:dikha\w*|show|find|de|bata\w*)\s+(.+?)\s*$",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = _normalize_explicit_sku_capture(m.group(1))
+        if _sku_token_acceptable(tok, explicit_sku_mention=True):
+            candidates.append((95, tok))
+    for m in re.finditer(
+        r"\b(?:yeh|ye|this)\s+sku\s+ka\s+product\b[^\n]{0,50}?(?:dikha\w*|show|find|de)\s+(.+?)\s*$",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = _normalize_explicit_sku_capture(m.group(1))
+        if _sku_token_acceptable(tok, explicit_sku_mention=True):
+            candidates.append((96, tok))
+
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (-x[0], -len(x[1])))
+    return candidates[0][1]
+
+
+def _turn_mentions_rating_filter(text: str) -> bool:
+    return bool(_RATING_CONTEXT.search(text or ""))
+
+
+def _user_mentions_price_this_turn(text: str) -> bool:
+    """True when the user explicitly asked for a money/budget filter this turn."""
+    low = (text or "").lower()
+    if not low.strip():
+        return False
+    if re.search(r"\b(?:rs|₹|rupee|rupees|inr|budget|price|priced)\b", low, re.I):
+        return True
+    if any(re.search(p, low, re.I) for p in _PRICE_UNDER + _PRICE_OVER):
+        return True
+    for pat in _BUDGET_AMOUNT_PATTERNS:
+        if re.search(pat, low, re.I):
+            return True
+    if re.search(r"\b(\d{2,7})\s*se\s+kam\b", low):
+        return True
+    if re.search(r"\b(?:range|hissab|hisaab|hisab)\s+ke\s+andar\b", low):
+        return True
+    if re.search(r"\b\d{2,7}\s*(?:rs|₹|rupees?|inr)?\s+ki\s+range\b", low, re.I):
+        return True
+    if re.search(r"\b(?:under|below|upto)\b", low) and re.search(r"\d", low):
+        return True
+    return False
+
+
+def _extract_rating_bounds_from_text(low: str) -> tuple[Optional[float], Optional[float]]:
+    """Parse rating_min / rating_max without treating stars as rupees."""
+    rmin = rmax = None
+    for pat in _RATING_UNDER_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            star_cap = None
+            if m.lastindex and m.group(1):
+                try:
+                    star_cap = float(m.group(1))
+                except ValueError:
+                    star_cap = None
+            if star_cap is None and re.search(r"\blow\s+rating\b", low):
+                star_cap = 3.0
+            if star_cap is not None:
+                rmax = star_cap
+            break
+    m_under_rating = re.search(
+        r"\b(?:rating|stars?)\s+(?:under|below|kam|se\s+kam|se\s+niche)\s+(\d(?:\.\d)?)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if m_under_rating and rmax is None:
+        try:
+            rmax = float(m_under_rating.group(1))
+        except ValueError:
+            pass
+    m_jinki_under = re.search(
+        r"\b(?:jin|jinki|jo)\b.*\b(?:rating|stars?)\b.*\b(?:under|below|kam|niche|se\s+kam)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if m_jinki_under and rmax is None:
+        m_num = re.search(r"\b(\d(?:\.\d)?)\b", low[m_jinki_under.end() : m_jinki_under.end() + 50])
+        if m_num:
+            try:
+                rmax = float(m_num.group(1))
+            except ValueError:
+                pass
+    for pat in _RATING_ABOVE_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m and m.lastindex:
+            try:
+                rmin = float(m.group(1))
+            except ValueError:
+                pass
+            break
+    m_jinki = re.search(
+        r"\b(?:jin|jinki|jo)\b.*\b(?:rating|stars?)\b.*\b(?:above|over|upar|jyada|zyada|zada|se)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if m_jinki and rmin is None:
+        m_num = re.search(r"\b(\d(?:\.\d)?)\b", low[m_jinki.end() : m_jinki.end() + 40])
+        if not m_num:
+            m_num = re.search(r"\b(\d(?:\.\d)?)\b", low)
+        if m_num:
+            try:
+                rmin = float(m_num.group(1))
+            except ValueError:
+                pass
+        if rmin is None and re.search(r"\b(?:above|over|upar|jyada)\s*0\b", low):
+            rmin = 0.01
+    return rmin, rmax
+
+
+def _scrub_price_filters_on_rating_turn(spec: dict[str, Any], text: str) -> None:
+    """Remove purchase_price_* when user asked for rating, not rupees."""
+    if not spec or not _turn_mentions_rating_filter(text):
+        return
+    if not _user_mentions_price_this_turn(text):
+        spec.pop("purchase_price_min", None)
+        spec.pop("purchase_price_max", None)
+        spec.pop("unit_price_min", None)
+        spec.pop("unit_price_max", None)
+
+
+def _extract_price_bounds(raw: str, low: str) -> tuple[Optional[float], Optional[float]]:
+    """Detect under/over price in any language (digits stay in original script)."""
+    combined = f"{raw} {low}"
+    low_s = (low or combined).lower()
+    if _turn_mentions_rating_filter(combined) and not re.search(
+        r"\b(?:rs|₹|rupee|rupees|inr|budget|price)\b", low_s, re.I
+    ):
+        return None, None
+    nums = [float(n) for n in re.findall(r"\d{2,7}", combined)]
+    if not nums:
+        lone = re.findall(r"\b(\d{1,7})\b", combined)
+        if lone and re.search(
+            r"\b(?:rs|₹|rupee|inr|price|budget|under|above|over|kam|sasta|mehnga)\b",
+            low_s,
+            re.I,
+        ):
+            nums = [float(x) for x in lone if int(x) > 0]
+        if not nums:
+            return None, None
+    price_max = None
+    price_min = None
+    for pat in _BUDGET_AMOUNT_PATTERNS:
+        m = re.search(pat, low_s, re.IGNORECASE)
+        if m and m.group(1).isdigit():
+            price_max = float(m.group(1))
+            break
+    if _UNDER_PRICE_MARKERS.search(combined) and price_max is None:
+        price_max = nums[0]
+    if _OVER_PRICE_MARKERS.search(combined) and not (
+        _turn_mentions_rating_filter(combined)
+        and not re.search(r"\b(?:rs|₹|rupee|inr|budget|price)\b", low_s, re.I)
+    ):
+        price_min = nums[0]
+    for pat in _PRICE_UNDER:
+        m = re.search(pat, low_s, re.IGNORECASE)
+        if m and m.lastindex and str(m.group(1)).isdigit():
+            price_max = float(m.group(1))
+            break
+    for pat in _PRICE_OVER:
+        m = re.search(pat, low_s, re.IGNORECASE)
+        if m and m.lastindex and str(m.group(1)).isdigit():
+            price_min = float(m.group(1))
+            break
+    m_kam = re.search(r"(\d{2,7})\s*se\s+kam", low_s)
+    if m_kam:
+        price_max = float(m_kam.group(1))
+    m_neeche = re.search(r"(\d{2,7})\s*ke\s+neeche", low_s)
+    if m_neeche:
+        price_max = float(m_neeche.group(1))
+    if re.search(r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*range\b", low_s):
+        if price_max is None and nums:
+            price_max = nums[0]
+    if re.search(r"\b(?:range|hissab|hisaab|hisab)\s+ke\s+andar\b", low_s) and nums:
+        if price_max is None:
+            price_max = nums[0]
+    m_ki_range = re.search(
+        r"\b(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\s+ki\s+range\b",
+        low_s,
+        re.I,
+    )
+    if m_ki_range and price_max is None:
+        price_max = float(m_ki_range.group(1))
+        price_min = None
+    m_budget_rs = re.search(
+        r"\b(\d{2,7})\s*rs\s+(?:h|hai|hain|he)\b|\b(\d{2,7})\s*rs\s+(?:ke\s+)?(?:hisaab|hisaab|hisab|according)\b",
+        low_s,
+        re.I,
+    )
+    if m_budget_rs and price_max is None:
+        g = m_budget_rs.group(1) or m_budget_rs.group(2)
+        if g and g.isdigit():
+            price_max = float(g)
+    m_between = re.search(
+        r"\b(?:between|from)\s+(\d{2,7})\s+(?:and|to|-|–)\s+(\d{2,7})\b",
+        low_s,
+        re.I,
+    )
+    if not m_between:
+        m_between = re.search(
+            r"\b(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\s*(?:se|to|-|–)\s*(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\b",
+            low_s,
+            re.I,
+        )
+    if not m_between:
+        m_between = re.search(
+            r"\b(\d{2,7})\s+se\s+(\d{2,7})\s*(?:rs|₹|rupees?|inr|tk|tak)?\b",
+            low_s,
+            re.I,
+        )
+    if not m_between and len(nums) >= 2 and re.search(
+        r"\b(?:range|hissaab|hisaab|hisab|between|se|to)\b", low_s, re.I
+    ):
+        a, b = sorted(nums[:2])
+        price_min = a
+        price_max = b
+    elif m_between:
+        a, b = float(m_between.group(1)), float(m_between.group(2))
+        price_min, price_max = (min(a, b), max(a, b))
+    return price_max, price_min
+
+
+def _merge_title_queries(left: str, right: str) -> str:
+    """Merge EN + original title hints without duplicating the same product noun."""
+    a = (left or "").strip()
+    b = (right or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    if a.lower() == b.lower():
+        return a
+    seen: set[str] = set()
+    out: list[str] = []
+    for tok in (a + " " + b).split():
+        tl = tok.lower()
+        if tl in seen:
+            continue
+        seen.add(tl)
+        out.append(tok)
+    return " ".join(out[:6])
+
+
+def _merge_filter_specs(*specs: dict[str, Any]) -> dict[str, Any]:
+    merged: dict[str, Any] = {
+        "title_query": "",
+        "color": None,
+        "size": None,
+        "brand": None,
+        "sku": None,
+        "pro_id": None,
+        "category_id": None,
+        "unit_price_min": None,
+        "unit_price_max": None,
+        "purchase_price_min": None,
+        "purchase_price_max": None,
+        "rating_min": None,
+        "rating_max": None,
+        "in_stock_only": False,
+        "sort": None,
+    }
+    for spec in specs:
+        if not spec:
+            continue
+        for key, val in spec.items():
+            if val is None or val == "" or val is False:
+                continue
+            if key == "sku" and merged.get("sku"):
+                if _is_valid_sku_token(str(val)) and not _is_valid_sku_token(str(merged["sku"])):
+                    merged["sku"] = val
+                elif _is_valid_sku_token(str(merged["sku"])):
+                    pass
+                elif len(str(val)) > len(str(merged["sku"])):
+                    merged["sku"] = val
+            elif key == "brand" and merged.get("brand"):
+                pass
+            elif key == "title_query" and merged.get("title_query"):
+                merged["title_query"] = _merge_title_queries(str(merged["title_query"]), str(val))
+            else:
+                merged[key] = val
+    if merged.get("sku") and not _sku_token_acceptable(
+        str(merged["sku"]), explicit_sku_mention=True
+    ):
+        merged["sku"] = None
+    return merged
+
+
+def _clean_title_hint(hint: str) -> str:
+    from services.product_query_understanding import dedupe_search_terms, is_noisy_search_query
+
+    h = dedupe_search_terms((hint or "").strip())
+    if is_noisy_search_query(h):
+        return ""
+    h = _strip_size_from_title_query(h, _extract_size_from_text(h))
+    return " ".join(h.split()).strip()
+
+
+def build_product_search_spec(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    category_id: Optional[int] = None,
+    color: Optional[str] = None,
+    title_hint: str = "",
+    pro_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """
+    Parse filters from original + translated text so SKU/price survive translation.
+    Original message is preferred for SKU codes and numeric price limits.
+    """
+    hint = _clean_title_hint(title_hint)
+    spec_orig = parse_product_filters_from_text(
+        original_msg or "",
+        category_id=category_id,
+        color=color,
+        title_hint="",
+        pro_id=pro_id,
+    )
+    spec_en = parse_product_filters_from_text(
+        f"{msg_en} {hint}".strip(),
+        category_id=category_id,
+        color=color or spec_orig.get("color"),
+        title_hint="",
+        pro_id=pro_id,
+    )
+    merged = _merge_filter_specs(spec_orig, spec_en)
+    pmax, pmin = _extract_price_bounds(original_msg or "", (msg_en or "").lower())
+    if pmax is not None:
+        merged["purchase_price_max"] = pmax
+    if pmin is not None:
+        merged["purchase_price_min"] = pmin
+    kw = _extract_product_keywords((msg_en or original_msg or "").lower())
+    if merged.get("sku"):
+        merged["title_query"] = kw or ""
+    elif kw and not merged.get("title_query"):
+        merged["title_query"] = kw
+    elif merged.get("title_query"):
+        cleaned = [
+            w
+            for w in merged["title_query"].split()
+            if w.lower() not in _FILTER_STOP and not w.isdigit()
+        ]
+        merged["title_query"] = " ".join(cleaned[:6])
+    literal_brand = _extract_brand_literal_from_text(original_msg or "")
+    if literal_brand:
+        merged["brand"] = literal_brand
+    merged = finalize_catalog_search_spec(merged, original_msg, msg_en)
+    merged = reconcile_catalog_spec_with_user_turn(
+        merged, original_msg, msg_en, ctx=None, ai_route=None
+    )
+    return sanitize_product_search_spec(merged)
+
+
+def _extract_product_keywords(low: str) -> str:
+    if is_price_or_rating_browse_turn(low):
+        return ""
+    if re.search(r"\bsim\b", low) and re.search(
+        r"\b(?:pin\b|nikal|ejector|tray|tool|opener|remover)",
+        low,
+        re.I,
+    ):
+        if not re.search(r"\b(?:pincode|pin\s*code)\b", low):
+            return "sim ejector pin"
+    words = []
+    if re.search(r"\b(?:shoe|shwo|sho)\s+me\b", low):
+        low = re.sub(r"\b(?:shoe|shwo|sho)\s+me\b", " ", low)
+    for tok in re.findall(r"[a-z]+", low):
+        if tok in ("shoe", "shwo", "sho") and re.search(r"\b(?:dikha|dikhao|cover|color|colour)\b", low):
+            continue
+        if len(tok) <= 2 and tok not in _PRODUCT_NOUNS:
+            continue
+        if tok in _FILTER_STOP:
+            continue
+        mapped = _NOUN_TYPO_MAP.get(tok, tok)
+        collapsed = _collapse_repeated_chars(mapped)
+        mapped = _NOUN_TYPO_MAP.get(collapsed, collapsed)
+        if mapped in _PRODUCT_NOUNS:
+            words.append(mapped.rstrip("s") if mapped.endswith("s") and mapped[:-1] in _PRODUCT_NOUNS else mapped)
+        elif mapped.endswith("s") and mapped[:-1] in _PRODUCT_NOUNS:
+            words.append(mapped[:-1])
+        elif mapped in ("tshirt", "tee"):
+            words.append("tshirt")
+    seen = set()
+    out = []
+    for w in words:
+        if w not in seen:
+            seen.add(w)
+            out.append(w)
+    return " ".join(out[:6])
+
+
+def _post_filter_mode_for_spec(spec: dict[str, Any]) -> str:
+    """Strict title tokens only when user named a brand/model; else colour/OS filters only."""
+    if spec.get("title_match_strict") or spec.get("brand"):
+        return "strict"
+    if spec.get("mandatory_match_tokens") and spec.get("brand_aliases"):
+        return "strict"
+    return "os_filters_only"
+
+
+def has_structured_product_filters(spec: dict[str, Any]) -> bool:
+    return any(
+        [
+            spec.get("sku"),
+            spec.get("color"),
+            spec.get("pro_id"),
+            spec.get("brand"),
+            spec.get("size"),
+            spec.get("unit_price_max") is not None,
+            spec.get("unit_price_min") is not None,
+            spec.get("purchase_price_max") is not None,
+            spec.get("purchase_price_min") is not None,
+        ]
+    )
+
+
+def format_filter_display_label(spec: dict[str, Any]) -> str:
+    """Human label for what the user asked — avoid 'Black colour black shirt'."""
+    title = (spec.get("title_query") or "").strip()
+    if title:
+        extras = []
+        if spec.get("sku") and _is_valid_sku_token(str(spec["sku"])):
+            extras.append(f"SKU {spec['sku']}")
+        if spec.get("purchase_price_max") is not None:
+            extras.append(f"under Rs {int(spec['purchase_price_max'])}")
+        elif spec.get("unit_price_max") is not None:
+            extras.append(f"under Rs {int(spec['unit_price_max'])}")
+        if spec.get("purchase_price_min") is not None:
+            extras.append(f"above Rs {int(spec['purchase_price_min'])}")
+        elif spec.get("unit_price_min") is not None:
+            extras.append(f"above Rs {int(spec['unit_price_min'])}")
+        if spec.get("rating_min") is not None:
+            try:
+                from services.catalog_spec_semantics import rating_min_display_label
+
+                extras.append(rating_min_display_label(spec["rating_min"]))
+            except ImportError:
+                extras.append(f"rating {spec['rating_min']}+ stars")
+        if spec.get("rating_max") is not None:
+            extras.append(f"rating under {spec['rating_max']} stars")
+        if spec.get("brand"):
+            extras.append(f"{spec['brand']} brand")
+        color = (spec.get("color") or "").strip()
+        title_low = title.lower()
+        if color and color.lower() not in title_low:
+            return f"{color} {title}" + (f" ({', '.join(extras)})" if extras else "")
+        if extras:
+            return f"{title} ({', '.join(extras)})"
+        return title
+    parts = []
+    if spec.get("sku") and _is_valid_sku_token(str(spec["sku"])):
+        parts.append(f"SKU {spec['sku']}")
+    if spec.get("color"):
+        parts.append(f"{spec['color']} colour")
+    if spec.get("purchase_price_max") is not None:
+        parts.append(f"under Rs {int(spec['purchase_price_max'])}")
+    elif spec.get("unit_price_max") is not None:
+        parts.append(f"under Rs {int(spec['unit_price_max'])}")
+    if spec.get("purchase_price_min") is not None:
+        parts.append(f"above Rs {int(spec['purchase_price_min'])}")
+    elif spec.get("unit_price_min") is not None:
+        parts.append(f"above Rs {int(spec['unit_price_min'])}")
+    if spec.get("rating_min") is not None:
+        try:
+            from services.catalog_spec_semantics import rating_min_display_label
+
+            parts.append(rating_min_display_label(spec["rating_min"]))
+        except ImportError:
+            parts.append(f"rating {spec['rating_min']}+ stars")
+    if spec.get("rating_max") is not None:
+        parts.append(f"rating under {spec['rating_max']} stars")
+    if spec.get("brand"):
+        parts.append(f"{spec['brand']} brand")
+    if spec.get("size"):
+        parts.append(f"size {spec['size']}")
+    return " ".join(parts).strip() or "your filters"
+
+
+def _title_match_tokens(title_query: str) -> list[str]:
+    """Product-type words that must appear in result names (shirt, rice, wheat…)."""
+    if not title_query:
+        return []
+    tokens = []
+    for w in re.findall(r"[a-z]{3,}", title_query.lower()):
+        if w in _COLOR_NAME_TOKENS or w in _FILTER_STOP:
+            continue
+        if w in _PRODUCT_NOUNS or w.endswith("s") and w[:-1] in _PRODUCT_NOUNS:
+            tokens.append(w.rstrip("s") if w.endswith("s") and w[:-1] in _PRODUCT_NOUNS else w)
+        elif len(w) >= 4 and w not in ("basmati", "organic", "premium"):
+            tokens.append(w)
+    seen: set[str] = set()
+    out = []
+    for t in tokens:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out[:4]
+
+
+def color_hue_mentioned_in_text(color_name: str, text: str) -> bool:
+    """True only when this exact text mentions the colour (not a sibling item in the sentence)."""
+    if not color_name or not (text or "").strip():
+        return False
+    tl = f" {text.lower()} "
+    for hue in _color_spelling_variants(color_name):
+        if re.search(rf"\b{re.escape(hue.lower())}\b", tl):
+            return True
+    return False
+
+
+def resolve_color_for_part_text(part_text: str, suggested_color: str = "") -> str:
+    """
+    Per-part catalog colour — any product type, any supported hue.
+    Colour applies only when THIS part's words mention it (shirt=white, cover=no white bleed).
+    """
+    scoped = (part_text or "").strip()
+    if not scoped:
+        return ""
+    explicit, _title = extract_color_and_product_title(scoped)
+    if explicit:
+        return explicit
+    fuzzy = normalize_color_fuzzy(scoped)
+    if fuzzy and color_hue_mentioned_in_text(fuzzy, scoped):
+        return fuzzy
+    sug = (suggested_color or "").strip()
+    if sug:
+        norm = normalize_color_fuzzy(sug) or sug
+        if color_hue_mentioned_in_text(norm, scoped):
+            return norm
+    return ""
+
+
+def _color_spelling_variants(color_name: str) -> list[str]:
+    c = (color_name or "").strip().lower()
+    if not c:
+        return []
+    variants = list(_COLOR_SPELLING_VARIANTS.get(c, (c,)))
+    if c in _COLOR_NAME_TOKENS and c not in variants:
+        variants.append(c)
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in variants:
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def _normalize_catalog_size_value(size_val: str) -> str:
+    """Map parsed size token to catalog size field value."""
+    s = (size_val or "").strip()
+    if not s:
+        return ""
+    if re.fullmatch(r"free\s*size", s, re.I):
+        return "Free Size"
+    if re.fullmatch(r"[xsmlXL]{1,3}", s, re.I):
+        return s.upper()
+    if re.search(r"\d", s):
+        return s.strip()
+    return s.title()
+
+
+def _extract_size_from_text(text: str) -> str:
+    """Pull size filter from message — size=10, size 10, 10 inch, free size."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    low = raw.lower()
+    for pat in _SIZE_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            return _normalize_catalog_size_value(m.group(1).strip())
+    return ""
+
+
+def _strip_size_from_title_query(title_query: str, size_value: str = "") -> str:
+    """OpenSearch uses size= filter; title_query must be product type only (cover, not size 10 cover)."""
+    tq = (title_query or "").strip()
+    if not tq:
+        return ""
+    for pat in _SIZE_PATTERNS:
+        tq = re.sub(pat, " ", tq, flags=re.IGNORECASE)
+    tq = re.sub(
+        r"\b(?:size|sizes|sized|number|no\.?|num)\b",
+        " ",
+        tq,
+        flags=re.IGNORECASE,
+    )
+    if size_value:
+        sv = re.escape(str(size_value).strip())
+        if sv:
+            tq = re.sub(rf"\b{sv}\b", " ", tq, flags=re.IGNORECASE)
+    return " ".join(tq.split()).strip()
+
+
+def _strip_color_from_title_query(title_query: str, color_name: str) -> str:
+    """API uses color= param; title should be product type only (cover not black cover)."""
+    if not title_query or not color_name:
+        return (title_query or "").strip()
+    tq = title_query
+    for token in _color_spelling_variants(color_name):
+        tq = re.sub(rf"\b{re.escape(token)}\b", " ", tq, flags=re.IGNORECASE)
+    for token in _COLOR_NAME_TOKENS:
+        if token in color_name.lower() or color_name.lower() in token:
+            tq = re.sub(rf"\b{re.escape(token)}\b", " ", tq, flags=re.IGNORECASE)
+    return " ".join(tq.split()).strip()
+
+
+_GENERIC_TITLE_WORDS = frozenset(
+    {"products", "product", "items", "item", "goods", "stuff", "things", "cheez", "cheeze"}
+)
+_PRODUCT_MODIFIER_WORDS = frozenset({"mobile", "phone", "smart", "wireless", "cell"})
+
+
+def _strip_generic_from_mandatory(spec: dict[str, Any]) -> None:
+    mandatory = spec.get("mandatory_match_tokens")
+    if not mandatory:
+        return
+    if not isinstance(mandatory, list):
+        mandatory = [str(mandatory)]
+    cleaned = [
+        t.strip().lower()
+        for t in mandatory
+        if t
+        and str(t).strip().lower() not in _GENERIC_TITLE_WORDS
+        and str(t).strip().lower() not in _PRODUCT_MODIFIER_WORDS
+    ]
+    ptype = (spec.get("product_type") or "").strip().lower()
+    product_nouns = [t for t in cleaned if t in _PRODUCT_NOUNS or t in _PRODUCT_TYPE_SYNONYMS]
+    if product_nouns:
+        spec["mandatory_match_tokens"] = [product_nouns[0]]
+    elif ptype and ptype in _PRODUCT_TYPE_SYNONYMS:
+        spec["mandatory_match_tokens"] = [ptype]
+    elif cleaned:
+        spec["mandatory_match_tokens"] = cleaned[:2]
+    else:
+        spec.pop("mandatory_match_tokens", None)
+
+
+def _normalize_generic_title_query(spec: dict[str, Any], original_msg: str = "") -> None:
+    tq = (spec.get("title_query") or "").strip().lower()
+    if tq and tq not in _GENERIC_TITLE_WORDS:
+        return
+    ptype = (spec.get("product_type") or "").strip().lower()
+    if ptype:
+        spec["title_query"] = ptype
+        return
+    try:
+        kw = _extract_product_keywords((original_msg or "").lower())
+        if kw:
+            spec["title_query"] = kw
+            return
+    except Exception:
+        pass
+    if spec.get("color"):
+        spec["title_query"] = ""
+    else:
+        spec.pop("title_query", None)
+
+
+def _strip_color_tokens_from_mandatory(spec: dict[str, Any]) -> None:
+    """Colour is enforced via color= + color_name — not as a title keyword."""
+    mandatory = spec.get("mandatory_match_tokens")
+    if not mandatory:
+        return
+    if not isinstance(mandatory, list):
+        mandatory = [str(mandatory)]
+    cleaned = [
+        t.strip().lower()
+        for t in mandatory
+        if t and str(t).strip().lower() not in _COLOR_NAME_TOKENS
+    ]
+    if cleaned:
+        spec["mandatory_match_tokens"] = cleaned
+    else:
+        spec.pop("mandatory_match_tokens", None)
+
+
+def _strip_color_tokens_from_brand_aliases(spec: dict[str, Any]) -> None:
+    """Colours/generic words in brand_aliases wrongly filter out products."""
+    aliases = spec.get("brand_aliases")
+    if not aliases:
+        return
+    if not isinstance(aliases, list):
+        aliases = [str(aliases)]
+    cleaned = [
+        a
+        for a in aliases
+        if str(a).strip().lower() not in _COLOR_NAME_TOKENS
+        and str(a).strip().lower() not in _GENERIC_TITLE_WORDS
+    ]
+    if cleaned:
+        spec["brand_aliases"] = cleaned
+    else:
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+    brand = (spec.get("brand") or "").strip().lower()
+    if brand and brand in _COLOR_NAME_TOKENS:
+        spec.pop("brand", None)
+
+
+def _scrub_invalid_price_rating_filters(spec: dict[str, Any]) -> None:
+    """Remove Rs 0 / inverted budgets that zero out catalog results."""
+    for key in ("purchase_price_min", "purchase_price_max", "unit_price_min", "unit_price_max"):
+        val = spec.get(key)
+        if val is None:
+            continue
+        try:
+            f = float(val)
+        except (TypeError, ValueError):
+            spec.pop(key, None)
+            continue
+        if f <= 0:
+            spec.pop(key, None)
+    pmin = spec.get("purchase_price_min")
+    pmax = spec.get("purchase_price_max")
+    if pmin is not None and pmax is not None:
+        try:
+            pmin_f, pmax_f = float(pmin), float(pmax)
+            if pmin_f > pmax_f:
+                spec.pop("purchase_price_min", None)
+                spec.pop("purchase_price_max", None)
+            elif pmin_f == pmax_f:
+                spec["purchase_price_max"] = pmax_f
+                spec.pop("purchase_price_min", None)
+        except (TypeError, ValueError):
+            pass
+    rmin = spec.get("rating_min")
+    rmax = spec.get("rating_max")
+    if rmin is not None and rmax is not None:
+        try:
+            if float(rmin) >= float(rmax):
+                spec.pop("rating_min", None)
+                spec.pop("rating_max", None)
+        except (TypeError, ValueError):
+            pass
+
+
+def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """Drop bogus SKU; strip catalogue colour from title_query. Brand/strictness come from AI spec."""
+    if not spec:
+        return spec
+    sku = spec.get("sku")
+    if sku:
+        if not _sku_token_acceptable(str(sku), explicit_sku_mention=True):
+            spec.pop("sku", None)
+        else:
+            spec.pop("brand", None)
+            spec.pop("brand_aliases", None)
+            spec.pop("brand_name_match_only", None)
+    color = spec.get("color")
+    if color and spec.get("sku"):
+        if str(spec["sku"]).strip().lower() == str(color).strip().lower():
+            spec.pop("sku", None)
+        elif re.search(r"[a-z][A-Z]", str(color)):
+            spec.pop("sku", None)
+    if spec.get("category_id") and not (spec.get("title_query") or "").strip():
+        try:
+            from services.welfog_api import strip_category_browse_conflicts_from_spec
+
+            spec = strip_category_browse_conflicts_from_spec(spec)
+        except ImportError:
+            pass
+    color = spec.get("color")
+    if color and spec.get("title_query"):
+        stripped = _strip_color_from_title_query(str(spec["title_query"]), str(color))
+        if stripped:
+            spec["title_query"] = stripped
+    _strip_color_tokens_from_brand_aliases(spec)
+    _strip_color_tokens_from_mandatory(spec)
+    _strip_generic_from_mandatory(spec)
+    if spec.get("brand_aliases") and not isinstance(spec["brand_aliases"], list):
+        spec["brand_aliases"] = [str(spec["brand_aliases"])]
+    if spec.get("mandatory_match_tokens") and not isinstance(spec["mandatory_match_tokens"], list):
+        spec["mandatory_match_tokens"] = [
+            t.strip().lower()
+            for t in str(spec["mandatory_match_tokens"]).split()
+            if t.strip()
+        ]
+    _scrub_invalid_price_rating_filters(spec)
+    try:
+        from services.catalog_spec_semantics import enforce_explicit_user_filters_only
+
+        user_blob = str(spec.pop("_filter_user_msg", "") or "")
+        if user_blob:
+            spec = enforce_explicit_user_filters_only(spec, user_blob, "")
+    except ImportError:
+        pass
+    tq = (spec.get("title_query") or "").strip().lower()
+    if tq in _FILTER_STOP or tq in ("your", "search", "kesa", "kaise", "hello"):
+        spec["title_query"] = ""
+    return spec
+
+
+def _product_name_matches_color(name_lower: str, color_name: str) -> bool:
+    """Title/description colour check — reject wrong hue (green cover when user asked black)."""
+    if not color_name:
+        return True
+    c = color_name.strip().lower()
+    if c == "multicolor":
+        return any(
+            x in name_lower
+            for x in ("multicolor", "multi color", "multi-color", "multicolour", "multi colour")
+        )
+    if c in name_lower:
+        return True
+    if c == "black" and ("black" in name_lower or "blk" in name_lower):
+        return True
+    if c in ("grey", "gray") and any(x in name_lower for x in ("grey", "gray")):
+        return True
+    if c == "sky blue" and any(x in name_lower for x in ("sky blue", "sky-blue", "aasmani", "asmani")):
+        return True
+    conflicts = _CONFLICTING_COLOR_HINTS.get(c, ())
+    for bad in conflicts:
+        if bad in name_lower:
+            return False
+    if c in ("black", "white", "green", "red", "blue", "yellow", "pink", "purple", "orange"):
+        return c in name_lower
+    return True
+
+
+def extract_material_tokens(text: str) -> list[str]:
+    """Words like transparent/crystal that must appear in title when user asked for them."""
+    low = (text or "").lower()
+    found: list[str] = []
+    for tok in sorted(_MATERIAL_TITLE_TOKENS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(tok)}\b", low):
+            found.append(tok)
+    return found
+
+
+def _apply_material_tokens_to_spec(spec: dict[str, Any], original_msg: str = "") -> None:
+    mats = extract_material_tokens(original_msg)
+    if not mats:
+        return
+    mandatory = list(spec.get("mandatory_match_tokens") or [])
+    for m in mats:
+        if m not in mandatory:
+            mandatory.append(m)
+    spec["mandatory_match_tokens"] = mandatory[:4]
+    spec["material_tokens"] = mats
+
+
+def filter_products_by_material_tokens(
+    products: list[dict],
+    material_tokens: list[str],
+) -> list[dict]:
+    if not material_tokens or not products:
+        return products
+    need = [t.strip().lower() for t in material_tokens if t and len(str(t).strip()) >= 3]
+    if not need:
+        return products
+    out = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if any(t in name for t in need):
+            out.append(p)
+    return out
+
+
+def filter_products_by_requested_color(
+    products: list[dict],
+    color_name: Optional[str],
+) -> list[dict]:
+    if not color_name or not products:
+        return products
+    out = []
+    for p in products:
+        card_color = (p.get("color_name") or p.get("color") or "").strip()
+        if card_color:
+            if _catalog_colors_equivalent(card_color, color_name):
+                out.append(p)
+            continue
+        name = (p.get("name") or "").lower()
+        if _product_name_matches_color(name, color_name):
+            out.append(p)
+    return out
+
+
+def _product_type_token_in_name(tok: str, name_lower: str) -> bool:
+    """cover/case/bumper are equivalent in catalog titles (Samsung Bumper, iPhone case)."""
+    if _title_token_in_name(tok, name_lower):
+        return True
+    synonyms = _PRODUCT_TYPE_SYNONYMS.get(tok)
+    if synonyms:
+        return any(s in name_lower for s in synonyms)
+    return False
+
+
+def filter_products_by_ai_mandatory_tokens(
+    products: list[dict],
+    mandatory_tokens: list[str],
+    *,
+    product_type: Optional[str] = None,
+    skip_color_tokens: bool = False,
+) -> list[dict]:
+    """All AI-provided tokens must appear in title (works for any brand/product, no hardcoded list)."""
+    tokens = [t.strip().lower() for t in (mandatory_tokens or []) if t and len(str(t).strip()) >= 2]
+    if skip_color_tokens:
+        tokens = [t for t in tokens if t not in _COLOR_NAME_TOKENS]
+    if not tokens or not products:
+        return products
+    ptype = (product_type or "").strip().lower()
+    out = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if not all(_product_type_token_in_name(tok, name) for tok in tokens):
+            continue
+        if ptype and not _product_type_token_in_name(ptype, name):
+            nouns = ptype.rstrip("s") if ptype.endswith("s") else ptype
+            if not (
+                _product_type_token_in_name(ptype, name)
+                or _product_type_token_in_name(nouns, name)
+            ):
+                continue
+        out.append(p)
+    return out
+
+
+def _phone_brand_vocab() -> frozenset:
+    try:
+        from services.product_query_understanding import _PHONE_BRANDS
+
+        return _PHONE_BRANDS
+    except ImportError:
+        return frozenset(
+            {
+                "samsung", "iphone", "apple", "vivo", "oppo", "realme", "redmi", "mi", "xiaomi",
+                "oneplus", "poco", "nothing", "google", "motorola", "nokia", "honor", "infinix",
+                "lg", "tecno", "itel",
+            }
+        )
+
+
+def filter_products_strict_brand_match(
+    products: list[dict],
+    brand: Optional[str],
+    brand_aliases: Optional[list[str]] = None,
+) -> list[dict]:
+    """Samsung part → titles with samsung only; drop iPhone/Infinix/LG-only listings."""
+    if not brand or not products:
+        return products
+    bl = brand.strip().lower()
+    if bl in _COLOR_NAME_TOKENS:
+        return products
+    aliases = [
+        a.strip().lower()
+        for a in (brand_aliases or [])
+        if a and str(a).strip().lower() not in _COLOR_NAME_TOKENS
+    ]
+    if bl not in aliases:
+        aliases.insert(0, bl)
+    others = {b for b in _phone_brand_vocab() if b != bl and len(b) >= 3}
+    out = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if not any(a in name for a in aliases):
+            continue
+        if others:
+            competing = [ob for ob in others if ob in name]
+            if competing and bl not in name:
+                continue
+        out.append(p)
+    return out
+
+
+def filter_products_by_requested_brand(
+    products: list[dict],
+    brand: Optional[str],
+    brand_aliases: Optional[list[str]] = None,
+    *,
+    strict_title: bool = False,
+) -> list[dict]:
+    """Match brand/model in product title (catalog brand field is often 'No Brand')."""
+    if strict_title and brand:
+        return filter_products_strict_brand_match(products, brand, brand_aliases)
+    if not products:
+        return products
+    aliases = [
+        a.strip().lower()
+        for a in (brand_aliases or [])
+        if a and str(a).strip().lower() not in _COLOR_NAME_TOKENS
+    ]
+    if brand:
+        bl = brand.strip().lower()
+        if bl in _COLOR_NAME_TOKENS:
+            return products
+        if bl and bl not in aliases:
+            aliases.insert(0, bl)
+    if not aliases:
+        return products
+    generic_brands = frozenset({"no brand", "generic", "unbranded", "na", "n/a", ""})
+    out = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        card_brand = (p.get("brand") or "").strip().lower()
+        if any(a in name for a in aliases):
+            out.append(p)
+            continue
+        if card_brand and card_brand not in generic_brands and any(a in card_brand for a in aliases):
+            out.append(p)
+    return out
+
+
+def conflict_exclude_tokens_for_product_type(product_type: str) -> list[str]:
+    p = (product_type or "").strip().lower()
+    if p.endswith("s") and len(p) > 3:
+        singular = p[:-1]
+        if singular in _TYPE_CONFLICT_EXCLUDES:
+            p = singular
+    return list(_TYPE_CONFLICT_EXCLUDES.get(p, ()))
+
+
+def filter_products_by_exclude_tokens(
+    products: list[dict],
+    exclude_tokens: list[str],
+) -> list[dict]:
+    """Drop titles containing excluded phrases (e.g. 'lg velvet' phone when user wants velvet material)."""
+    bad = [e.strip().lower() for e in (exclude_tokens or []) if e and len(str(e).strip()) >= 3]
+    if not bad or not products:
+        return products
+    out = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if any(phrase in name for phrase in bad):
+            continue
+        out.append(p)
+    return out
+
+
+def filter_products_by_requested_sku(products: list[dict], sku: str) -> list[dict]:
+    """Strict SKU match on catalog cards (wildcard already applied in OpenSearch)."""
+    needle = (sku or "").strip().lower()
+    if not needle or not products:
+        return products
+    out = []
+    for p in products:
+        psku = (p.get("sku") or "").strip().lower()
+        if not psku:
+            continue
+        if psku == needle or needle in psku or psku in needle:
+            out.append(p)
+    return out
+
+
+def _card_purchase_price(p: dict) -> Optional[float]:
+    raw = p.get("price") or p.get("purchase_price")
+    if raw is None:
+        return None
+    try:
+        return float(str(raw).replace(",", "").replace("₹", "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def filter_products_by_purchase_price(products: list[dict], spec: dict[str, Any]) -> list[dict]:
+    pmax = spec.get("purchase_price_max")
+    pmin = spec.get("purchase_price_min")
+    if pmax is None and pmin is None:
+        return products
+    out = []
+    for p in products:
+        val = _card_purchase_price(p)
+        if val is None:
+            continue
+        if pmax is not None and val > float(pmax):
+            continue
+        if pmin is not None and val < float(pmin):
+            continue
+        out.append(p)
+    return out
+
+
+def filter_products_by_rating_range(products: list[dict], spec: dict[str, Any]) -> list[dict]:
+    rmin = spec.get("rating_min")
+    rmax = spec.get("rating_max")
+    if rmin is None and rmax is None:
+        return products
+    try:
+        rmin_f = float(rmin) if rmin is not None else None
+    except (TypeError, ValueError):
+        rmin_f = None
+    try:
+        rmax_f = float(rmax) if rmax is not None else None
+    except (TypeError, ValueError):
+        rmax_f = None
+    out = []
+    for p in products:
+        raw = p.get("rating")
+        if raw is None or raw == "":
+            if rmin_f is not None and rmin_f <= 0.01:
+                out.append(p)
+            continue
+        try:
+            val = float(raw)
+        except (TypeError, ValueError):
+            if rmin_f is not None and rmin_f <= 0.01:
+                out.append(p)
+            continue
+        if rmin_f is not None:
+            if rmin_f <= 0.01:
+                if val > 0:
+                    out.append(p)
+                continue
+            elif val < rmin_f:
+                continue
+        if rmax_f is not None and val >= rmax_f:
+            continue
+        out.append(p)
+    return out
+
+
+def _brand_mentioned_in_text(brand: str, text: str) -> bool:
+    bl = (brand or "").strip().lower()
+    if not bl or bl in _GENERIC_BRAND_WORDS:
+        return False
+    tl = f" {(text or '').lower()} "
+    return bool(re.search(rf"\b{re.escape(bl)}\b", tl))
+
+
+def _message_has_specific_product_type(text: str) -> bool:
+    tl = f" {(text or '').lower()} "
+    for noun in _PRODUCT_NOUNS:
+        if re.search(rf"\b{re.escape(noun)}\b", tl):
+            return True
+    return False
+
+
+def scrub_filter_only_catalog_title(spec: dict[str, Any], comb: str = "") -> None:
+    """Drop junk title_query on price/rating-only browse (e.g. 'jinki', 'price range 100150')."""
+    if not spec or not comb:
+        return
+    has_price = (
+        spec.get("purchase_price_min") is not None
+        or spec.get("purchase_price_max") is not None
+    )
+    has_rating = spec.get("rating_min") is not None or spec.get("rating_max") is not None
+    if not (has_price or has_rating):
+        return
+    if spec.get("pro_id") or spec.get("sku"):
+        return
+    tq = (spec.get("title_query") or "").strip().lower()
+    if not tq:
+        return
+    if is_price_or_rating_browse_turn(comb):
+        spec["title_query"] = ""
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+        spec["title_match_strict"] = False
+        return
+    if has_rating and _turn_mentions_rating_filter(comb):
+        junk = {
+            "jinki", "jin", "jo", "products", "product", "items", "item",
+            "produts", "produt", "dikha", "dikhao", "dikho", "dikhado", "bta", "btao", "bata",
+            "rating", "above", "ke", "more", "than",
+        }
+        tokens = set(tq.split())
+        if tokens <= junk or tq in junk or any(t in junk for t in tokens):
+            spec["title_query"] = ""
+            spec.pop("brand_aliases", None)
+            spec.pop("brand_name_match_only", None)
+
+
+def is_price_or_rating_browse_turn(text: str) -> bool:
+    """User browses by budget/rating without naming a new brand/product type."""
+    low = (text or "").lower()
+    if not low.strip():
+        return False
+    has_rating = _turn_mentions_rating_filter(low) or any(
+        re.search(p, low, re.I) for p in _RATING_UNDER_PATTERNS + _RATING_PATTERNS
+    )
+    has_budget = _user_mentions_price_this_turn(low)
+    if has_rating and not has_budget:
+        has_budget = False
+    elif not has_budget:
+        has_budget = any(re.search(p, low, re.I) for p in _PRICE_UNDER + _PRICE_OVER)
+        if has_budget and has_rating and not re.search(
+            r"\b(?:rs|₹|rupee|inr|budget|price)\b", low, re.I
+        ):
+            has_budget = False
+    if not (has_budget or has_rating):
+        return False
+    if _extract_brand_literal_from_text(text):
+        return False
+    if _message_has_specific_product_type(text):
+        return False
+    return True
+
+
+def _scrub_bogus_brand_from_spec(spec: dict[str, Any], original_msg: str = "") -> None:
+    if spec.get("_catalog_ai"):
+        return
+    aliases = spec.get("brand_aliases")
+    if aliases:
+        if not isinstance(aliases, list):
+            aliases = [str(aliases)]
+        cleaned_aliases = []
+        for a in aliases:
+            al = str(a).strip().lower()
+            if not al or al in _GENERIC_BRAND_WORDS or al in _FILTER_STOP:
+                continue
+            if al.isdigit() or al in {"rs", "rupee", "rupees", "inr", "under", "below", "above", "over"}:
+                continue
+            cleaned_aliases.append(a)
+        if cleaned_aliases:
+            spec["brand_aliases"] = cleaned_aliases
+        else:
+            spec.pop("brand_aliases", None)
+            spec.pop("brand_name_match_only", None)
+    brand = (spec.get("brand") or "").strip()
+    if not brand:
+        return
+    bl = brand.lower()
+    if bl in _GENERIC_BRAND_WORDS or bl in _BRAND_STOP:
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+        return
+    if original_msg and not _brand_mentioned_in_text(brand, original_msg):
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+        spec.pop("title_match_strict", None)
+
+
+def reconcile_catalog_spec_with_user_turn(
+    spec: dict[str, Any],
+    original_msg: str = "",
+    msg_en: str = "",
+    *,
+    ctx: Optional[dict] = None,
+    ai_route: Optional[dict] = None,
+    ai_understanding: Optional[dict] = None,
+) -> dict[str, Any]:
+    """
+    Align AI/heuristic spec with what the user actually asked — stop Samsung/Welfog bleed
+    on price/rating-only turns; pro_id lookups must not search 'dikhoa' text.
+    """
+    if not spec:
+        return spec
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    heuristic = parse_product_filters_from_text(original_msg or comb)
+
+    if spec.get("pro_id") or heuristic.get("pro_id"):
+        pid = spec.get("pro_id") or heuristic.get("pro_id")
+        spec["pro_id"] = int(pid)
+        spec["title_query"] = ""
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+        spec["title_match_strict"] = False
+        return spec
+
+    trust_ai = bool(spec.get("_catalog_ai")) or bool(
+        ai_understanding and (ai_understanding.get("search_terms") or ai_understanding.get("product_requests"))
+    )
+    if trust_ai:
+        try:
+            from services.catalog_spec_semantics import reconcile_ai_first_catalog_spec
+
+            return reconcile_ai_first_catalog_spec(
+                spec,
+                original_msg,
+                msg_en,
+                ctx=ctx,
+                ai_route=ai_route,
+                ai_understanding=ai_understanding,
+            )
+        except ImportError:
+            pass
+
+    for key in ("purchase_price_max", "purchase_price_min", "rating_min", "rating_max", "size", "color"):
+        if heuristic.get(key) is not None and heuristic.get(key) != "":
+            if trust_ai and spec.get(key) not in (None, ""):
+                continue
+            spec[key] = heuristic[key]
+
+    pmax, pmin = _extract_price_bounds(original_msg or comb, (msg_en or comb).lower())
+    if pmax is not None:
+        spec["purchase_price_max"] = pmax
+    if pmin is not None:
+        spec["purchase_price_min"] = pmin
+
+    rmin_h, rmax_h = _extract_rating_bounds_from_text((comb or "").lower())
+    if rmin_h is not None and spec.get("rating_min") is None:
+        spec["rating_min"] = rmin_h
+    if rmax_h is not None and spec.get("rating_max") is None:
+        spec["rating_max"] = rmax_h
+
+    _scrub_price_filters_on_rating_turn(spec, comb)
+
+    if not _user_mentions_price_this_turn(comb):
+        spec.pop("purchase_price_max", None)
+        spec.pop("purchase_price_min", None)
+        spec.pop("unit_price_max", None)
+        spec.pop("unit_price_min", None)
+
+    _scrub_bogus_brand_from_spec(spec, comb)
+
+    continue_topic = bool(isinstance(ai_route, dict) and ai_route.get("continue_previous_topic"))
+    price_rating_browse = is_price_or_rating_browse_turn(comb)
+    has_product_type = _message_has_specific_product_type(comb)
+    has_budget = spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None
+
+    if price_rating_browse and not continue_topic and not has_product_type:
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+        spec["title_query"] = ""
+        spec["title_match_strict"] = False
+    elif (
+        has_budget
+        and _user_mentions_price_this_turn(comb)
+        and ctx
+        and not _brand_mentioned_in_text(str(spec.get("brand") or ""), comb)
+    ):
+        last = ((ctx.get("data") or {}).get("last_os_spec") or {})
+        if not has_product_type and last.get("title_query"):
+            spec["title_query"] = last["title_query"]
+        if not spec.get("color") and last.get("color"):
+            spec["color"] = last["color"]
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+    elif price_rating_browse and continue_topic and ctx:
+        last = ((ctx.get("data") or {}).get("last_os_spec") or {})
+        if last.get("title_query") and not _message_has_specific_product_type(comb):
+            spec["title_query"] = last["title_query"]
+        if last.get("color") and not spec.get("color"):
+            spec["color"] = last["color"]
+
+    if not trust_ai:
+        parsed_color, parsed_title = extract_color_and_product_title(comb)
+        if parsed_color:
+            spec["color"] = parsed_color
+        if parsed_title and not price_rating_browse:
+            spec["title_query"] = parsed_title
+
+    _scrub_bogus_brand_from_spec(spec, comb)
+    _scrub_price_filters_on_rating_turn(spec, comb)
+    try:
+        from services.catalog_spec_semantics import enforce_explicit_user_filters_only
+
+        spec = enforce_explicit_user_filters_only(
+            spec, original_msg, msg_en, ai_understanding=ai_understanding
+        )
+    except ImportError:
+        pass
+    scrub_filter_only_catalog_title(spec, comb)
+    spec.pop("_catalog_ai", None)
+    return spec
+
+
+def apply_catalog_post_filters(
+    products: list[dict],
+    spec: dict[str, Any],
+    *,
+    post_filter_mode: str = "strict",
+) -> list[dict]:
+    """
+    Post-filter after OpenSearch hits.
+    strict: mandatory + brand + colour
+    os_filters_only: colour + brand only (OpenSearch already narrowed by title)
+    light: colour only
+    """
+    if not products:
+        return products
+    mode = (post_filter_mode or "strict").strip().lower()
+    exclude = spec.get("exclude_title_tokens") or []
+    if exclude:
+        products = filter_products_by_exclude_tokens(products, exclude)
+
+    if mode == "strict":
+        mandatory = spec.get("mandatory_match_tokens") or []
+        if mandatory:
+            products = filter_products_by_ai_mandatory_tokens(
+                products,
+                mandatory,
+                product_type=spec.get("product_type"),
+                skip_color_tokens=bool(spec.get("color")),
+            )
+        else:
+            title_q = (spec.get("title_query") or "").strip()
+            strict = bool(spec.get("title_match_strict"))
+            if title_q:
+                products = filter_products_by_title_relevance(products, title_q, strict=strict)
+
+    aliases = spec.get("brand_aliases") or []
+    if mode in ("strict", "os_filters_only") and (spec.get("brand") or aliases):
+        strict_brand = bool(spec.get("title_match_strict")) and not spec.get("brand_name_match_only")
+        products = filter_products_by_requested_brand(
+            products,
+            spec.get("brand"),
+            brand_aliases=aliases if isinstance(aliases, list) else None,
+            strict_title=strict_brand,
+        )
+
+    if mode in ("strict", "os_filters_only", "light") and spec.get("color"):
+        products = filter_products_by_requested_color(products, spec.get("color"))
+
+    if spec.get("sku"):
+        products = filter_products_by_requested_sku(products, str(spec["sku"]))
+
+    if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
+        products = filter_products_by_purchase_price(products, spec)
+
+    if spec.get("rating_min") is not None or spec.get("rating_max") is not None:
+        products = filter_products_by_rating_range(products, spec)
+
+    mats = spec.get("material_tokens") or []
+    if mats:
+        products = filter_products_by_material_tokens(products, mats)
+
+    return products
+
+
+def _title_token_in_name(tok: str, name_lower: str) -> bool:
+    if tok in name_lower:
+        return True
+    if tok.endswith("s") and tok[:-1] in name_lower:
+        return True
+    if not tok.endswith("s") and f"{tok}s" in name_lower:
+        return True
+    return False
+
+
+def filter_products_by_title_relevance(
+    products: list[dict],
+    title_query: str,
+    *,
+    strict: bool = False,
+    mandatory_tokens: Optional[list[str]] = None,
+) -> list[dict]:
+    """
+    Drop irrelevant catalog hits. Prefer mandatory_tokens from AI when present.
+    """
+    if mandatory_tokens:
+        return filter_products_by_ai_mandatory_tokens(products, mandatory_tokens)
+
+    need = _title_match_tokens(title_query)
+    need = [t for t in need if t not in _COLOR_NAME_TOKENS and t not in _MATERIAL_TITLE_TOKENS]
+    if not need or not products:
+        return products
+
+    product_nouns = [t for t in need if t in _PRODUCT_NOUNS or (t.endswith("s") and t[:-1] in _PRODUCT_NOUNS)]
+
+    if strict:
+        matched = []
+        for p in products:
+            name = (p.get("name") or "").lower()
+            if not all(_title_token_in_name(tok, name) for tok in need):
+                continue
+            if product_nouns and not any(_title_token_in_name(n, name) for n in product_nouns):
+                continue
+            matched.append(p)
+        return matched
+
+    matched = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if any(_title_token_in_name(tok, name) for tok in need):
+            matched.append(p)
+    return matched
+
+
+def _ensure_project_dotenv_loaded() -> None:
+    """Load parent .env when modules run outside app.py (tests, scripts)."""
+    if os.getenv("OPENSEARCH_URL", "").strip():
+        return
+    try:
+        from dotenv import load_dotenv
+
+        from support_paths import ENV_FILE
+
+        if os.path.isfile(ENV_FILE):
+            load_dotenv(ENV_FILE)
+    except Exception:
+        pass
+
+
+def _env_opensearch_config():
+    _ensure_project_dotenv_loaded()
+    url = (os.getenv("OPENSEARCH_URL") or "").strip()
+    user = (os.getenv("OPENSEARCH_USER") or "").strip()
+    password = (os.getenv("OPENSEARCH_PASS") or "").strip()
+    if not url:
+        return None
+    return {"url": url, "auth": (user, password) if user else None}
+
+
+def is_opensearch_configured() -> bool:
+    return _env_opensearch_config() is not None
+
+
+def _scrub_color_meta_from_title(title: str) -> str:
+    """Remove filler colour words from title_query (never search 'color cover')."""
+    if not title:
+        return ""
+    tq = re.sub(r"\b(color|colour|rang)\b", " ", title, flags=re.IGNORECASE)
+    return " ".join(tq.split()).strip()
+
+
+def _extract_brand_literal_from_text(text: str) -> Optional[str]:
+    """Brand from user text with original spelling (Gyld not gyid from translation)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    for pat in _BRAND_PATTERNS:
+        m = re.search(pat, raw, re.IGNORECASE)
+        if m:
+            brand = m.group(1).strip()
+            if brand.lower() not in _BRAND_STOP and brand.lower() not in _FILTER_STOP:
+                return brand if len(brand) > 4 else brand.title()
+    return None
+
+
+def _normalize_brand_label(token: str) -> str:
+    t = (token or "").strip().lower()
+    if t == "iphone":
+        return "iPhone"
+    if t in ("oneplus", "redmi", "oppo", "vivo", "realme", "infinix"):
+        return t.capitalize()
+    return t.title() if t else ""
+
+
+def _infer_brand_from_message(text: str) -> Optional[str]:
+    """Detect phone/device brand in Hinglish/English (samsung ke liye cover)."""
+    low = (text or "").lower()
+    if not low:
+        return None
+    for pat in _BRAND_KE_KI_KA_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            for g in m.groups():
+                if g:
+                    return _normalize_brand_label(g)
+    vocab = sorted(_phone_brand_vocab(), key=len, reverse=True)
+    earliest: Optional[tuple[int, str]] = None
+    for b in vocab:
+        m = re.search(rf"\b{re.escape(b)}\b", low)
+        if m and (earliest is None or m.start() < earliest[0]):
+            earliest = (m.start(), b)
+    if earliest:
+        return _normalize_brand_label(earliest[1])
+    return None
+
+
+def _catalog_title_for_search(spec: dict[str, Any]) -> str:
+    """REST/OpenSearch name= must include brand (API search box uses 'samsung' not 'cover' alone)."""
+    brand = (spec.get("brand") or "").strip()
+    tq = (spec.get("title_query") or "").strip()
+    if brand:
+        bl = brand.lower()
+        if not tq or bl not in tq.lower():
+            return f"{brand} {tq}".strip() if tq else brand
+    return tq
+
+
+def extract_structured_catalog_filters(
+    text: str,
+    *,
+    category_id: Optional[int] = None,
+    color: Optional[str] = None,
+    pro_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """SKU, price, rating, size, pro_id from text — no title_query/brand (AI owns those)."""
+    full = parse_product_filters_from_text(
+        text,
+        category_id=category_id,
+        color=color,
+        pro_id=pro_id,
+    )
+    out: dict[str, Any] = {}
+    for key in (
+        "sku",
+        "pro_id",
+        "purchase_price_max",
+        "purchase_price_min",
+        "rating_min",
+        "rating_max",
+        "size",
+        "category_id",
+        "color",
+        "in_stock_only",
+        "sort",
+    ):
+        val = full.get(key)
+        if val is not None and val != "":
+            out[key] = val
+    return out
+
+
+def finalize_catalog_search_spec(
+    spec: dict[str, Any],
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict[str, Any]:
+    """Colour + brand + title_query aligned with what the user actually asked."""
+    # Per-part catalog search passes only that part as original_msg — do not widen blob.
+    blob = f"{original_msg or ''} {msg_en or ''}".strip()
+    trust_ai = bool(spec.get("_catalog_ai"))
+    user_title = ""
+    if blob:
+        if not trust_ai:
+            user_color, user_title = extract_color_and_product_title(blob)
+            if not user_color:
+                fuzzy = normalize_color_fuzzy(blob)
+                if fuzzy and color_hue_mentioned_in_text(fuzzy, blob):
+                    user_color = fuzzy
+            if user_color:
+                spec["color"] = user_color
+            elif spec.get("color") and not color_hue_mentioned_in_text(
+                str(spec.get("color")), blob
+            ):
+                spec["color"] = ""
+            literal_brand = _extract_brand_literal_from_text(original_msg or "")
+            if literal_brand:
+                spec["brand"] = literal_brand
+            else:
+                inferred_brand = _infer_brand_from_message(blob)
+                if inferred_brand and not spec.get("brand"):
+                    spec["brand"] = inferred_brand
+            if user_title and not spec.get("title_query"):
+                spec["title_query"] = user_title
+        elif spec.get("color") and not color_hue_mentioned_in_text(
+            str(spec.get("color")), blob
+        ):
+            spec["color"] = ""
+
+    brand_only_browse = False
+    brand = (spec.get("brand") or "").strip()
+    if brand:
+        bl = brand.lower()
+        aliases = list(spec.get("brand_aliases") or [])
+        if bl not in [str(a).lower() for a in aliases]:
+            aliases.insert(0, brand)
+        en_brand = _extract_brand_literal_from_text(msg_en or "")
+        if not en_brand and msg_en:
+            en_brand = parse_product_filters_from_text(msg_en).get("brand")
+        if en_brand and en_brand.lower() not in [str(a).lower() for a in aliases]:
+            aliases.append(en_brand)
+        spec["brand_aliases"] = aliases[:8]
+        spec["brand_name_match_only"] = True
+        blob_low = blob.lower()
+        brand_only = bool(
+            re.search(rf"\b{re.escape(bl)}\s+brand\b", blob_low)
+            and not (user_title or "").strip()
+        )
+        if brand_only or (
+            (user_title or "").strip().lower() in ("product", "products")
+            and re.search(r"\bbrand\b", blob_low)
+        ):
+            spec["title_query"] = ""
+            spec["title_match_strict"] = False
+            brand_only_browse = True
+        else:
+            spec["title_match_strict"] = True
+        mode = (spec.get("match_mode") or "").strip().lower()
+        if not mode or mode == "universal":
+            spec["match_mode"] = "strict"
+
+    tq = (spec.get("title_query") or "").strip()
+    if spec.get("color"):
+        tq = _strip_color_from_title_query(tq, str(spec["color"]))
+    tq = _scrub_color_meta_from_title(tq)
+    if brand_only_browse:
+        spec["title_query"] = ""
+    else:
+        merged_title = _catalog_title_for_search(spec)
+        if merged_title:
+            spec["title_query"] = _scrub_color_meta_from_title(merged_title)
+        elif tq:
+            spec["title_query"] = tq
+    return spec
+
+
+def _enforce_user_color_product_spec(
+    spec: dict[str, Any],
+    original_msg: str,
+    msg_en: str = "",
+) -> dict[str, Any]:
+    """Backward-compatible alias — use finalize_catalog_search_spec."""
+    return finalize_catalog_search_spec(spec, original_msg, msg_en)
+
+
+def is_single_color_product_query(text: str) -> bool:
+    """One product ask with a colour filter — must not split into multi searches."""
+    c, t = extract_color_and_product_title(text or "")
+    return bool(c and t)
+
+
+def build_catalog_search_spec(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    ai: Optional[dict[str, Any]] = None,
+    category_id: Optional[int] = None,
+    color: Optional[str] = None,
+    pro_id: Optional[int] = None,
+    ctx: Optional[dict] = None,
+    ai_route: Optional[dict] = None,
+) -> dict[str, Any]:
+    """Merge message heuristics + AI JSON → OpenSearch filter spec (colour, price, brand, SKU, pro_id)."""
+    ai_has_shopping = bool(
+        ai
+        and (
+            ai.get("is_shopping")
+            or ai.get("_ai_first")
+            or (ai.get("search_terms") or "").strip()
+            or ai.get("product_requests")
+            or ai.get("sku")
+            or ai.get("pro_id")
+            or ai.get("rating_min") is not None
+            or ai.get("rating_max") is not None
+            or ai.get("max_price") is not None
+            or ai.get("min_price") is not None
+            or ai.get("brand")
+        )
+    )
+    if ai_has_shopping:
+        try:
+            from services.catalog_spec_semantics import extract_gap_fill_ids_from_text
+
+            spec = extract_gap_fill_ids_from_text(
+                original_msg or "", pro_id=pro_id
+            )
+            if msg_en:
+                spec_en = extract_gap_fill_ids_from_text(msg_en, pro_id=pro_id)
+                if spec_en.get("sku") and not spec.get("sku"):
+                    spec["sku"] = spec_en["sku"]
+                if spec_en.get("pro_id") and not spec.get("pro_id"):
+                    spec["pro_id"] = spec_en["pro_id"]
+        except ImportError:
+            spec = extract_structured_catalog_filters(
+                original_msg or "",
+                category_id=category_id,
+                color=color,
+                pro_id=pro_id,
+            )
+        if category_id and not spec.get("category_id"):
+            spec["category_id"] = category_id
+        if color and not spec.get("color"):
+            spec["color"] = color
+    else:
+        spec = parse_product_filters_from_text(
+            original_msg or "",
+            category_id=category_id,
+            color=color,
+            pro_id=pro_id,
+        )
+        if msg_en:
+            spec_en = parse_product_filters_from_text(
+                msg_en,
+                category_id=category_id,
+                color=color or spec.get("color"),
+                pro_id=pro_id,
+            )
+            spec = _merge_filter_specs(spec, spec_en)
+    if ai:
+        heuristic_color = spec.get("color")
+        try:
+            from services.catalog_spec_from_ai import merge_ai_into_catalog_spec
+
+            spec = merge_ai_into_catalog_spec(spec, ai, original_msg=original_msg)
+            if not spec.get("color") and heuristic_color:
+                spec["color"] = heuristic_color
+        except ImportError:
+            pass
+    elif not spec.get("title_query"):
+        spec = build_product_search_spec(
+            original_msg,
+            msg_en,
+            category_id=category_id,
+            color=color or spec.get("color"),
+            pro_id=pro_id,
+        )
+    if pro_id and not spec.get("pro_id"):
+        spec["pro_id"] = pro_id
+    if category_id and not spec.get("category_id"):
+        spec["category_id"] = category_id
+    spec["_filter_user_msg"] = original_msg or ""
+    spec = sanitize_product_search_spec(spec)
+    _normalize_generic_title_query(spec, original_msg)
+    _apply_material_tokens_to_spec(spec, original_msg)
+    if msg_en:
+        _apply_material_tokens_to_spec(spec, msg_en)
+    spec = finalize_catalog_search_spec(spec, original_msg, msg_en)
+    spec = sanitize_product_search_spec(spec)
+    spec = reconcile_catalog_spec_with_user_turn(
+        spec,
+        original_msg,
+        msg_en,
+        ctx=ctx,
+        ai_route=ai_route,
+        ai_understanding=ai if ai_has_shopping else None,
+    )
+    try:
+        from services.product_filter_pipeline import finalize_catalog_spec_for_api
+
+        spec = finalize_catalog_spec_for_api(
+            spec,
+            original_msg,
+            msg_en,
+            ai_understanding=ai if ai_has_shopping else None,
+        )
+    except ImportError:
+        pass
+    return spec
+
+
+def _to_number(val) -> Optional[float]:
+    if val is None:
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    s = str(val).strip().replace(",", "")
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _extract_first(patterns: tuple, text: str, flags=re.IGNORECASE) -> Optional[str]:
+    for pat in patterns:
+        m = re.search(pat, text, flags)
+        if m:
+            return (m.group(1) if m.lastindex else m.group(0)).strip()
+    return None
+
+
+def _brand_name_should_clauses(brand_or_aliases) -> list[dict]:
+    """
+    Welfog index often has brand='No Brand' — match phone/model words in name + category, not brand field alone.
+    """
+    tokens: list[str] = []
+    if isinstance(brand_or_aliases, str):
+        tokens = [brand_or_aliases.strip()]
+    elif isinstance(brand_or_aliases, list):
+        tokens = [str(x).strip() for x in brand_or_aliases if str(x).strip()]
+    should: list[dict] = []
+    seen: set[str] = set()
+    for raw in tokens:
+        low = raw.lower()
+        if not low or low in seen or low in ("no brand", "brand"):
+            continue
+        seen.add(low)
+        should.append(
+            {
+                "multi_match": {
+                    "query": low,
+                    "fields": ["brand^5", "name^4", "sku^2", "category_name"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO",
+                }
+            }
+        )
+        should.append(
+            {
+                "term": {
+                    "brand": {
+                        "value": raw,
+                        "case_insensitive": True,
+                    }
+                }
+            }
+        )
+    return should
+
+
+def parse_product_filters_from_text(
+    text: str,
+    *,
+    category_id: Optional[int] = None,
+    color: Optional[str] = None,
+    title_hint: str = "",
+    pro_id: Optional[int] = None,
+) -> dict[str, Any]:
+    """Parse natural-language product filter/sort request (English + Hinglish)."""
+    raw = (text or "").strip()
+    low = raw.lower()
+    spec: dict[str, Any] = {
+        "title_query": "",
+        "color": color,
+        "size": None,
+        "brand": None,
+        "sku": None,
+        "pro_id": pro_id,
+        "category_id": category_id,
+        "unit_price_min": None,
+        "unit_price_max": None,
+        "purchase_price_min": None,
+        "purchase_price_max": None,
+        "rating_min": None,
+        "rating_max": None,
+        "in_stock_only": False,
+        "sort": None,
+    }
+
+    parsed_color, parsed_title = extract_color_and_product_title(raw)
+    if parsed_color:
+        spec["color"] = parsed_color
+    elif not spec.get("color"):
+        try:
+            from services.product_intent_parser import extract_color_word_boundary
+
+            spec["color"] = extract_color_word_boundary(raw)
+        except ImportError:
+            hue = normalize_color_fuzzy(raw)
+            if hue and color_hue_mentioned_in_text(hue, raw):
+                spec["color"] = hue
+    if parsed_title:
+        spec["title_query"] = parsed_title
+
+    sku_inline = _extract_sku_from_text(raw)
+    if sku_inline:
+        spec["sku"] = sku_inline
+
+    for pat in _SIZE_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            spec["size"] = _normalize_catalog_size_value(m.group(1).strip())
+            break
+
+    brand_m = _extract_brand_literal_from_text(raw)
+    if brand_m:
+        spec["brand"] = brand_m
+    if not spec.get("brand"):
+        inferred = _infer_brand_from_message(low)
+        if inferred:
+            spec["brand"] = inferred
+
+    for pat in _PRICE_UNDER:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            if m.lastindex and m.group(1).isdigit():
+                spec["purchase_price_max"] = float(m.group(1))
+            else:
+                spec["sort"] = spec["sort"] or "purchase_price_asc"
+            break
+
+    for pat in _PRICE_OVER:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            if m.lastindex and m.group(1).isdigit():
+                spec["purchase_price_min"] = float(m.group(1))
+            else:
+                spec["sort"] = spec["sort"] or "purchase_price_desc"
+            break
+
+    purchase_low = re.search(
+        r"purchase\s+price\s+(?:under|below|max|upto)\s*(\d{2,7})",
+        low,
+        re.IGNORECASE,
+    )
+    if purchase_low:
+        spec["purchase_price_max"] = float(purchase_low.group(1))
+
+    purchase_min = re.search(
+        r"purchase\s+price\s+(?:above|over|min)\s*(\d{2,7})",
+        low,
+        re.IGNORECASE,
+    )
+    if purchase_min:
+        spec["purchase_price_min"] = float(purchase_min.group(1))
+
+    pmax, pmin = _extract_price_bounds(raw, low)
+    if pmax is not None:
+        spec["purchase_price_max"] = pmax
+    if pmin is not None:
+        spec["purchase_price_min"] = pmin
+
+    for pat in _RATING_UNDER_PATTERNS:
+        m = re.search(pat, low, re.IGNORECASE)
+        if m:
+            star_cap = None
+            if m.lastindex and m.group(1):
+                try:
+                    star_cap = float(m.group(1))
+                except ValueError:
+                    star_cap = None
+            if star_cap is None and re.search(r"\blow\s+rating\b", low):
+                star_cap = 3.0
+            if star_cap is not None:
+                spec["rating_max"] = star_cap
+            break
+
+    if spec.get("rating_min") is None:
+        for pat in _RATING_ABOVE_PATTERNS:
+            m = re.search(pat, low, re.IGNORECASE)
+            if m and m.lastindex:
+                try:
+                    spec["rating_min"] = float(m.group(1))
+                except ValueError:
+                    pass
+                break
+    m_rating_above = re.search(
+        r"\b(?:rating|stars?)\s*(\d(?:\.\d)?)\s*se\s+(?:jyada|zyada|zada|upar|zyaada)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if m_rating_above:
+        try:
+            spec["rating_min"] = float(m_rating_above.group(1))
+        except ValueError:
+            pass
+    m_rating_products = re.search(
+        r"\b(?:jin|jinki|jo)\s+products?\s+.*\b(?:rating|stars?)\b.*\b(?:jyada|zyada|upar|above|se)\b",
+        low,
+        re.IGNORECASE,
+    )
+    if m_rating_products and spec.get("rating_min") is None:
+        spec["rating_min"] = 0.01
+
+    if spec.get("rating_max") is None:
+        for pat in _RATING_PATTERNS:
+            m = re.search(pat, low, re.IGNORECASE)
+            if m:
+                wants_min = bool(re.search(r"\b(?:at\s+least|min|minimum|>=|above|se\s+upar)\b", low))
+                filter_by_rating = bool(
+                    re.search(r"\b(?:wale|wali|products?|dikhao|dikha|filter|only)\b", low)
+                )
+                if m.lastindex and m.group(1):
+                    try:
+                        star_val = float(m.group(1))
+                    except ValueError:
+                        star_val = None
+                    if star_val is not None and (
+                        wants_min
+                        or filter_by_rating
+                        or re.search(rf"\b{re.escape(m.group(1))}\s*(?:star|stars)\b", low)
+                    ):
+                        spec["rating_min"] = star_val
+                    elif star_val is None:
+                        spec["sort"] = spec["sort"] or "rating_desc"
+                    else:
+                        spec["sort"] = spec["sort"] or "rating_desc"
+                else:
+                    spec["sort"] = spec["sort"] or "rating_desc"
+                break
+
+    if not spec.get("sku"):
+        sku = _extract_first(_SKU_PATTERNS, raw)
+        if sku:
+            spec["sku"] = sku.upper() if sku.isupper() else sku
+
+    if re.search(r"\b(best|top|sabse\s+achi|sabse\s+badiya)\b", low):
+        spec["sort"] = spec["sort"] or "rating_desc"
+
+    if not spec.get("pro_id"):
+        pro_id_val = _extract_first(_PRO_ID_PATTERNS, low)
+        if pro_id_val and pro_id_val.isdigit():
+            spec["pro_id"] = int(pro_id_val)
+
+    if re.search(r"\b(?:in\s+stock|available|stock\s+me|stock\s+hai)\b", low):
+        spec["in_stock_only"] = True
+
+    if any(k in low for k in _SORT_PRICE_ASC):
+        spec["sort"] = "purchase_price_asc"
+    elif any(k in low for k in _SORT_PRICE_DESC):
+        spec["sort"] = "purchase_price_desc"
+    elif any(k in low for k in _SORT_RATING):
+        spec["sort"] = "rating_desc"
+    elif any(k in low for k in _SORT_PURCHASE_ASC):
+        spec["sort"] = "purchase_price_asc"
+
+    if re.search(r"\bsort\s+by\s+(price|rating|purchase)", low):
+        kind = re.search(r"\bsort\s+by\s+(price|rating|purchase)", low).group(1)
+        if kind == "price":
+            spec["sort"] = "purchase_price_asc" if "low" in low or "asc" in low else "purchase_price_desc"
+        elif kind == "rating":
+            spec["sort"] = "rating_desc"
+        else:
+            spec["sort"] = "purchase_price_asc"
+
+    clean_hint = (title_hint or "").strip()
+    if clean_hint:
+        if not spec.get("size"):
+            spec["size"] = _extract_size_from_text(raw) or _extract_size_from_text(clean_hint)
+        spec["title_query"] = _strip_size_from_title_query(clean_hint, spec.get("size") or "")
+        if spec.get("color"):
+            spec["title_query"] = _strip_color_from_title_query(
+                spec["title_query"], str(spec["color"])
+            )
+        spec["title_query"] = re.sub(
+            r"\b(?:product|products|item|items|ka|ke|ki|dikhao|dikha|dikao|dikhe|show|chahiye)\b",
+            " ",
+            spec["title_query"],
+            flags=re.IGNORECASE,
+        )
+        spec["title_query"] = " ".join(spec["title_query"].split()).strip()
+        if len(spec["title_query"]) < 2 and spec.get("size"):
+            spec["title_query"] = _extract_product_keywords(low) or "cover"
+        return spec
+
+    if parsed_title:
+        if spec.get("color"):
+            spec["title_query"] = _strip_color_from_title_query(parsed_title, str(spec["color"]))
+        if spec.get("size"):
+            spec["title_query"] = _strip_size_from_title_query(spec["title_query"], str(spec["size"]))
+        return spec
+
+    title = raw
+    scrub = title
+    for pat in (
+        _SIZE_PATTERNS + _BRAND_PATTERNS + _SKU_PATTERNS + _PRO_ID_PATTERNS
+        + _PRICE_UNDER + _PRICE_OVER + _RATING_PATTERNS
+    ):
+        scrub = re.sub(pat, " ", scrub, flags=re.IGNORECASE)
+    scrub = re.sub(
+        r"\b(color|colour|rang|brand|size|sku|pro\s*id|product\s*id|rating|sort|filter|"
+        r"under|below|above|cheapest|sasta|mehnga|stock|purchase\s+price|hai|kya)\b",
+        " ",
+        scrub,
+        flags=re.IGNORECASE,
+    )
+    if spec["color"]:
+        scrub = re.sub(re.escape(spec["color"]), " ", scrub, flags=re.IGNORECASE)
+    if spec.get("brand"):
+        scrub = re.sub(re.escape(str(spec["brand"])), " ", scrub, flags=re.IGNORECASE)
+    product_kw = _extract_product_keywords(low)
+    words = [
+        w
+        for w in re.findall(r"[a-z0-9]+", scrub.lower())
+        if w not in _FILTER_STOP and w not in _BRAND_STOP and len(w) > 1
+    ]
+    mapped_words = []
+    for w in words:
+        if spec.get("sku") and w == spec["sku"].lower():
+            continue
+        mw = _NOUN_TYPO_MAP.get(w, w)
+        if mw not in mapped_words:
+            mapped_words.append(mw)
+    spec["title_query"] = product_kw or " ".join(mapped_words[:8]).strip()
+    if spec.get("sku"):
+        spec["title_query"] = product_kw or ""
+    if len(spec["title_query"]) < 2 and any(
+        [
+            spec.get("brand"),
+            spec.get("sku"),
+            spec.get("pro_id"),
+            category_id,
+            spec.get("color"),
+            spec.get("size"),
+            spec.get("sort"),
+            spec.get("unit_price_max") is not None,
+        ]
+    ):
+        spec["title_query"] = product_kw or ""
+
+    return spec
+
+
+def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: int = 0) -> dict:
+    must: list[dict] = []
+    filters: list[dict] = []
+
+    if spec.get("pro_id"):
+        filters.append({"term": {"pro_id": int(spec["pro_id"])}})
+    if spec.get("sku"):
+        sku_val = spec["sku"]
+        if spec.get("strict_sku_match"):
+            filters.append({"term": {"sku": {"value": sku_val, "case_insensitive": True}}})
+        else:
+            filters.append(
+                {
+                    "bool": {
+                        "should": [
+                            {"term": {"sku": {"value": sku_val, "case_insensitive": True}}},
+                            {"wildcard": {"sku": f"*{sku_val}*"}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                }
+            )
+    if spec.get("category_id"):
+        filters.append({"term": {"category_id": int(spec["category_id"])}})
+    if spec.get("color"):
+        c = str(spec["color"]).strip()
+        color_values: list[str] = []
+        for variant in (c, c.title(), c.capitalize(), *_color_spelling_variants(c)):
+            v = (variant or "").strip()
+            if v and v not in color_values:
+                color_values.append(v)
+        color_should: list[dict] = []
+        for cv in color_values:
+            color_should.append(
+                {
+                    "term": {
+                        "color_name": {
+                            "value": cv,
+                            "case_insensitive": True,
+                        }
+                    }
+                }
+            )
+            color_should.append({"match_phrase": {"color_name": cv}})
+        if c.lower() == "multicolor":
+            color_should.append({"match_phrase": {"name": "multicolor"}})
+        filters.append({"bool": {"should": color_should, "minimum_should_match": 1}})
+    if spec.get("size"):
+        filters.append({"match": {"size": spec["size"]}})
+    aliases = spec.get("brand_aliases") or []
+    brand_tokens = aliases if isinstance(aliases, list) and aliases else []
+    if not brand_tokens and spec.get("brand"):
+        brand_tokens = [spec["brand"]]
+    name_should = _brand_name_should_clauses(brand_tokens)
+    if name_should:
+        filters.append({"bool": {"should": name_should, "minimum_should_match": 1}})
+    if spec.get("unit_price_min") is not None:
+        filters.append({"range": {"unit_price": {"gte": spec["unit_price_min"]}}})
+    if spec.get("unit_price_max") is not None:
+        filters.append({"range": {"unit_price": {"lte": spec["unit_price_max"]}}})
+    if not spec.get("_os_price_filter_disabled"):
+        if spec.get("purchase_price_min") is not None:
+            filters.append({"range": {"purchase_price": {"gte": spec["purchase_price_min"]}}})
+        if spec.get("purchase_price_max") is not None:
+            filters.append({"range": {"purchase_price": {"lte": spec["purchase_price_max"]}}})
+    if spec.get("rating_min") is not None:
+        filters.append({"range": {"rating": {"gte": spec["rating_min"]}}})
+    if spec.get("rating_max") is not None:
+        filters.append({"range": {"rating": {"lt": float(spec["rating_max"])}}})
+    if spec.get("in_stock_only"):
+        filters.append({"range": {"stock": {"gt": 0}}})
+
+    filters.append({"term": {"published": 1}})
+    filters.append({"term": {"approved": 1}})
+
+    title = (spec.get("title_query") or "").strip()
+    if spec.get("sku") and not title:
+        pass
+    elif title:
+        must.append(
+            {
+                "multi_match": {
+                    "query": title,
+                    "fields": ["name^3", "sku^2", "brand", "category_name"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO",
+                }
+            }
+        )
+
+    if must or filters:
+        query: dict = {"bool": {}}
+        if must:
+            query["bool"]["must"] = must
+        if filters:
+            query["bool"]["filter"] = filters
+    else:
+        query = {"match_all": {}}
+
+    body: dict[str, Any] = {"size": min(size, MAX_PAGE_SIZE), "from": max(0, offset), "query": query}
+
+    sort_key = spec.get("sort")
+    if sort_key == "unit_price_asc":
+        body["sort"] = [{"unit_price": "asc"}, {"_score": "desc"}]
+    elif sort_key == "unit_price_desc":
+        body["sort"] = [{"unit_price": "desc"}, {"_score": "desc"}]
+    elif sort_key == "rating_desc":
+        body["sort"] = [{"rating": {"order": "desc", "missing": "_last"}}, {"_score": "desc"}]
+    elif sort_key == "purchase_price_asc":
+        body["sort"] = [{"purchase_price": "asc"}, {"_score": "desc"}]
+    elif sort_key == "purchase_price_desc":
+        body["sort"] = [{"purchase_price": "desc"}, {"_score": "desc"}]
+
+    return body
+
+
+def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
+    from services import kb_service as _kb
+
+    sysmsg = _kb.sysmsg
+    cards = []
+    for hit in hits or []:
+        src = hit.get("_source") if isinstance(hit, dict) else {}
+        if not isinstance(src, dict):
+            continue
+        name = src.get("name") or sysmsg("default_product_card_title")
+        from services.welfog_api import format_customer_price_display
+
+        price = format_customer_price_display(src, sysmsg("na_price"))
+        thumb = (src.get("thumbnail_img") or "").lstrip("/")
+        slug = (src.get("slug") or "").strip()
+        link = (
+            f"https://welfog.com/product_details/{slug}"
+            if slug
+            else "https://welfog.com"
+        )
+        cards.append(
+            {
+                "name": name,
+                "price": price,
+                "image": f"{IMAGE_BASE_URL}{thumb}" if thumb else "",
+                "link": link,
+                "pro_id": src.get("pro_id"),
+                "sku": src.get("sku") or "",
+                "size": src.get("size") or "",
+                "rating": src.get("rating"),
+                "color_name": src.get("color_name") or src.get("color") or "",
+                "color": src.get("color_name") or src.get("color") or "",
+                "brand": src.get("brand") or "",
+                "score": hit.get("_score") or 0,
+            }
+        )
+    return cards
+
+
+def _opensearch_request(body: dict) -> tuple[list, int]:
+    cfg = _env_opensearch_config()
+    if not cfg:
+        return [], 0
+    try:
+        res = requests.post(cfg["url"], json=body, auth=cfg["auth"], timeout=14)
+        if res.status_code != 200:
+            return [], 0
+        data = res.json()
+        hits_wrap = data.get("hits") or {}
+        hits = hits_wrap.get("hits") or []
+        total_obj = hits_wrap.get("total") or {}
+        total = int(total_obj.get("value", len(hits)) if isinstance(total_obj, dict) else len(hits))
+        return hits, total
+    except Exception:
+        return [], 0
+
+
+def _search_opensearch_page(
+    spec: dict[str, Any],
+    *,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+    post_filter_mode: str = "strict",
+) -> tuple[list[dict], int, bool]:
+    page = max(1, int(page))
+    page_size = min(max(1, int(page_size)), MAX_PAGE_SIZE)
+    offset = (page - 1) * page_size
+    body = _build_opensearch_body(spec, size=page_size, offset=offset)
+    hits, os_total = _opensearch_request(body)
+    cards = opensearch_hits_to_product_cards(hits)
+    cards = apply_catalog_post_filters(cards, spec, post_filter_mode=post_filter_mode)
+    if cards:
+        from services.welfog_api import sync_product_cards_prices_from_rest_api
+
+        q = (spec.get("title_query") or "").strip()
+        if q:
+            cards = sync_product_cards_prices_from_rest_api(
+                cards,
+                q,
+                color=spec.get("color"),
+                category_id=spec.get("category_id"),
+            )
+        if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
+            cards = filter_products_by_purchase_price(cards, spec)
+        if spec.get("rating_min") is not None or spec.get("rating_max") is not None:
+            cards = filter_products_by_rating_range(cards, spec)
+    raw_has_more = (offset + len(hits)) < max(int(os_total or 0), offset + len(hits))
+    has_more = raw_has_more and len(cards) >= page_size
+    return cards, len(cards), has_more
+
+
+def product_search_show_view_more(
+    products: list,
+    has_more: bool,
+    *,
+    page_size: int = PAGE_SIZE,
+    min_count: int = MIN_PRODUCTS_FOR_VIEW_MORE,
+) -> bool:
+    """Only offer pagination when the first page is full enough to matter."""
+    if not products or not has_more:
+        return False
+    if len(products) < min_count:
+        return False
+    if len(products) < page_size:
+        return False
+    return True
+
+
+def search_opensearch_products(
+    spec: dict[str, Any],
+    *,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+    post_filter_mode: str = "strict",
+) -> tuple[list[dict], int, bool]:
+    """Returns (product_cards, visible_count, has_more)."""
+    return _search_opensearch_page(
+        spec, page=page, page_size=page_size, post_filter_mode=post_filter_mode
+    )
+
+
+def search_opensearch_catalog(
+    spec: dict[str, Any],
+    *,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+) -> tuple[list[dict], dict[str, Any], int, bool]:
+    """
+    OpenSearch-only catalog search with tiered relax (never returns unrelated REST junk).
+    Filters: title_query, color, brand/aliases, size, unit_price, SKU, pro_id, category_id, sort.
+    """
+    from utils.reasoning_log import log_reasoning
+
+    spec = sanitize_product_search_spec(dict(spec or {}))
+    if not is_opensearch_configured():
+        log_reasoning("OpenSearch not configured (OPENSEARCH_URL missing).")
+        return [], spec, 0, False
+
+    log_reasoning(
+        f"OpenSearch catalog: title={spec.get('title_query')!r} color={spec.get('color')!r} "
+        f"size={spec.get('size')!r} brand={spec.get('brand')!r} sku={spec.get('sku')!r} pro_id={spec.get('pro_id')} "
+        f"price_max={spec.get('purchase_price_max')!r} price_min={spec.get('purchase_price_min')!r}"
+    )
+
+    pf = _post_filter_mode_for_spec(spec)
+    cards, n, more = _search_opensearch_page(
+        spec, page=page, page_size=page_size, post_filter_mode=pf
+    )
+    if cards:
+        log_reasoning(f"OpenSearch tier-1: {n} product(s) matched colour/keywords.")
+        cards = filter_products_by_purchase_price(cards, spec)
+        cards = filter_products_by_rating_range(cards, spec)
+        if cards:
+            try:
+                from services.product_intent_parser import log_opensearch_query
+
+                log_opensearch_query(spec, len(cards))
+            except ImportError:
+                pass
+            return cards, spec, len(cards), more
+
+    if spec.get("strict_no_relax"):
+        log_reasoning("OpenSearch strict mode — zero hits, no filter relaxation.")
+        try:
+            from services.product_intent_parser import log_opensearch_query
+
+            log_opensearch_query(spec, 0)
+        except ImportError:
+            pass
+        return [], spec, 0, False
+
+    has_price_f = (
+        spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None
+    )
+    if not cards and has_price_f and (spec.get("title_query") or "").strip():
+        wide_price = dict(spec)
+        wide_price["_os_price_filter_disabled"] = True
+        wide_price["title_match_strict"] = False
+        wide_price.pop("mandatory_match_tokens", None)
+        cards, n, more = _search_opensearch_page(
+            wide_price,
+            page=page,
+            page_size=min(page_size * 3, MAX_PAGE_SIZE),
+            post_filter_mode="os_filters_only",
+        )
+        if cards:
+            log_reasoning(
+                "OpenSearch tier-1p: title search without OS price filter, post-filter budget."
+            )
+            cards = filter_products_by_purchase_price(cards, spec)
+            cards = filter_products_by_rating_range(cards, spec)
+            if cards:
+                return cards, wide_price, len(cards), more
+
+    if spec.get("sku"):
+        sku_only = dict(spec)
+        sku_only["title_query"] = ""
+        sku_only.pop("mandatory_match_tokens", None)
+        sku_only["title_match_strict"] = False
+        cards, n, more = _search_opensearch_page(
+            sku_only, page=page, page_size=page_size, post_filter_mode="light"
+        )
+        if cards:
+            cards = filter_products_by_requested_sku(cards, str(spec["sku"]))
+            if cards:
+                log_reasoning(f"OpenSearch tier-sku: {len(cards)} hit(s) for SKU {spec['sku']!r}.")
+                return cards, sku_only, len(cards), more
+
+    if spec.get("brand"):
+        boosted = dict(spec)
+        boosted["title_query"] = _catalog_title_for_search(spec) or spec.get("title_query")
+        boosted.pop("mandatory_match_tokens", None)
+        boosted["title_match_strict"] = False
+        cards, n, more = _search_opensearch_page(
+            boosted, page=page, page_size=page_size, post_filter_mode="os_filters_only"
+        )
+        if cards:
+            cards = filter_products_strict_brand_match(
+                cards,
+                spec.get("brand"),
+                spec.get("brand_aliases"),
+            )
+        if cards:
+            log_reasoning(
+                f"OpenSearch tier-1c: title={boosted.get('title_query')!r} + brand filter."
+            )
+            cards = filter_products_by_purchase_price(cards, spec)
+            cards = filter_products_by_rating_range(cards, spec)
+            if cards:
+                return cards, boosted, len(cards), more
+
+    if spec.get("color") and (spec.get("title_query") or "").strip():
+        title_pf = dict(spec)
+        title_pf.pop("color", None)
+        title_pf.pop("mandatory_match_tokens", None)
+        title_pf["title_match_strict"] = False
+        cards, n, more = _search_opensearch_page(
+            title_pf, page=page, page_size=page_size, post_filter_mode="os_filters_only"
+        )
+        if cards:
+            cards = filter_products_by_requested_color(cards, spec.get("color"))
+            need = _title_match_tokens(spec.get("title_query") or "")
+            if need:
+                cards = filter_products_by_ai_mandatory_tokens(
+                    cards, need, skip_color_tokens=True
+                )
+            mats = spec.get("material_tokens") or []
+            if mats:
+                cards = filter_products_by_material_tokens(cards, mats)
+        if cards:
+            log_reasoning(
+                f"OpenSearch tier-1b: title={spec.get('title_query')!r} + color_name={spec.get('color')!r}."
+            )
+            return cards, title_pf, len(cards), more
+
+    relaxed = dict(spec)
+    relaxed.pop("mandatory_match_tokens", None)
+    relaxed["title_match_strict"] = False
+    cards, n, more = _search_opensearch_page(
+        relaxed, page=page, page_size=page_size, post_filter_mode="os_filters_only"
+    )
+    if cards:
+        log_reasoning("OpenSearch tier-2: OS filters + brand/colour post-filter.")
+        return cards, relaxed, n, more
+
+    if spec.get("color") and (spec.get("title_query") or "").strip():
+        color_only = dict(spec)
+        color_only["title_query"] = ""
+        color_only.pop("mandatory_match_tokens", None)
+        cards, n, more = _search_opensearch_page(
+            color_only, page=page, page_size=page_size, post_filter_mode="os_filters_only"
+        )
+        if cards:
+            need = _title_match_tokens(spec.get("title_query") or "")
+            if need:
+                cards = [
+                    p
+                    for p in cards
+                    if any(_product_type_token_in_name(t, (p.get("name") or "").lower()) for t in need)
+                ]
+            if cards:
+                log_reasoning(
+                    f"OpenSearch tier-2b: colour={spec.get('color')!r} then product-type filter."
+                )
+                return cards, color_only, len(cards), more
+
+    brand_key = (spec.get("brand") or "").strip().lower()
+    if brand_key and brand_key not in _COLOR_NAME_TOKENS:
+        wider = dict(relaxed)
+        wider.pop("brand", None)
+        wider.pop("brand_aliases", None)
+        cards, n, more = _search_opensearch_page(
+            wider, page=page, page_size=page_size, post_filter_mode="os_filters_only"
+        )
+        if cards:
+            log_reasoning("OpenSearch tier-3: title + colour (phone model relaxed).")
+            return cards, wider, n, more
+
+    return [], spec, 0, False
+
+
+def cheapest_alternative_hint(spec: dict[str, Any]) -> str:
+    """When price filter has zero hits, find lowest-priced item in same category keywords."""
+    if (spec.get("title_query") or "").strip():
+        return ""
+    relaxed = dict(spec)
+    relaxed.pop("unit_price_max", None)
+    relaxed.pop("unit_price_min", None)
+    products, _total, _ = search_opensearch_products(relaxed, page=1, page_size=5)
+    if not products:
+        return ""
+    cheapest = min(products, key=lambda p: float(p.get("price") or 999999))
+    price = cheapest.get("price")
+    name = (cheapest.get("name") or "a product")[:40]
+    if price:
+        return f" Lowest available match: <b>{name}</b> at Rs {price}."
+    return ""
+
+
+def _category_browse_rest_fallback(
+    spec: dict[str, Any],
+    *,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+    ctx=None,
+) -> tuple[list[dict], dict[str, Any], int, bool]:
+    """REST fallback when OpenSearch is empty and browse is category-only (no title filter)."""
+    cat_id = spec.get("category_id")
+    if not cat_id:
+        return [], spec, 0, False
+    if (spec.get("title_query") or "").strip():
+        return [], spec, 0, False
+
+    from services.welfog_api import fetch_products_by_category_browse
+    from utils.reasoning_log import log_reasoning
+
+    log_reasoning(f"Catalog: category-only REST browse categories={cat_id}")
+    rest, effective_cid = fetch_products_by_category_browse(
+        cat_id,
+        ctx=ctx,
+        page=page,
+        color=spec.get("color"),
+    )
+    if not rest:
+        return [], spec, 0, False
+
+    out_spec = dict(spec)
+    out_spec["category_id"] = effective_cid
+    try:
+        from services.welfog_api import strip_category_browse_conflicts_from_spec
+
+        out_spec = strip_category_browse_conflicts_from_spec(out_spec, ctx=ctx)
+    except ImportError:
+        pass
+    pf = _post_filter_mode_for_spec(out_spec)
+    rest = apply_catalog_post_filters(rest, out_spec, post_filter_mode=pf)
+    if not rest:
+        return [], out_spec, 0, False
+    start = (page - 1) * page_size
+    slice_rest = rest[start : start + page_size]
+    has_more_rest = len(rest) > start + page_size
+    return slice_rest, out_spec, len(rest), has_more_rest
+
+
+def _filter_only_rest_fallback(
+    spec: dict[str, Any],
+    *,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+) -> tuple[list[dict], dict[str, Any], int, bool]:
+    """REST pool + post-filter when user asked price/rating only (no product title)."""
+    if (spec.get("title_query") or "").strip() or spec.get("pro_id") or spec.get("sku"):
+        return [], spec, 0, False
+    has_filter = any(
+        spec.get(k) is not None
+        for k in ("purchase_price_max", "purchase_price_min", "rating_min", "rating_max", "color", "size")
+    )
+    if not has_filter:
+        return [], spec, 0, False
+    from services.welfog_api import fetch_catalog_browse_products
+    from utils.reasoning_log import log_reasoning
+
+    log_reasoning("Catalog: filter-only REST browse + post-filter.")
+    pool = fetch_catalog_browse_products(max_pages=6)
+    pf = _post_filter_mode_for_spec(spec)
+    rest = apply_catalog_post_filters(pool, spec, post_filter_mode=pf)
+    if not rest:
+        return [], spec, 0, False
+    start = (page - 1) * page_size
+    slice_rest = rest[start : start + page_size]
+    has_more_rest = len(rest) > start + page_size
+    return slice_rest, spec, len(rest), has_more_rest
+
+
+def search_products_combined(
+    text: str,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    category_id=None,
+    color=None,
+    title_hint: str = "",
+    pro_id: Optional[int] = None,
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+    ctx=None,
+) -> tuple[list[dict], dict, int, bool]:
+    """
+    OpenSearch first (filters/sort/catalog), REST API fallback.
+    Returns (products, spec, total, has_more).
+    """
+    if original_msg or msg_en:
+        spec = build_product_search_spec(
+            original_msg or text,
+            msg_en or text,
+            category_id=category_id,
+            color=color,
+            title_hint=title_hint,
+            pro_id=pro_id,
+        )
+    else:
+        spec = parse_product_filters_from_text(
+            text,
+            category_id=category_id,
+            color=color,
+            title_hint=title_hint,
+            pro_id=pro_id,
+        )
+    products, total, has_more = search_opensearch_products(
+        spec, page=page, page_size=page_size, post_filter_mode=_post_filter_mode_for_spec(spec)
+    )
+    if products:
+        return products, spec, total, has_more
+
+    if not (title_hint or spec.get("title_query") or "").strip():
+        filt_rest = _filter_only_rest_fallback(spec, page=page, page_size=page_size)
+        if filt_rest[0]:
+            return filt_rest
+        cat_rest = _category_browse_rest_fallback(
+            spec, page=page, page_size=page_size, ctx=ctx
+        )
+        if cat_rest[0]:
+            return cat_rest
+
+    q = (title_hint or spec.get("title_query") or "").strip()
+    if not q:
+        q = _extract_product_keywords((text or "").lower())
+    if not q and (original_msg or msg_en):
+        q = _extract_product_keywords(f"{original_msg} {msg_en}".lower())
+    if not q:
+        filt_rest = _filter_only_rest_fallback(spec, page=page, page_size=page_size)
+        if filt_rest[0]:
+            return filt_rest
+        cat_rest = _category_browse_rest_fallback(
+            spec, page=page, page_size=page_size, ctx=ctx
+        )
+        if cat_rest[0]:
+            return cat_rest
+        return [], spec, 0, False
+
+    from utils.reasoning_log import log_reasoning
+
+    log_reasoning(f"OpenSearch empty — live REST catalog: name={q!r} color={spec.get('color')!r}")
+    cat = category_id or spec.get("category_id")
+    if cat:
+        from services.welfog_api import resolve_search_category_id
+
+        cat = resolve_search_category_id(str(cat), ctx)
+    rest = fetch_products_from_api(
+        q,
+        category_id=cat,
+        color=color or spec.get("color"),
+        page=page,
+    )
+    if rest:
+        pf = _post_filter_mode_for_spec(spec)
+        rest = apply_catalog_post_filters(rest, spec, post_filter_mode=pf)
+        if rest:
+            start = (page - 1) * page_size
+            slice_rest = rest[start : start + page_size]
+            has_more_rest = len(rest) > start + page_size
+            return slice_rest, spec, len(rest), has_more_rest
+    return [], spec, 0, False
+
+
+def catalog_search_live(
+    spec: dict[str, Any],
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    page: int = 1,
+    page_size: int = PAGE_SIZE,
+    ctx=None,
+) -> tuple[list[dict], dict[str, Any], int, bool]:
+    """
+    Full Welfog catalog: OpenSearch index first (fast filters), then live REST API for
+    fashion/grocery/electronics when the index slice is empty or incomplete.
+    """
+    from utils.reasoning_log import log_reasoning
+
+    spec = sanitize_product_search_spec(dict(spec or {}))
+    products, spec, total, has_more = search_opensearch_catalog(
+        spec, page=page, page_size=page_size
+    )
+    if products:
+        return products, spec, total, has_more
+
+    if spec.get("strict_no_relax") and spec.get("pro_id"):
+        return [], spec, 0, False
+
+    if not (spec.get("title_query") or "").strip():
+        filt_rest = _filter_only_rest_fallback(spec, page=page, page_size=page_size)
+        if filt_rest[0]:
+            return filt_rest
+        cat_rest = _category_browse_rest_fallback(
+            spec, page=page, page_size=page_size, ctx=ctx
+        )
+        if cat_rest[0]:
+            return cat_rest
+
+    text = f"{original_msg} {msg_en}".strip() or (spec.get("title_query") or "")
+    q = _catalog_title_for_search(spec) or (spec.get("title_query") or "").strip()
+    if not q:
+        q = _extract_product_keywords(text.lower())
+    if not q:
+        filt_rest = _filter_only_rest_fallback(spec, page=page, page_size=page_size)
+        if filt_rest[0]:
+            return filt_rest
+        cat_rest = _category_browse_rest_fallback(
+            spec, page=page, page_size=page_size, ctx=ctx
+        )
+        if cat_rest[0]:
+            return cat_rest
+        return [], spec, 0, False
+
+    log_reasoning(f"Catalog: OpenSearch 0 hits — live REST API name={q!r}")
+    cat_id = spec.get("category_id")
+    if cat_id:
+        from services.welfog_api import resolve_search_category_id
+
+        cat_id = resolve_search_category_id(str(cat_id), ctx)
+    rest = fetch_products_from_api(
+        q,
+        category_id=cat_id,
+        color=spec.get("color"),
+        page=page,
+    )
+    brand_key = (spec.get("brand") or "").strip()
+    if not rest and brand_key:
+        log_reasoning(f"Catalog: REST brand browse name={brand_key!r}")
+        for pg in (1, 2, 3):
+            rest.extend(
+                fetch_products_from_api(
+                    brand_key,
+                    category_id=spec.get("category_id"),
+                    color=spec.get("color"),
+                    page=pg,
+                )
+            )
+            if len(rest) >= 40:
+                break
+        seen_rest: set = set()
+        uniq_rest = []
+        for it in rest:
+            k = it.get("slug") or it.get("id")
+            if k is not None and k in seen_rest:
+                continue
+            if k is not None:
+                seen_rest.add(k)
+            uniq_rest.append(it)
+        rest = uniq_rest
+    if not rest:
+        return [], spec, 0, False
+    pf = _post_filter_mode_for_spec(spec)
+    rest = apply_catalog_post_filters(rest, spec, post_filter_mode=pf)
+    if brand_key:
+        rest = filter_products_strict_brand_match(
+            rest, brand_key, spec.get("brand_aliases")
+        )
+    if not rest:
+        return [], spec, 0, False
+    start = (page - 1) * page_size
+    slice_rest = rest[start : start + page_size]
+    has_more_rest = len(rest) > start + page_size
+    return slice_rest, spec, len(rest), has_more_rest
+
+
+def build_product_cards_html(products: list[dict], sysmsg) -> str:
+    html = []
+    for p in products:
+        html.append("<div class='wf-product-card'>")
+        if p.get("image"):
+            html.append(
+                f"<div style='width: 100%; height: 130px; background-color: #f9f9f9; border-radius: 8px; "
+                f"overflow: hidden; margin-bottom: 10px; display: flex; align-items: center; justify-content: center; "
+                f"border: 1px solid #f0f0f0;'><img src='{p['image']}' alt='{p['name']}' "
+                f"style='max-width: 100%; max-height: 100%; object-fit: contain; display: block;'></div>"
+            )
+        else:
+            html.append(
+                f"<div style='width: 100%; height: 130px; background: #f0f0f0; border-radius: 8px; "
+                f"margin-bottom: 10px; display: flex; align-items: center; justify-content: center; "
+                f"color: #999; font-size: 12px; border: 1px solid #e0e0e0;'>{sysmsg('no_image')}</div>"
+            )
+        name = p.get("name") or ""
+        name_short = name[:38] + "..." if len(name) > 38 else name
+        html.append(
+            f"<div style='font-size: 13px; font-weight: 600; color: #333; margin-bottom: 6px; height: 34px; "
+            f"overflow: hidden; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; "
+            f"-webkit-box-orient: vertical;'>{name_short}</div>"
+        )
+        html.append(
+            f"<div style='font-size: 15px; font-weight: bold; color: #ff7a00; margin-bottom: 12px; "
+            f"margin-top: auto;'>₹{p.get('price', '')}</div>"
+        )
+        if p.get("link"):
+            html.append(
+                f"<a href='{p['link']}' target='_blank' rel='noopener noreferrer'>"
+                f"{sysmsg('view_product')}</a>"
+            )
+        html.append("</div>")
+    return "".join(html)
+
+
+def _build_product_view_more_tail(
+    sysmsg,
+    *,
+    has_more: bool,
+    products: list,
+    next_page: int = 2,
+    browse_more_url: str = "",
+) -> str:
+    if not product_search_show_view_more(products, has_more):
+        return ""
+    label = sysmsg("products_view_more") or "View more products"
+    if browse_more_url:
+        safe_url = html_escape(browse_more_url, quote=True)
+        return (
+            "<div class='wf-product-tail' style='margin-top:12px;text-align:center;'>"
+            f"<a href='{safe_url}' target='_blank' rel='noopener noreferrer' "
+            f"class='wf-ph-more wf-product-more wf-product-more-link'>"
+            f"<span class='wf-ph-more__label'>{label}</span></a></div>"
+        )
+    return (
+        "<div class='wf-product-tail' style='margin-top:12px;text-align:center;'>"
+        f"<button type='button' class='wf-ph-more wf-product-more' data-next-product-page=\"{next_page}\">"
+        f"<span class='wf-ph-more__label'>{label}</span></button></div>"
+    )
+
+
+def build_product_rail_with_pagination(
+    products: list[dict],
+    sysmsg,
+    *,
+    has_more: bool = False,
+    next_page: int = 2,
+    browse_more_url: str = "",
+) -> str:
+    html = "<div class='wf-product-root'><div class='wf-product-rail'>"
+    html += build_product_cards_html(products, sysmsg)
+    html += "</div>"
+    html += _build_product_view_more_tail(
+        sysmsg,
+        has_more=has_more,
+        products=products,
+        next_page=next_page,
+        browse_more_url=browse_more_url,
+    )
+    html += "</div>"
+    return html
+
+
+def format_product_search_append_payload(user_ctx_data: dict, page: int) -> dict:
+    spec = (user_ctx_data or {}).get("last_os_spec") or {}
+    if not spec:
+        return {"cards_html": "", "tail_html": ""}
+    products, _total, has_more = search_opensearch_products(spec, page=page, page_size=PAGE_SIZE)
+    if not products:
+        return {"cards_html": "", "tail_html": ""}
+    from services import kb_service as _kb
+    from services.welfog_api import build_welfog_product_browse_url
+
+    cards = build_product_cards_html(products, _kb.sysmsg)
+    browse_url = (user_ctx_data or {}).get("product_browse_url") or build_welfog_product_browse_url(spec)
+    tail = _build_product_view_more_tail(
+        _kb.sysmsg,
+        has_more=has_more,
+        products=products,
+        next_page=page + 1,
+        browse_more_url=browse_url,
+    )
+    return {"cards_html": cards, "tail_html": tail}
+

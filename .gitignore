@@ -1,29 +1,48 @@
 # Python
 __pycache__/
 **/__pycache__/
-*.pyc
-**/*.pyc
+*.py[cod]
+*$py.class
 *.pyo
+.Python
+*.egg-info/
+dist/
+build/
+.eggs/
 
 # Virtual env
 venv/
+.venv/
+env/
 
-# Database
-db.sqlite3
-
-# Env files
+# Secrets — never commit real keys
 .env
+.env.local
+.env.*.local
+!.env.example
 
-# VS Code
+# IDE / editor
 .vscode/
+.idea/
+.cursor/
+.continue/
+*.swp
+*.swo
 
-# OS files
+# OS
 .DS_Store
 Thumbs.db
+desktop.ini
 
-# Logs
+# Logs & debug
 *.log
+debug-*.log
 
-# Django migrations (optional)
-*/migrations/*
-!*/migrations/__init__.py
+# Local runtime DB (optional history copy at repo root)
+welfog_history.db
+
+# Test / temp caches
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/

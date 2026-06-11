@@ -21,6 +21,9 @@
     <div class="composer">
         <div class="composer__inner">
             <input type="text" id="chatInput" class="composer__input" placeholder="Ask anything" autocomplete="off" />
+            <button type="button" class="composer__mic" id="chatMicBtn" title="Dictate (Ctrl+Shift+D)" aria-label="Start voice dictation" aria-pressed="false">
+                <i class="fas fa-microphone" aria-hidden="true"></i>
+            </button>
             <button type="button" class="composer__send send-btn" id="chatSendBtn" onclick="send()" title="Send" aria-label="Send message"><i class="fas fa-paper-plane"></i></button>
         </div>
     </div>

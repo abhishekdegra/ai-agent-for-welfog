@@ -1,0 +1,76 @@
+WELFOG CHAT — MASTER ROUTING (semantic topics, NOT keyword lists)
+================================================================
+
+Groq reads this + RECENT CONVERSATION + LATEST USER MESSAGE to choose intent and kb_keys.
+Customers use any Indian language (Tamil, Hindi, Telugu, English, Roman Hinglish, typos).
+
+TOPIC → intent → data_channel → handler
+---------------------------------------
+
+| User means | intent | data_channel | Backend |
+|------------|--------|--------------|---------|
+| Can you deliver to my PIN / friend’s area / city? | pincode_check | live_api | POST check_pincode |
+| Where is MY order / track / kab aayega / delay / NOT received / nahi pahucha | order | live_api | welfog_track — NOT order_history list |
+| Show full purchase list / meri orders dikhao / history list in chat | order_history | live_api | purchase history API — NOT single-order track |
+| How to PLACE a new order / checkout steps / order kaise karte h | general | kb | faqs + order_placement_help — needs_order_id=false, NOT tracking |
+| Show MY past orders list / which orders I placed / order list dikhao | order_history | live_api | purchase history API — NOT order tracking, do NOT ask Order ID |
+| HOW/WHERE to view order history in the app (process, steps, kaha jake dekhun, app par) — NOT list in chat | general | kb | order_history_help — NOT purchase-history API, NOT Order ID |
+| Order ID kahan milegi / mere order ids | order_id | live_api | order id API |
+| Find / buy ANY product on Welfog (grocery, fashion, electronics, home, beauty, toys — any wording/language) | product | catalog | AI product_requests → OpenSearch + catalog API — NEVER off_topic |
+| Same as above but with colour/size/price filter in ANY language (green covers, neeli shirt, black wale, under 500) | product | catalog | AI sets color + search_terms separately — NOT KB FAQ |
+| Today’s deals / offers | deals | live_api | deals API |
+| All categories list | categories | live_api | nav categories |
+| Browse by category on home | category_feed | live_api | category feed |
+| My wishlist in chat (saved/liked/heart — NOT purchased) | wishlist | live_api | wishlist API — account_list_kind=wishlist_in_chat |
+| How to view wishlist in app (steps only) | general | kb | wishlist_howto_kb — account_list_kind=wishlist_howto |
+| Full purchase list in chat (bought/placed orders — NOT saved-only) | order_history | live_api | purchase history API — account_list_kind=purchase_history_in_chat |
+| How to view order history in app | general | kb | order_history_howto — account_list_kind=purchase_history_howto |
+
+ACCOUNT_LIST_KIND (AI — semantic, not keyword lists)
+----------------------------------------------------
+Every route JSON must set account_list_kind when user asks for THEIR saved items OR THEIR purchases:
+- wishlist_in_chat / purchase_history_in_chat = show list HERE in chat (live_api).
+- wishlist_howto / purchase_history_howto = app navigation steps only (KB).
+- none = all other topics.
+Saved/liked/heart ≠ purchased/order history — user_meaning and account_list_kind must agree.
+| Refund / return / payment policy or my refund status | refund or payment or general | kb | knowledge files |
+| Privacy / terms / shipping policy / FAQ / company info | general | kb | knowledge files |
+| Customer care phone / email | general | kb | support contact files |
+| Amazon / Flipkart order (other company) | out_of_domain | none | polite decline |
+| Random non-shopping (recipe, cricket, girlfriend, life advice) | out_of_domain | none | polite decline — NEVER product catalog |
+| Seller account / seller login / sell on Welfog | seller | kb | seller.txt + support |
+| Hi / namaste / small talk | general | none | conversation_scope=general_chitchat + scope_reply in customer language |
+| Random non-shopping (any language, unseen wording) | out_of_domain | none | conversation_scope=out_of_domain + scope_reply — NEVER catalog/KB |
+
+CONVERSATION_SCOPE (AI — semantic, NOT keyword lists)
+-----------------------------------------------------
+Every route JSON must set conversation_scope + scope_reply when not shopping:
+- welfog_support: normal table above; scope_reply empty.
+- general_chitchat: greeting, thanks, who is this bot, light talk — warm short scope_reply; meta_kind conversational or assistant_intro.
+- out_of_domain: weather, sports, recipes, other apps, life advice, personal stories — polite scope_reply; intent=out_of_domain; NEVER product search.
+
+DISAMBIGUATION (critical — same words, different topics)
+------------------------------------------------------
+- "order" + "deliver to PIN" / "friend lives in 302034" / "order karna chahta" at a place = pincode_check (serviceability), NOT order tracking.
+- "order" + "track" / "status" / "kab aayega" / "nahi aaya" = order tracking.
+- 4–20 digit number after bot asked for Order ID = order_id context (not pincode).
+- 6-digit number in delivery/PIN question = pincode.
+- "product pahucha dega" at a PIN = delivery to PIN, NOT catalog search.
+
+NUMBERS
+-------
+- extracted_pincode: 6-digit Indian PIN when topic is serviceability.
+- Order ID: 4–20 digits (or 4–20 alphanumeric chars) when topic is tracking/refund/payment; use numeric_context field.
+- Catalog pro_id: product lookup when user asks products for that id.
+
+FOLLOW-UPS
+----------
+- Read RECENT CONVERSATION. Short replies ("ha", "302034 per?", "887889 y rha") continue the active topic.
+- reuse_user_value_from_chat when user says they already sent id/pin but this message has no digits.
+
+kb_keys
+-------
+- Pick filenames that match topic (shipping, refund, faqs, company, welfog_api, welfog_api_order_history, etc.).
+- Internal playbook files (order_tracking_examples) are for specialists only — never paste to customer.
+
+If unsure: intent=general, empty search_query, kb_keys include faqs and company.

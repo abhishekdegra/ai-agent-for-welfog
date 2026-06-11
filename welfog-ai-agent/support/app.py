@@ -6,19 +6,54 @@ Welfog support application entrypoint.
 - AI / KB / APIs: services/* and utils/* (not duplicated here)
 """
 import os
+import signal
+import socket
+import subprocess
+import sys
 from secrets import token_hex
 
 from dotenv import load_dotenv
 from flask import Flask
 
-from admin_models import AdminUser
+from admin_models import AdminUser, AgentSettings  # noqa: F401 — register model for create_all
 from extensions import db, login_manager
 from routes.admin_routes import register_admin_routes
 from routes.chat_routes import register_chat_routes
 from services.mysql_service import init_mysql_chat_schema
-from support_paths import BASE_DIR
+from support_paths import BASE_DIR, ENV_FILE
 
-load_dotenv()
+# .env lives in welfog-ai-agent/ (parent of support/), not only in support/
+load_dotenv(ENV_FILE)
+load_dotenv(os.path.join(BASE_DIR, ".env"))  # optional support/.env overrides
+
+_hf_token = (os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "").strip()
+if _hf_token:
+    os.environ.setdefault("HF_TOKEN", _hf_token)
+    os.environ.setdefault("HUGGING_FACE_HUB_TOKEN", _hf_token)
+
+
+def _warmup_ai_on_startup() -> None:
+    """Load SentenceTransformer + KB vectors at startup (before first /chat)."""
+    if (os.getenv("DISABLE_EMBEDDINGS", "0") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        print("[startup] embeddings disabled (DISABLE_EMBEDDINGS=1)", flush=True)
+        return
+    try:
+        print("[startup] Loading embedding weights + KB text index...", flush=True)
+        from services.embedding import encode_texts, get_greetings_vecs
+        from services.kb_service import ensure_kb_vectors, refresh_knowledge_cache
+
+        refresh_knowledge_cache(build_vectors=True)
+        encode_texts(["welfog startup warmup"])
+        get_greetings_vecs()
+        ensure_kb_vectors()
+        print("[startup] AI embeddings + KB vector index ready", flush=True)
+    except Exception as exc:
+        print(f"[startup] embedding warmup failed (lazy load on first use): {exc}", flush=True)
 
 
 def create_app():
@@ -42,13 +77,113 @@ def create_app():
     init_mysql_chat_schema()
     register_chat_routes(app)
     register_admin_routes(app)
+
+    @app.route("/health")
+    def health():
+        return {"status": "ok"}, 200
+    _warmup_ai_on_startup()
+    _register_request_logging(app)
     return app
+
+
+def _register_request_logging(app: Flask) -> None:
+    @app.after_request
+    def _log_request(response):
+        try:
+            path = (request.path or "").strip()
+            if path in ("/chat", "/") or path.startswith("/api/"):
+                print(
+                    f"[http] {request.method} {path} -> {response.status_code}",
+                    flush=True,
+                )
+        except Exception:
+            pass
+        return response
 
 
 app = create_app()
 
 
+def _pids_listening_on_port(port: int) -> list[int]:
+    """Return PIDs bound to 127.0.0.1:port (Windows netstat)."""
+    try:
+        out = subprocess.check_output(
+            ["netstat", "-ano"],
+            text=True,
+            errors="replace",
+            timeout=8,
+        )
+    except (subprocess.SubprocessError, FileNotFoundError, OSError):
+        return []
+    needle = f":{port}"
+    pids: list[int] = []
+    for line in out.splitlines():
+        if "LISTENING" not in line or needle not in line:
+            continue
+        parts = line.split()
+        if parts and parts[-1].isdigit():
+            pids.append(int(parts[-1]))
+    return list(dict.fromkeys(pids))
+
+
+def _port_is_free(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        try:
+            sock.bind(("127.0.0.1", port))
+            return True
+        except OSError:
+            return False
+
+
+def _ensure_port_available(port: int) -> None:
+    """Refuse to start if another server is already on this port (orphan after Ctrl+C)."""
+    if _port_is_free(port):
+        return
+    pids = _pids_listening_on_port(port)
+    pid_hint = ", ".join(str(p) for p in pids) if pids else "unknown"
+    print(
+        f"[startup] Port {port} is already in use (PID {pid_hint}).\n"
+        f"  Another python app.py is still running — kill it first:\n"
+        f"    taskkill /F /PID {pids[0] if pids else '<pid>'}\n"
+        f"  Or in PowerShell: Stop-Process -Id {pids[0] if pids else '<pid>'} -Force",
+        flush=True,
+    )
+    sys.exit(1)
+
+
+def _install_shutdown_handlers() -> None:
+    """Ctrl+C must stop the server; hard exit avoids Windows forrtl hang."""
+
+    def _stop(_signum, _frame):
+        print("\n[shutdown] Stopping server (Ctrl+C)...", flush=True)
+        os._exit(0)
+
+    signal.signal(signal.SIGINT, _stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, _stop)
+
+
 if __name__ == "__main__":
+    _install_shutdown_handlers()
+    port = int((os.getenv("FLASK_PORT") or "5000").strip() or "5000")
+    _ensure_port_available(port)
+
     with app.app_context():
         db.create_all()
-    app.run(port=5000, debug=True)
+
+    # Windows: never use reloader — spawns orphan child that survives Ctrl+C.
+    reloader_env = (os.getenv("FLASK_USE_RELOADER", "0") or "0").strip().lower()
+    use_reloader = reloader_env not in ("0", "false", "no", "off") and sys.platform != "win32"
+    debug = (os.getenv("FLASK_DEBUG", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+        "off",
+    )
+
+    print(
+        f"[startup] Welfog support server PID {os.getpid()} on http://127.0.0.1:{port} "
+        f"(Ctrl+C to stop, reloader={'on' if use_reloader else 'off'})",
+        flush=True,
+    )
+    app.run(port=port, debug=debug, use_reloader=use_reloader, threaded=True)

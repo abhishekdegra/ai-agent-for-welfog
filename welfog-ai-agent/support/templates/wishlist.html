@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>My Wishlist — Welfog</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+</head>
+<body class="app-body wishlist-page-body">
+<div class="wishlist-page">
+    <header class="wishlist-page__header">
+        <a class="wishlist-page__back" href="{{ url_for('chat.home') }}{% if user_id and user_id != 'STATIC_USER_001' %}?user_id={{ user_id | urlencode }}{% endif %}">
+            <i class="fas fa-arrow-left" aria-hidden="true"></i> Chat
+        </a>
+        <h1 class="wishlist-page__title"><i class="fas fa-heart" style="color:#ff3d6a;margin-right:6px;"></i> Wishlist</h1>
+    </header>
+    <div class="wishlist-page__body">
+        <div class="wishlist-page__list" id="wishlistPageList">
+            {{ wishlist_html | safe }}
+        </div>
+    </div>
+</div>
+<script>
+const THEME_KEY = "welfog_chat_theme";
+(function initTheme() {
+    const saved = localStorage.getItem(THEME_KEY);
+    document.documentElement.setAttribute("data-theme", saved === "light" ? "light" : "dark");
+})();
+
+function getUserIdFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get("user_id");
+    if (!raw) return null;
+    return raw.split(/[?&]/)[0].split("#")[0].trim() || null;
+}
+
+function addUserIdToApiPath(path) {
+    const userId = getUserIdFromUrl();
+    if (!userId) return path;
+    return path + (path.includes("?") ? "&" : "?") + "user_id=" + encodeURIComponent(userId);
+}
+
+function dedupeWishlistCards(html, scrollEl) {
+    const existing = new Set(
+        Array.from(scrollEl.querySelectorAll(".wf-wl-card[data-wl-pid]")).map(function(el) {
+            return el.getAttribute("data-wl-pid");
+        })
+    );
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    const frag = document.createDocumentFragment();
+    wrap.querySelectorAll(".wf-wl-card").forEach(function(node) {
+        const pid = node.getAttribute("data-wl-pid");
+        if (pid && existing.has(pid)) return;
+        if (pid) existing.add(pid);
+        frag.appendChild(node);
+    });
+    return frag;
+}
+
+async function runWishlistPageMore(btn, nextPage) {
+    const root = btn.closest(".wf-wl-root");
+    const scrollEl = root && root.querySelector(".wf-wl-scroll");
+    if (!root || !scrollEl) return;
+    const labelEl = btn.querySelector(".wf-wl-more__label") || btn;
+    if (!btn.dataset.wlRestLabel) {
+        btn.dataset.wlRestLabel = (labelEl.textContent || "").trim() || "View more";
+    }
+    labelEl.textContent = "Loading…";
+    btn.classList.add("wf-wl-more--loading");
+    btn.setAttribute("aria-busy", "true");
+    try {
+        const res = await fetch(addUserIdToApiPath("/chat"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                message: "",
+                user_id: getUserIdFromUrl(),
+                wishlist_page: parseInt(nextPage, 10)
+            })
+        });
+        const data = await res.json();
+        if (data.type === "wishlist_append") {
+            const tail = scrollEl.querySelector(".wf-wl-tail");
+            if (data.cards_html && tail) {
+                const frag = dedupeWishlistCards(data.cards_html, scrollEl);
+                if (frag.firstChild) tail.parentNode.insertBefore(frag, tail);
+            } else if (data.cards_html) {
+                const frag = dedupeWishlistCards(data.cards_html, scrollEl);
+                if (frag.firstChild) scrollEl.appendChild(frag);
+            }
+            if (tail) tail.remove();
+            if (data.tail_html) scrollEl.insertAdjacentHTML("beforeend", data.tail_html);
+        }
+    } finally {
+        btn.classList.remove("wf-wl-more--loading");
+        btn.removeAttribute("aria-busy");
+        labelEl.textContent = btn.dataset.wlRestLabel || "View more";
+        delete btn.dataset.wlBusy;
+    }
+}
+
+document.getElementById("wishlistPageList").addEventListener("click", function(ev) {
+    const btn = ev.target.closest(".wf-wl-more--page, .wf-wl-more");
+    if (!btn || btn.dataset.wlBusy === "1") return;
+    const nextPage = btn.getAttribute("data-next-page");
+    if (!nextPage) return;
+    ev.preventDefault();
+    btn.dataset.wlBusy = "1";
+    void runWishlistPageMore(btn, nextPage);
+});
+</script>
+</body>
+</html>

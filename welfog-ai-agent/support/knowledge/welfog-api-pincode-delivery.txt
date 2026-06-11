@@ -1,0 +1,51 @@
+WELFOG PINCODE / DELIVERY SERVICEABILITY — API KNOWLEDGE BASE
+=============================================================
+
+Use when user asks: delivery ho jayegi?, service hai?, pincode pe order?, yaha deliver karte ho?
+
+NOT: order ID tracking (6-digit alone in track context), NOT product catalog search.
+
+------------------------------------------------------------
+1) LIVE API
+------------------------------------------------------------
+POST https://welfogapi.welfog.com/api/v2/pincode/check_pincode
+Body: { "pincode": "<6-digit Indian PIN>" }
+
+Success (result true): delivery available — show message, distance, encourage order.
+Failure (result false): not serviceable at this PIN.
+
+------------------------------------------------------------
+2) USER INTENT TYPES
+------------------------------------------------------------
+check_pin_live: user gave PIN (302034, 111111) and wants yes/no delivery, COD, timing.
+ask_pin: wants delivery info but no PIN yet — ask for 6-digit PIN.
+pin_correction: user says "ye pincode tha", "galat order id" — still pincode topic, not order track.
+pin_followup: short "302034 per?", "uspe?", "waha?" after pincode chat — use PIN from message or recent user line.
+
+NEVER track_live: six digits are PIN when words like pincode, delivery, delevery, service, pahucha, per/par/pe.
+
+------------------------------------------------------------
+3) CITY / AREA (no PIN digits yet)
+------------------------------------------------------------
+User may ask only by city or area — still pincode topic, NOT order tracking:
+- "Jaipur me de dega kya Welfog service" / "will Welfog provide service in Kota?"
+- Bot geocodes known city → representative PIN → POST check_pincode (live yes/no + map lat/lng in API data).
+- If city is unclear / random word → ask_pin (invite 6-digit PIN).
+- Never reply with Order ID template. Never product search on these phrases.
+Welfog checks delivery via live API + valid 6-digit Indian PIN (city resolved automatically when clear).
+
+------------------------------------------------------------
+4) EXAMPLES (with PIN)
+------------------------------------------------------------
+- "302034 per delivery ho jayegi?" → check_pin_live, pin=302034
+- "pincode 111111 pe product pohcha dega kya" → check_pin_live (NOT product search)
+- "302034 per ?" → check_pin_live
+- "yh pincode tha delivery batao" → check_pin_live, extract pin from message or context
+- "mujhe confused hu welfog service dega ya nai is pincode pe" → check_pin_live
+
+------------------------------------------------------------
+5) AI JSON actions
+------------------------------------------------------------
+check_pin_live | ask_pin | not_pincode_topic
+
+extracted_pincode: only valid 6-digit Indian PIN in LATEST user message (or follow-up line).

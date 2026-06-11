@@ -1,0 +1,212 @@
+WELFOG PRODUCT SEARCH — API KNOWLEDGE BASE (for AI routing + execution)
+=======================================================================
+
+Use when the customer wants to FIND / BUY / BROWSE a physical product (any wording, any language).
+Welfog is a FULL ecommerce marketplace: fashion, grocery, electronics, beauty, home, toys, etc.
+
+SEMANTIC-FIRST (industry): The Groq product-search JSON must infer ALL filters from MEANING —
+colour, purchase_price min/max, rating min/max, brand, size, SKU, pro_id, multi-item lists —
+in any language, long prompts, or informal phrasing. Do NOT rely on fixed Hindi/English keyword lists.
+sku field ONLY for real warehouse codes (usually contains a digit, e.g. TP-SamsungS25, SSKKOO) —
+never verbs like chahiye/dikhao or any plain word the user typed. Python only backfills SKU when
+the user explicitly wrote "SKU …" / product code, or pasted a code-shaped token.
+
+After the first product search, the user may send MORE filter messages (price, colour, brand, size,
+sort, SKU, category) — combine with the LAST search context (same product type) unless they clearly
+switch to a new product.
+
+------------------------------------------------------------
+1) MAIN PRODUCT SEARCH API (live catalog — fallback)
+------------------------------------------------------------
+Endpoint:
+  GET https://welfogapi.welfog.com/api/v2/products/search
+
+Params:
+  - page: 1, 2, 3 … (never null)
+  - name: cleaned English keywords (product type + brand + model)
+  - categories: category_id ONLY when user browses a department ("beauty ke products")
+  - color: catalog colour name (Black, White, Sky Blue, Multicolor, Grey, …)
+
+HYBRID SEARCH (how the agent works):
+  Step A — OpenSearch index (fast filters) when OPENSEARCH_URL is set.
+  Step B — If OpenSearch returns 0 hits, automatically call the live REST API above.
+  Never say "not found" without trying both when the user asked for a normal product.
+
+------------------------------------------------------------
+2) OPENSEARCH INDEX — GET URLs (query string)
+------------------------------------------------------------
+Base index (browser / direct hit):
+  https://s.welfog.com/products_v1/_search
+
+Use param `q=` for Lucene query string. Combine filters with AND.
+Pagination: &from=0&size=10  (next page: &from=10&size=10)
+Selected fields: &_source=name,purchase_price,unit_price,color_name,size,pro_id,id,sku,brand,todays_deal,category_id,category_name
+
+⚠️ PRICE FIELD (CRITICAL — read before any price filter):
+  - Index stores BOTH unit_price (often MRP/list) AND purchase_price (what customer PAYS on Welfog).
+  - For ALL customer-facing filters, sorting, and "500 tak / under Rs 500 / sasta" → use purchase_price.
+  - NEVER filter customer budget on unit_price alone — cards show purchase_price (sale price).
+  - Agent OpenSearch body: purchase_price_min / purchase_price_max, sort purchase_price_asc.
+
+Ready GET examples (replace values):
+
+  Name:
+    .../_search?q=name:iphone
+
+  SKU:
+    .../_search?q=sku:SSKKOO
+
+  Brand (spaces → quotes):
+    .../_search?q=brand:"No Brand"
+
+  Colour:
+    .../_search?q=color_name:Black
+
+  Size:
+    .../_search?q=size:"Free Size"
+
+  Price range (CUSTOMER pays — use purchase_price, NOT unit_price):
+    .../_search?q=purchase_price:[100 TO 500]
+
+  Today's deal:
+    .../_search?q=todays_deal:true
+
+  Category ID:
+    .../_search?q=category_id:10382
+
+  Category name:
+    .../_search?q=category_name:"Mobile Cases & Covers"
+
+  Product ID (catalog pro_id):
+    .../_search?q=pro_id:2607613
+
+  Multiple filters combined:
+    .../_search?q=name:case AND brand:"No Brand" AND category_id:10382 AND purchase_price:[100 TO 500]
+
+  With _source + pagination + sort (price low → high on purchase_price):
+    .../_search?_source=name,purchase_price,color_name,size,pro_id,sku,brand,category_name&q=name:case&from=0&size=10&sort=purchase_price:asc
+
+Syntax notes:
+  - Values with spaces → double quotes ("Free Size", "No Brand")
+  - Ranges → [min TO max]
+  - Boolean → true / false
+  - Exact keyword fields give best matches
+
+Agent mapping (natural language → OpenSearch spec fields):
+  | User says (any language)     | OpenSearch / spec field        |
+  |------------------------------|--------------------------------|
+  | shirt, cover, rice, charger  | title_query / name             |
+  | black, safed, neela          | color / color_name             |
+  | size M, free size            | size                           |
+  | samsung brand, nike          | brand + brand_aliases          |
+  | SKU ABC123                   | sku                            |
+  | pro id 2607613               | pro_id                         |
+  | category 10382 / mobile case | category_id / category_name    |
+  | 500 tak, under 500, sasta    | purchase_price_max (+ sort)    |
+  | 200 se upar, above 200       | purchase_price_min             |
+  | 200 se 500, 200 to 500 range | purchase_price_min=200, purchase_price_max=500 |
+  | aaj ka deal                  | todays_deal:true               |
+  | sasta / cheapest             | sort purchase_price_asc        |
+  | rating acha / best rated     | rating_min + sort rating_desc  |
+
+------------------------------------------------------------
+3) POST-SEARCH FILTER FOLLOW-UPS (multi-step shopping)
+------------------------------------------------------------
+User already saw product cards → new message is ONLY a filter (keep same product type from chat):
+
+  Examples:
+  - "500 tak dikhao"           → add purchase_price_max=500, keep last title_query
+  - "ab black wale"            → change color=Black, keep last product type
+  - "samsung brand ke"         → add brand filter, keep cover/shirt/etc.
+  - "free size"                → add size=Free Size
+  - "sasta sort karo"          → sort purchase_price_asc
+  - "SKU SSKKOO wala"          → sku filter
+  - "sirf aaj ke deals"        → todays_deal=true
+
+Rules:
+  - Merge new filter WITH last search spec (ctx last_os_spec) — do not drop previous product type.
+  - If user names a NEW product ("ab jeans dikhao") → new search, do not reuse old filters.
+  - Price words always → purchase_price_min/max, never unit_price for customer budget.
+
+------------------------------------------------------------
+4) AI-FIRST FLOW (every shopping message)
+------------------------------------------------------------
+Step 1 — AI understands message (any brand, any product, any language). NO hardcoded brand list.
+MULTIPLE items in one sentence → product_requests[] with one entry per item.
+Step 2 — Read this KB + welfog-api.txt for API param rules.
+Step 3 — AI outputs: search_terms, color, brand, brand_aliases[], product_type, match_mode,
+         max_price/min_price (map to purchase_price in catalog spec).
+
+CRITICAL — CLEAN API QUERY (never send full user sentence):
+  - search_terms = 2–6 English words: product type + brand/model ONLY (e.g. "mobile cover", "nike cricket bat", "sports tshirt").
+  - NEVER put dikhao/chahiye/bata de/kabaddi ke liye/200 se 500/pincode/conversation in search_terms or name param.
+  - Use product_type for noun (cover, tshirt, bat); use brand for Nike/Samsung; use color for rang; use min_price/max_price for budget.
+  - Price RANGE: "200 se 500", "200 to 500 rs", "between 200 and 500" → min_price=200 AND max_price=500 (purchase_price_min/max).
+  - SKU lookup: sku field only + empty search_terms. pro_id lookup: pro_id only + empty search_terms.
+  - Sports/use-case words (kabaddi, cricket, gym, college) → put in search_terms if they help find the item (e.g. "cricket bat", "sports tshirt"), NOT as filters.
+
+Step 4 — catalog_search_live: OpenSearch then REST if needed.
+Step 5 — Post-filter cards by purchase_price and colour on the agent side.
+Step 6 — Show matching product cards. Try OpenSearch + REST before not-found; do not say "no products" if cards exist after filters.
+
+------------------------------------------------------------
+5) QUERY EXAMPLES → search_terms + params
+------------------------------------------------------------
+| User (any language)              | search_terms        | size    | color   | purchase_price |
+|----------------------------------|---------------------|---------|---------|----------------|
+| size=10 ka cover dikhao          | cover               | 10      | —       | —              |
+| free size shirt                  | shirt               | Free Size | —     | —              |
+| safed shirt chahiye              | shirt               | —       | White   | —              |
+| cover 500 tak                    | cover               | —       | max 500        |
+| blue jeans dikhao                | jeans               | Blue    | —              |
+| iphone cover dikhao              | iphone cover        | —       | —              |
+| samsung m14 back cover black     | samsung m14 cover   | Black   | —              |
+| mobile covers sasta              | mobile cover        | —       | sort asc       |
+| beauty category products         | (empty name)        | —       | categories=id  |
+
+NOT product search:
+  - order tracking, order id, wishlist, policies, customer care number.
+
+------------------------------------------------------------
+6) RESULT FILTERING
+------------------------------------------------------------
+- match_mode strict: user named brand/model (iphone, samsung, nike). brand_aliases required.
+- match_mode universal: shirt, jeans, charger, rice — do NOT require every token in title.
+- Colour always in color= field; search_terms = product type (+ brand if strict).
+- Size always in size= field; NEVER in search_terms or title_query.
+- Price always purchase_price range / sort — what customer pays on product cards.
+
+------------------------------------------------------------
+7) COLOUR — ANY LANGUAGE
+------------------------------------------------------------
+- Customer may write colour in Hindi, Hinglish, Tamil, Telugu, Marathi, English, or typos.
+- Put normalized catalogue colour in color / color_name (Black, Green, Sky Blue, Multicolor, …).
+- search_terms must NOT include colour words or filler (color, ke, dikhao, rang).
+- Follow-up after cards: "black wale" / "ab green" → same product type, new color only.
+
+------------------------------------------------------------
+7b) SIZE — SEPARATE FROM PRODUCT NAME (critical for Groq)
+------------------------------------------------------------
+User often gives TWO things: SIZE + PRODUCT TYPE. Never merge into one title.
+
+| User says                         | size field   | search_terms / title_query |
+|-----------------------------------|--------------|---------------------------|
+| size=10 ka product cover dikhao   | 10           | cover                     |
+| size 10 cover dikhao              | 10           | cover                     |
+| free size shirt chahiye           | Free Size    | shirt                     |
+| M size jeans                      | M            | jeans                     |
+
+WRONG: search_terms = "size 10 product cover dikhao" (full sentence as title).
+
+OpenSearch GET: .../q=name:cover AND size:10  (quotes if spaces: size:"Free Size")
+
+Rules:
+  - size=10, size:10, size 10 — size filter only; product word = cover/shirt/etc. in title_query.
+  - "product" in Hinglish often means "item" — strip from title, not a catalog keyword.
+  - Follow-up "size 10 wale" → size=10, keep same product type from chat.
+
+------------------------------------------------------------
+8) NO RESULTS
+------------------------------------------------------------
+- Only after OpenSearch + live REST both return nothing: suggest different spelling, colour, or broader keyword.
+- Do NOT attach wrong category_id (e.g. Home Utility "Covers" for mobile covers).

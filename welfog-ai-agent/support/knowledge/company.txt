@@ -30,7 +30,12 @@ Welfog Instagram: https://www.instagram.com/welfog_online/
 Welfog Twitter: https://x.com/welfog
 Welfog Facebook: https://www.facebook.com/people/Welfog/
 
-Fraud Prevention & Fake Calls:
+Social Media Links — Support Rules:
+- Only share Welfog official social URLs listed above (from knowledge base). Never invent or guess handles.
+- If user asks for Welfog social media in any language (Hinglish, English, Punjabi, Marathi, Tamil, etc.) — including "apni/teri/tumhari insta", "Welfog ki LinkedIn", "saare social links" — give only the requested platform(s) or all if they ask for all.
+- If user asks for another company, person, school, college, or university social handle (Amazon, Meesho, Flipkart, someone's personal LinkedIn/Instagram) — politely decline: we only provide Welfog official social media URLs.
+- Follow-up in same chat like "twitter bhi de" after Welfog social links → add the requested Welfog platform only.
+
 Welfog and its authorized representatives will NEVER call, SMS, or email you to ask for your password, OTP, PIN, CVV, or card details. Welfog will never ask you to make payments outside the official app via personal UPI, bank transfer, or cash to claim a prize or unlock an account.
 
 Official Communication Channels:

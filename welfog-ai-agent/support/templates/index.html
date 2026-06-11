@@ -9,6 +9,7 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+<script src="{{ url_for('static', filename='js/voice-dictation.js') }}" defer></script>
 </head>
 <body class="app-body">
 
@@ -30,6 +31,11 @@ let currentChatId = null;
 let pendingDeleteId = null;
 /** True while waiting for /chat response — blocks double-send */
 let chatAwaitingReply = false;
+/** Voice dictation controller (mic / speech-to-text) */
+let welfogVoice = null;
+/** While purchase-history "View more" is loading — suppresses global Typing bubble if send() races */
+window.__welfogPhAppendBusy = false;
+window.__welfogWlAppendBusy = false;
 
 const THEME_KEY = "welfog_chat_theme";
 
@@ -94,6 +100,26 @@ function scheduleResizeHistorySync() {
     }, 200);
 }
 
+function dedupePurchaseHistoryCards(html, scrollEl) {
+    const existing = new Set(
+        Array.from(scrollEl.querySelectorAll(".wf-ph-card[data-ph-oid]")).map(function(el) {
+            return el.getAttribute("data-ph-oid");
+        }).filter(Boolean)
+    );
+    const wrap = document.createElement("div");
+    wrap.innerHTML = html;
+    const frag = document.createDocumentFragment();
+    Array.from(wrap.children).forEach(function(node) {
+        if (node.classList && node.classList.contains("wf-ph-card")) {
+            const id = node.getAttribute("data-ph-oid");
+            if (id && existing.has(id)) return;
+            if (id) existing.add(id);
+        }
+        frag.appendChild(node);
+    });
+    return frag;
+}
+
 function addMessage(text, type){
     const div = document.createElement("div");
     div.className = "msg " + type;
@@ -103,6 +129,7 @@ function addMessage(text, type){
 }
 
 function showTyping(){
+    if (window.__welfogPhAppendBusy || window.__welfogWlAppendBusy) return;
     const div = document.createElement("div");
     div.className = "typing";
     div.id = "typing";
@@ -126,6 +153,9 @@ function setChatComposerLocked(locked) {
     if (btn) {
         btn.disabled = !!locked;
     }
+    if (welfogVoice && welfogVoice.setDisabled) {
+        welfogVoice.setDisabled(!!locked);
+    }
     if (inner) {
         inner.classList.toggle("composer__inner--locked", !!locked);
         inner.setAttribute("aria-busy", locked ? "true" : "false");
@@ -136,6 +166,20 @@ function getChatIdFromUrl(){
     const params = new URLSearchParams(window.location.search);
     const id = params.get("chat_id");
     return id ? id : null;
+}
+
+function getUserIdFromUrl(){
+    const params = new URLSearchParams(window.location.search);
+    const raw = params.get("user_id");
+    if (!raw) return null;
+    const sanitized = raw.split(/[?&]/)[0].split("#")[0].trim();
+    return sanitized || null;
+}
+
+function addUserIdToApiPath(path){
+    const userId = getUserIdFromUrl();
+    if (!userId) return path;
+    return path + (path.includes("?") ? "&" : "?") + "user_id=" + encodeURIComponent(userId);
 }
 
 function setChatIdInUrl(chatId){
@@ -166,6 +210,9 @@ async function initializeChatFromUrl(){
 
 async function send(){
     const input = document.getElementById("chatInput");
+    if (welfogVoice && welfogVoice.stop) {
+        welfogVoice.stop();
+    }
     const message = input.value.trim();
     if (!message) return;
     if (chatAwaitingReply) return;
@@ -184,11 +231,27 @@ async function send(){
 
         showTyping();
 
-        const res = await fetch("/chat", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ message: message, chat_id: currentChatId })
-        });
+        const chatCtrl = new AbortController();
+        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 48000);
+        let res;
+        try {
+            res = await fetch(addUserIdToApiPath("/chat"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ message: message, chat_id: currentChatId, user_id: getUserIdFromUrl() }),
+                signal: chatCtrl.signal
+            });
+        } finally {
+            clearTimeout(chatTimer);
+        }
+        if (!res.ok) {
+            removeTyping();
+            addMessage(
+                "<div style='color:#333;line-height:1.55;'>We're experiencing very high traffic right now. Please try again in a minute or two. Thank you for your patience.</div>",
+                "bot"
+            );
+            return;
+        }
         const data = await res.json();
 
         if (data.chat_id) {
@@ -206,11 +269,310 @@ async function send(){
         }
     } catch (e) {
         removeTyping();
-        addMessage("Server error...", "bot");
+        const busyMsg = (e && e.name === "AbortError")
+            ? "<div style='color:#333;line-height:1.55;'>We're experiencing very high traffic right now. Please try again in a minute or two. Thank you for your patience.</div>"
+            : "<div style='color:#333;line-height:1.55;'>Sorry — we could not reach the server. Please check your connection and try again in a moment.</div>";
+        addMessage(busyMsg, "bot");
     } finally {
         chatAwaitingReply = false;
         setChatComposerLocked(false);
     }
+}
+
+if (chat) {
+    async function runPurchaseHistoryMore(ev, btn, nextPage) {
+        const root = btn.closest(".wf-ph-root");
+        const scrollEl = root && root.querySelector(".wf-ph-scroll");
+        if (!root || !scrollEl) {
+            delete btn.dataset.phBusy;
+            return;
+        }
+
+        window.__welfogPhAppendBusy = true;
+        removeTyping();
+
+        const labelEl = btn.querySelector(".wf-ph-more__label") || btn;
+        if (!btn.dataset.phRestLabel) {
+            btn.dataset.phRestLabel = (labelEl.textContent || "").trim() || "View more";
+        }
+        labelEl.textContent = "Loading…";
+        btn.classList.add("wf-ph-more--loading");
+        btn.setAttribute("aria-busy", "true");
+        btn.setAttribute("aria-disabled", "true");
+
+        chatAwaitingReply = true;
+        setChatComposerLocked(true);
+
+        try {
+            const res = await fetch(addUserIdToApiPath("/chat"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: "",
+                    chat_id: currentChatId,
+                    user_id: getUserIdFromUrl(),
+                    purchase_history_page: parseInt(nextPage, 10)
+                })
+            });
+            const data = await res.json();
+            if (data.chat_id) {
+                currentChatId = data.chat_id;
+                setChatIdInUrl(currentChatId);
+            }
+            if (data.type === "purchase_history_append") {
+                const tail = scrollEl.querySelector(".wf-ph-tail");
+                if (data.cards_html && tail) {
+                    const frag = dedupePurchaseHistoryCards(data.cards_html, scrollEl);
+                    if (frag.firstChild) {
+                        tail.parentNode.insertBefore(frag, tail);
+                    }
+                } else if (data.cards_html && !tail) {
+                    const frag = dedupePurchaseHistoryCards(data.cards_html, scrollEl);
+                    if (frag.firstChild) scrollEl.appendChild(frag);
+                }
+                const tailOld = scrollEl.querySelector(".wf-ph-tail");
+                if (tailOld) tailOld.remove();
+                var newTail = data.tail_html;
+                if (newTail === undefined || newTail === null) {
+                    newTail = data.footer_html;
+                }
+                if (newTail) {
+                    scrollEl.insertAdjacentHTML("beforeend", newTail);
+                }
+                requestAnimationFrame(function() {
+                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                });
+            } else if (data.data) {
+                addMessage(data.data, "bot");
+            }
+            const historyPanel = document.getElementById("historyPanel");
+            if (historyPanel && historyPanel.classList.contains("open")) {
+                await refreshHistoryList();
+            } else {
+                syncHistoryActive();
+            }
+        } catch (e) {
+            addMessage("Could not load more orders.", "bot");
+        } finally {
+            chatAwaitingReply = false;
+            setChatComposerLocked(false);
+            window.__welfogPhAppendBusy = false;
+            delete btn.dataset.phBusy;
+            if (btn.isConnected) {
+                btn.classList.remove("wf-ph-more--loading");
+                btn.removeAttribute("aria-busy");
+                btn.removeAttribute("aria-disabled");
+                const lab = btn.querySelector(".wf-ph-more__label") || btn;
+                lab.textContent = btn.dataset.phRestLabel || "View more";
+            }
+        }
+    }
+
+    function onPurchaseHistoryMorePointerOrClick(ev) {
+        const btn = ev.target.closest(".wf-ph-more");
+        if (!btn || btn.classList.contains("wf-product-more") || !chat.contains(btn)) return;
+        const nextPage = btn.getAttribute("data-next-page");
+        if (!nextPage || !currentChatId) return;
+        if (btn.dataset.phBusy === "1" || chatAwaitingReply) return;
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        btn.dataset.phBusy = "1";
+        void runPurchaseHistoryMore(ev, btn, nextPage);
+    }
+
+    async function runProductSearchMore(ev, btn, nextPage) {
+        const root = btn.closest(".wf-product-root");
+        const rail = root && root.querySelector(".wf-product-rail");
+        if (!root || !rail) {
+            delete btn.dataset.phBusy;
+            return;
+        }
+        window.__welfogProductAppendBusy = true;
+        const labelEl = btn.querySelector(".wf-ph-more__label") || btn;
+        if (!btn.dataset.phRestLabel) {
+            btn.dataset.phRestLabel = (labelEl.textContent || "").trim() || "View more products";
+        }
+        labelEl.textContent = "Loading…";
+        btn.classList.add("wf-ph-more--loading");
+        chatAwaitingReply = true;
+        setChatComposerLocked(true);
+        try {
+            const res = await fetch(addUserIdToApiPath("/chat"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: "",
+                    chat_id: currentChatId,
+                    user_id: getUserIdFromUrl(),
+                    product_search_page: parseInt(nextPage, 10)
+                })
+            });
+            const data = await res.json();
+            if (data.chat_id) {
+                currentChatId = data.chat_id;
+                setChatIdInUrl(currentChatId);
+            }
+            if (data.type === "product_search_append" && data.cards_html) {
+                rail.insertAdjacentHTML("beforeend", data.cards_html);
+                const tailOld = root.querySelector(".wf-product-tail");
+                if (tailOld) tailOld.remove();
+                if (data.tail_html) {
+                    root.insertAdjacentHTML("beforeend", data.tail_html);
+                }
+            } else if (data.data) {
+                addMessage(data.data, "bot");
+            }
+        } catch (e) {
+            addMessage("Could not load more products.", "bot");
+        } finally {
+            chatAwaitingReply = false;
+            setChatComposerLocked(false);
+            window.__welfogProductAppendBusy = false;
+            delete btn.dataset.phBusy;
+            if (btn.isConnected) {
+                btn.classList.remove("wf-ph-more--loading");
+                const lab = btn.querySelector(".wf-ph-more__label") || btn;
+                lab.textContent = btn.dataset.phRestLabel || "View more products";
+            }
+        }
+    }
+
+    function onProductSearchMorePointerOrClick(ev) {
+        const btn = ev.target.closest(".wf-product-more");
+        if (!btn || !chat.contains(btn)) return;
+        if (btn.tagName === "A" && btn.getAttribute("href")) return;
+        const nextPage = btn.getAttribute("data-next-product-page");
+        if (!nextPage || !currentChatId) return;
+        if (btn.dataset.phBusy === "1" || chatAwaitingReply) return;
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        btn.dataset.phBusy = "1";
+        void runProductSearchMore(ev, btn, nextPage);
+    }
+
+    /* capture:true — runs early; pointerdown updates UI immediately on touch */
+    async function runWishlistMore(ev, btn, nextPage) {
+        const root = btn.closest(".wf-wl-root");
+        const scrollEl = root && root.querySelector(".wf-wl-scroll");
+        if (!root || !scrollEl) {
+            delete btn.dataset.wlBusy;
+            return;
+        }
+        window.__welfogWlAppendBusy = true;
+        removeTyping();
+        const labelEl = btn.querySelector(".wf-wl-more__label") || btn;
+        if (!btn.dataset.wlRestLabel) {
+            btn.dataset.wlRestLabel = (labelEl.textContent || "").trim() || "View more";
+        }
+        labelEl.textContent = "Loading…";
+        btn.classList.add("wf-wl-more--loading");
+        btn.setAttribute("aria-busy", "true");
+        btn.setAttribute("aria-disabled", "true");
+        chatAwaitingReply = true;
+        setChatComposerLocked(true);
+        try {
+            const res = await fetch(addUserIdToApiPath("/chat"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    message: "",
+                    chat_id: currentChatId,
+                    user_id: getUserIdFromUrl(),
+                    wishlist_page: parseInt(nextPage, 10)
+                })
+            });
+            const data = await res.json();
+            if (data.chat_id) {
+                currentChatId = data.chat_id;
+                setChatIdInUrl(currentChatId);
+            }
+            if (data.type === "wishlist_append") {
+                const tail = scrollEl.querySelector(".wf-wl-tail");
+                if (data.cards_html && tail) {
+                    const frag = dedupeWishlistCards(data.cards_html, scrollEl);
+                    if (frag.firstChild) tail.parentNode.insertBefore(frag, tail);
+                } else if (data.cards_html && !tail) {
+                    const frag = dedupeWishlistCards(data.cards_html, scrollEl);
+                    if (frag.firstChild) scrollEl.appendChild(frag);
+                }
+                const tailOld = scrollEl.querySelector(".wf-wl-tail");
+                if (tailOld) tailOld.remove();
+                if (data.tail_html) scrollEl.insertAdjacentHTML("beforeend", data.tail_html);
+                requestAnimationFrame(function() {
+                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                });
+            } else if (data.data) {
+                addMessage(data.data, "bot");
+            }
+        } catch (e) {
+            addMessage("Could not load more wishlist items.", "bot");
+        } finally {
+            chatAwaitingReply = false;
+            setChatComposerLocked(false);
+            window.__welfogWlAppendBusy = false;
+            delete btn.dataset.wlBusy;
+            if (btn.isConnected) {
+                btn.classList.remove("wf-wl-more--loading");
+                btn.removeAttribute("aria-busy");
+                btn.removeAttribute("aria-disabled");
+                const lab = btn.querySelector(".wf-wl-more__label") || btn;
+                lab.textContent = btn.dataset.wlRestLabel || "View more";
+            }
+        }
+    }
+
+    function dedupeWishlistCards(html, scrollEl) {
+        const existing = new Set(
+            Array.from(scrollEl.querySelectorAll(".wf-wl-card[data-wl-pid]")).map(function(el) {
+                return el.getAttribute("data-wl-pid");
+            })
+        );
+        const wrap = document.createElement("div");
+        wrap.innerHTML = html;
+        const frag = document.createDocumentFragment();
+        wrap.querySelectorAll(".wf-wl-card").forEach(function(node) {
+            const pid = node.getAttribute("data-wl-pid");
+            if (pid && existing.has(pid)) return;
+            if (pid) existing.add(pid);
+            frag.appendChild(node);
+        });
+        return frag;
+    }
+
+    function onWishlistMorePointerOrClick(ev) {
+        const btn = ev.target.closest(".wf-wl-more");
+        if (!btn || btn.classList.contains("wf-wl-more--page") || !chat.contains(btn)) return;
+        const nextPage = btn.getAttribute("data-next-page");
+        if (!nextPage || !currentChatId) return;
+        if (btn.dataset.wlBusy === "1" || chatAwaitingReply) return;
+        ev.preventDefault();
+        ev.stopImmediatePropagation();
+        btn.dataset.wlBusy = "1";
+        void runWishlistMore(ev, btn, nextPage);
+    }
+
+    function onPurchaseHistoryTrackToggle(ev) {
+        const btn = ev.target.closest(".wf-ph-track-btn");
+        if (!btn || !chat.contains(btn)) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        const card = btn.closest(".wf-ph-card");
+        const panel = card && card.querySelector(".wf-ph-track-panel");
+        if (!card || !panel) return;
+        const open = !card.classList.contains("wf-ph-card--track-open");
+        card.classList.toggle("wf-ph-card--track-open", open);
+        panel.hidden = !open;
+        btn.setAttribute("aria-expanded", open ? "true" : "false");
+        btn.textContent = open ? "Hide tracking" : "Track order";
+    }
+
+    chat.addEventListener("pointerdown", onPurchaseHistoryMorePointerOrClick, true);
+    chat.addEventListener("click", onPurchaseHistoryMorePointerOrClick, true);
+    chat.addEventListener("click", onPurchaseHistoryTrackToggle, true);
+    chat.addEventListener("pointerdown", onProductSearchMorePointerOrClick, true);
+    chat.addEventListener("click", onProductSearchMorePointerOrClick, true);
+    chat.addEventListener("pointerdown", onWishlistMorePointerOrClick, true);
+    chat.addEventListener("click", onWishlistMorePointerOrClick, true);
 }
 
 async function newChat() {
@@ -220,7 +582,11 @@ async function newChat() {
     currentChatId = null;
     setChatIdInUrl(null);
     enterLandingMode();
-    await fetch("/api/chat/new", { method: "POST" });
+    await fetch(addUserIdToApiPath("/api/chat/new"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ user_id: getUserIdFromUrl() })
+    });
     const panel = document.getElementById("historyPanel");
     if (isDesktopLayout()) {
         panel.classList.add("open");
@@ -233,7 +599,7 @@ async function newChat() {
 async function refreshHistoryList() {
     const list = document.getElementById("historyList");
     list.innerHTML = "<div class=\"hist-placeholder\">Loading…</div>";
-    const res = await fetch("/api/chats");
+    const res = await fetch(addUserIdToApiPath("/api/chats"));
     const chats = await res.json();
     list.innerHTML = "";
     if (chats.length === 0) {
@@ -302,7 +668,7 @@ async function loadOldChat(id, skipUrlUpdate = false) {
         panel.classList.remove("open");
     }
 
-    const res = await fetch(`/api/chat/messages/${id}`);
+    const res = await fetch(addUserIdToApiPath(`/api/chat/messages/${id}`));
     const data = await res.json();
 
     if (!res.ok || data.error || !Array.isArray(data) || data.length === 0) {
@@ -337,7 +703,7 @@ async function confirmDeleteChat() {
     if (!pendingDeleteId) return;
     const deleteId = pendingDeleteId;
     hideDeleteModal();
-    const res = await fetch(`/api/chat/delete/${deleteId}`, { method: "DELETE" });
+    const res = await fetch(addUserIdToApiPath(`/api/chat/delete/${deleteId}`), { method: "DELETE" });
     const data = await res.json();
     if (!res.ok) {
         enterChatMode();
@@ -378,6 +744,12 @@ window.addEventListener("resize", scheduleResizeHistorySync);
 
 window.addEventListener("DOMContentLoaded", async () => {
     initTheme();
+    if (typeof initWelfogVoiceDictation === "function") {
+        welfogVoice = initWelfogVoiceDictation({
+            isLocked: function () { return chatAwaitingReply; },
+            transcribeUrl: function () { return addUserIdToApiPath("/api/voice/transcribe"); }
+        });
+    }
     await initDesktopHistory();
     await initializeChatFromUrl();
 });

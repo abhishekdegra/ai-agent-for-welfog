@@ -2,6 +2,84 @@
 {% block page_title %}Settings{% endblock %}
 {% block header_title %}Settings{% endblock %}
 {% block content %}
+<div class="admin-settings-block admin-llm-card">
+  <div class="admin-llm-card__head">
+    <div>
+      <h2>AI model</h2>
+      <p class="admin-llm-card__desc">
+        Controls how the support agent calls LLMs for routing, product understanding, and answers.
+        Only admins can change this; customers always use your selection.
+      </p>
+    </div>
+    <span class="admin-llm-badge{% if llm_model_key == 'auto' %} admin-llm-badge--auto{% endif %}" id="llm-active-badge">
+      {% if llm_model_key == 'auto' %}Auto{% else %}Fixed{% endif %}
+    </span>
+  </div>
+
+  <form method="post" action="{{ url_for('admin_settings') }}" class="admin-llm-form" id="llm-settings-form">
+    <input type="hidden" name="llm_model_key" id="llm_model_key_input" value="{{ llm_model_key }}">
+
+    <div class="admin-llm-picker" id="admin-llm-picker">
+      <button type="button" class="admin-llm-picker__trigger" id="llm-picker-trigger" aria-haspopup="listbox" aria-expanded="false">
+        <span class="admin-llm-picker__icon" id="llm-picker-icon" aria-hidden="true">
+          {% if llm_model_key == 'auto' %}∞{% else %}◆{% endif %}
+        </span>
+        <span class="admin-llm-picker__text">
+          <span class="admin-llm-picker__label" id="llm-picker-label">{{ llm_current.label }}</span>
+          <span class="admin-llm-picker__sub" id="llm-picker-sub">{{ llm_current.subtitle }}</span>
+        </span>
+        <svg class="admin-llm-picker__chev" width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </button>
+
+      <div class="admin-llm-picker__menu" id="llm-picker-menu" role="listbox" hidden>
+        {% set ns = namespace(last_group='') %}
+        {% for opt in llm_options %}
+          {% if opt.group and opt.group != ns.last_group %}
+            <div class="admin-llm-picker__group">{{ opt.group }}</div>
+            {% set ns.last_group = opt.group %}
+          {% endif %}
+          <button
+            type="button"
+            class="admin-llm-picker__option{% if opt.key == llm_model_key %} admin-llm-picker__option--active{% endif %}{% if not opt.available %} admin-llm-picker__option--disabled{% endif %}"
+            role="option"
+            data-key="{{ opt.key }}"
+            data-label="{{ opt.label }}"
+            data-sub="{{ opt.subtitle }}"
+            data-available="{{ '1' if opt.available else '0' }}"
+            {% if not opt.available %}disabled title="Add API key in .env"{% endif %}
+            aria-selected="{{ 'true' if opt.key == llm_model_key else 'false' }}"
+          >
+            <span class="admin-llm-picker__option-icon">{% if opt.key == 'auto' %}∞{% else %}◆{% endif %}</span>
+            <span class="admin-llm-picker__option-body">
+              <span class="admin-llm-picker__option-label">{{ opt.label }}</span>
+              <span class="admin-llm-picker__option-sub">{{ opt.subtitle }}</span>
+            </span>
+            {% if opt.key == llm_model_key %}
+              <svg class="admin-llm-picker__check" width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <path d="M5 12l5 5L19 7" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            {% endif %}
+          </button>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="admin-llm-hint" id="llm-mode-hint" data-auto-hint="{{ auto_chain_hint }}">
+      {% if llm_model_key == 'auto' %}
+        <strong>Auto</strong> uses fallback: {{ auto_chain_hint }}. If one provider fails, the next is tried automatically.
+      {% else %}
+        <strong>Fixed model</strong> — every customer query uses <em>{{ llm_current.label }}</em> only (routing, catalog AI, answers).
+      {% endif %}
+    </div>
+
+    <div class="admin-form-actions">
+      <button type="submit" class="admin-btn admin-btn--primary">Save model preference</button>
+    </div>
+  </form>
+</div>
+
 <div class="admin-settings-block">
   <h2>Account</h2>
   <dl>
@@ -17,10 +95,14 @@
     <dt>Directory</dt>
     <dd><code>{{ knowledge_dir }}</code></dd>
   </dl>
-  <p style="margin:12px 0 0;font-size:0.85rem;color:var(--admin-muted);">Manage files under <strong>Knowledge</strong> in the sidebar.</p>
+  <p class="admin-settings-note">Manage files under <strong>Knowledge</strong> in the sidebar.</p>
 </div>
 <div class="admin-settings-block">
   <h2>Session</h2>
   <a href="{{ url_for('admin_logout') }}" class="admin-btn admin-btn--danger">Log out</a>
 </div>
+{% endblock %}
+
+{% block extra_scripts %}
+<script src="{{ url_for('static', filename='js/admin-llm-picker.js') }}"></script>
 {% endblock %}

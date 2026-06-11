@@ -1,0 +1,81 @@
+WELFOG ORDER TRACKING — API KNOWLEDGE BASE (AI-first)
+====================================================
+
+Use for ANY message about shipment status, delay, delivery, "order track karo", "kab aayega", order ID + status.
+Also read: welfog-api-order-tracking-examples.txt (1000+ phrasing patterns for Groq specialist).
+
+Pipeline: Groq JSON specialist + deterministic heuristic merge + welfog_track API.
+Never product catalog. Never reuse Order ID from bot's old status card.
+
+NOT for: product catalog search, wishlist, deals-only, privacy policy.
+
+------------------------------------------------------------
+1) LIVE TRACKING API (primary — always use when user gives Order ID)
+------------------------------------------------------------
+POST https://welfogapi.welfog.com/api/onedelivery/welfog_track
+Body JSON:
+  { "order_id": "<id>", "user_id": <logged-in chat user_id> }
+
+Requires user logged in (user_id in chat URL). Ownership verified against purchase-history.
+
+Success → format status, ETA, courier steps for the customer.
+Errors → not_found, not_owned, login_required (use system messages; never invent phone numbers).
+
+------------------------------------------------------------
+2) WHEN USER GIVES ORDER ID + TRACK INTENT
+------------------------------------------------------------
+Examples (any language / typos):
+  - "order id 332211 track kr de"
+  - "sun na mera order track krke batade yeh h order ki id 332211"
+  - "302032 h y order id"
+  - "112233" (follow-up after bot asked for id)
+  - "track order 2605201"
+
+Action: extract_order_id from LATEST user message only → call welfog_track API → show live result.
+NEVER search product catalog. NEVER say "no product found".
+
+CRITICAL — user has NOT given id yet (do NOT call API):
+  - "mera order id de raha hu track karo"
+  - "ek aur order id de ra hu track krke bata"
+  - "abhi to order id di hi nahi"
+→ action ask_order_id: politely ask them to paste the Order ID. Do NOT say "is order id ke liye tracking nahi mili".
+
+NEVER reuse Order ID from bot's previous status card in chat history.
+
+------------------------------------------------------------
+3) WHEN USER WANTS TRACK BUT NO ID YET
+------------------------------------------------------------
+Examples:
+  - "mera order track karo"
+  - "order kab aayega"
+  - "order nahi aaya abhi tak"
+  - "order kiya tha lekin ab bhi nahi pahucha mere paas"
+  - "10-12 din pehle product order kiya ab tak nahi aaya"
+  - User angry: "history kyu dikha rha, track krke dikha" → track_single_order or ask_order_id, NEVER show_order_list again
+
+Action: ask_order_id — short message + where to find ID (My Orders / SMS / email).
+Set awaiting order_id in session. Next message with digits → track immediately.
+
+------------------------------------------------------------
+4) HOW-TO ONLY (no live API yet)
+------------------------------------------------------------
+User asks steps: "track kaise karu", "order id kahan milega" without giving id for live check.
+Use KB tracking_help / order_id_help — numbered steps in app.
+
+------------------------------------------------------------
+5) ORDER ID SHAPE ON WELFOG
+------------------------------------------------------------
+Often 4–20 digit numbers (e.g. 302032, 26051410, 989898). Do NOT treat as product SKU or pincode when order/track/refund context is clear.
+
+------------------------------------------------------------
+6) AI JSON (order tracking specialist)
+------------------------------------------------------------
+action:
+  - track_live: has order id + wants status → call API
+  - ask_order_id: wants track, no id
+  - tracking_howto: only wants steps
+  - not_tracking: wrong topic
+
+extracted_order_id: from CURRENT message or RECENT CONVERSATION if user said "bhej diya / yeh hai"
+
+Read RECENT CONVERSATION — if assistant asked for Order ID and user sends only digits, action=track_live.

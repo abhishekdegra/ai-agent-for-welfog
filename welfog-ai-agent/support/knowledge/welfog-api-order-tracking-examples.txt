@@ -1,0 +1,51 @@
+WELFOG ORDER TRACKING — PHRASING EXAMPLES (for AI specialist)
+=============================================================
+
+Use with welfog-api-order-tracking.txt. Classify LATEST user message only.
+
+------------------------------------------------------------
+A) track_live — ID in latest user message (call welfog_track API)
+------------------------------------------------------------
+- order id 2605150 track kr de / 2605150 ki status bata
+- ye rhi id 2605150 ab bta iski jankari
+- 302032 h y order id / yeh hai order id 332211
+- track order 2605201 / shipment status for 112233
+- 112233 (only digits after bot asked for Order ID)
+- sun na mera order track krke batade yeh h order ki id 332219
+- check my order 2605150 / where is order 2605150
+- order 2605150 kab aayega / 2605150 deliver hua ya nahi
+
+------------------------------------------------------------
+B) ask_order_id — wants status but NO id in latest message yet
+------------------------------------------------------------
+- mera order track karo / order kab aayega
+- order nahi aaya abhi tak / delivery nahi hui
+- sun na order id de raha hu track krke bata (de raha = will send, no digits)
+- ek aur order id de ra hu track krke bata
+- order track krna hai id batata hu (promising id later)
+- mera parcel kahan hai / package stuck hai
+- order late ho gaya kya karu status batao (no id)
+- when will my order arrive (no id)
+
+------------------------------------------------------------
+C) tracking_howto — steps only, no live lookup now
+------------------------------------------------------------
+- order track kaise karu / tracking kaise kare
+- order id kahan milega / order id kaise nikalu
+- how to track order on welfog / steps to check order status
+- track karne ka tarika (no id, no delay complaint)
+
+------------------------------------------------------------
+D) NEVER do (wrong channel)
+------------------------------------------------------------
+- Product search: cover dikhao, iphone case (intent product)
+- Order history list: mere saare order dikhao (order_history flow)
+- Place new order: order kaise karu checkout (placement, not tracking)
+- Copy Order ID from assistant's old status card in chat — only user lines
+
+------------------------------------------------------------
+E) Typos / Hinglish (normalize mentally)
+------------------------------------------------------------
+ordder, ordr, oorder → order | trck, trak, traking, teck → track
+kab aaega, kab aayega, kb aayega | nhi aaya, nahi aya, nh aaya
+bta de, bata de, btana, batana | jankari, status, update

@@ -7,6 +7,13 @@ from flask_login import login_required, login_user, logout_user
 from werkzeug.security import check_password_hash, generate_password_hash
 
 from admin_models import AdminUser
+from services.agent_llm_settings import (
+    describe_auto_chain,
+    get_admin_llm_model_key,
+    get_selectable_llm_options,
+    option_for_key,
+    set_admin_llm_model_key,
+)
 from support_paths import KNOWLEDGE_DIR
 from extensions import db
 from services.kb_service import get_allowed_knowledge_filenames, refresh_knowledge_cache
@@ -46,13 +53,25 @@ def register_admin_routes(app):
         files = get_allowed_knowledge_filenames()
         return render_template("admin_knowledge.html", files=files, nav_active="knowledge")
 
-    @app.route("/welfog-admin/settings")
+    @app.route("/welfog-admin/settings", methods=["GET", "POST"])
     @login_required
     def admin_settings():
+        if request.method == "POST":
+            model_key = (request.form.get("llm_model_key") or "").strip()
+            ok, msg = set_admin_llm_model_key(model_key)
+            flash(msg, "success" if ok else "error")
+            return redirect(url_for("admin_settings"))
+
+        llm_key = get_admin_llm_model_key()
+        llm_current = option_for_key(llm_key) or option_for_key("auto")
         return render_template(
             "admin_settings.html",
             nav_active="settings",
             knowledge_dir=os.path.abspath(KNOWLEDGE_DIR),
+            llm_model_key=llm_key,
+            llm_current=llm_current,
+            llm_options=get_selectable_llm_options(),
+            auto_chain_hint=describe_auto_chain(),
         )
 
     @app.route("/welfog-admin/new-file", methods=["GET", "POST"])

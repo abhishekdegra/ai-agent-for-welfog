@@ -1,3 +1,19 @@
+Seller account on Welfog (supplier / vendor)
+
+How to create a seller account:
+1) Open the Welfog seller portal or app seller registration page (official Welfog website — Seller / Become a seller).
+2) Register with your mobile number and verify OTP.
+3) Complete business details: shop name, GST (if applicable), bank account for payouts, pickup/warehouse address.
+4) Upload required documents (ID, GST certificate if applicable) and submit for verification.
+5) After approval, log in to the seller dashboard to list products.
+
+Seller login problems (error on login):
+- Confirm you are using the same mobile number registered for the seller account.
+- Check OTP/SMS is not blocked; wait 60 seconds and tap Resend OTP.
+- Clear app cache or try another browser; disable VPN.
+- If the error says account not found, you may still be on customer login — switch to Seller login.
+- If login fails after many tries, contact Welfog seller support: info@welfog.com or customer care 9828628181 (mention seller panel login issue).
+
 Supplier Legal Compliance:
 Suppliers must ensure their products comply with all Indian laws, including the Legal Metrology Act, Consumer Protection Rules, and BIS Act. Suppliers are solely responsible for product quality, taxes (GST), and accurate descriptions.
 

@@ -1,0 +1,113 @@
+WELFOG ORDER APIs — KNOWLEDGE BASE (for AI routing + execution)
+=============================================================
+
+Use this playbook when the customer asks about THEIR orders on Welfog in any language,
+spelling, or Roman script (English, Hinglish, Hindi, Tamil, Telugu, Bengali, etc.).
+
+------------------------------------------------------------
+A) PURCHASE HISTORY / ORDER LIST (show orders in chat)
+------------------------------------------------------------
+Endpoint:
+  GET https://welfogapi.welfog.com/api/v2/purchase-history/{user_id}
+
+Query params (backend may accept any of):
+  user_id, page, per_page (10), limit, offset
+
+When to use (intent = show_order_list):
+  User wants to SEE their own past orders / order list / order history IN THIS CHAT.
+  Examples (non-exhaustive — same meaning in any wording):
+  - "meri order history", "mere orders dikhao", "order list", "my orders on welfog"
+  - "welfog pe order list dikhao", "saari order batao", "purane order"
+  - "welfog se kya kya mangaya", "ab tak kya mangaya", "mene kya kya order kiya" (no word 'order' required)
+  - NOT company.txt / "Welfog kya hai" — that is general intent only
+  - "kitne order kiye" (if they want to see orders, not only a count)
+  - "order konse order kre the", "kon kon se products order kiye", "mere orders list dikao" (typos OK)
+  - Tamil/Telugu/Hindi native script asking to show their orders
+  - NEVER use track API or ask Order ID for these — call purchase-history API only
+
+When NOT to use:
+  - Single shipment tracking with ETA ("where is my order", "kab aayega") -> use TRACK API (section B)
+  - How-to steps only ("order history kaise dekhu in app") -> use KB help text (section C)
+  - How to place a new order -> general placement help, NOT this API
+  - Another user's orders, or orders without login -> explain login + user_id required
+
+Auth / user:
+  Chat must have logged-in customer user_id (from app URL param). Without it, show login message.
+
+Chat UI behaviour (already implemented):
+  - Returns HTML cards: product title, Order ID, payment status, delivery status, product link
+  - Pagination: "View more" loads next page via purchase_history_page in chat POST
+
+------------------------------------------------------------
+B) SINGLE ORDER TRACKING (live status — different API)
+------------------------------------------------------------
+Endpoint:
+  POST https://welfogapi.welfog.com/api/onedelivery/welfog_track
+  JSON body: { "order_id": "<id>", "user_id": <logged-in id> }
+
+When to use (intent = track_single_order):
+  User asks status/ETA/delivery of ONE order; usually needs Order ID.
+  NOT the purchase-history list API.
+
+------------------------------------------------------------
+C) HOW TO VIEW ORDER HISTORY IN APP (steps only — no API list)
+------------------------------------------------------------
+When to use (intent = order_history_howto):
+  User asks WHERE or HOW to open order history in Welfog app/website (steps),
+  without asking to list orders here in chat.
+
+Use system message key: order_history_help (not purchase-history API).
+
+------------------------------------------------------------
+C2) HOW TO FIND ORDER ID (steps only — no API list)
+------------------------------------------------------------
+When to use (action = order_id_help):
+  User asks how/where to find or get their Order ID (kaise nikale, kahan milega, order id kya hai).
+  NOT show_order_list — even if they mention "order" and "id" together.
+  Examples: order id kese nikalte h; order id kahan se milega; how to find order id
+
+Use system message key: order_id_help (not purchase-history API).
+
+------------------------------------------------------------
+D) AI DECISION RULES (critical)
+------------------------------------------------------------
+1) Prefer semantic meaning over exact keywords — typos and Hinglish are normal.
+2) show_order_list: plural / list / history / "meri/mere/my" + orders / "dikhao sab orders"
+3) track_single_order: one order + track/status/kab aayega/delay + optional order id in message
+4) order_history_howto: "kaise dekhu", "kahan milegi", "steps", "process" for viewing history
+5) not_order_topic: message is about products, deals, pincode, policies — not order list/track
+6) If assistant recently showed order list and user says "aur dikhao" / "more" -> show_order_list (pagination)
+
+------------------------------------------------------------
+E) SINGLE ORDER DETAILS (payment / product / delivery info — not live ETA track)
+------------------------------------------------------------
+Endpoint:
+  GET https://welfogapi.welfog.com/api/v2/purchase-history-details/{order_id}?user_id={user_id}
+
+When to use (intent = order_details):
+  User asks about ONE of their orders: payment status, product name, delivery status/address,
+  order summary — NOT shipment ETA / "kab aayega" (use TRACK API section B).
+  Requires logged-in user_id and order_id (from message or recent chat).
+
+When NOT to use:
+  - Invoice/bill download -> section F
+  - Live tracking timeline / delay / where is parcel -> section B
+  - Order list in chat -> section A
+
+Auth: Only the logged-in customer's orders. If API returns no row, say order not linked to account.
+
+------------------------------------------------------------
+F) ORDER INVOICE / BILL DOWNLOAD
+------------------------------------------------------------
+Step 1 — Verify ownership (required):
+  GET purchase-history-details/{order_id}?user_id={user_id}
+  Only proceed if this returns the customer's order row.
+
+Step 2 — Invoice button URL (after verification):
+  GET https://supplierservice.welfog.com/get_invoice?order_id={order_id}
+
+When to use (intent = order_invoice):
+  User wants invoice, bill, receipt, GST bill for their order.
+  Show a download button linking to the invoice URL — never expose another user's invoice.
+
+Return action names exactly as in sections A–F for the orchestrator.

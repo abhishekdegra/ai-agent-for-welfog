@@ -68,6 +68,26 @@ Flow:
   - Then use products/search with categories=<id>
 
 ------------------------------------------------------------
+2b) INNER CATEGORIES (Subcategories under a main department)
+------------------------------------------------------------
+Endpoint:
+  https://welfogapi.welfog.com/api/inner_categories?main_category_id=<id>
+
+Example: main_category_id=10 (Men Fashion) returns parent groups (Footwear, Accessories, …)
+and children (Shoes id 1014, Flipflops & Slippers id 1015, …).
+
+Use this when:
+  - User names a subcategory ("men shoes", "belts", "kurtas") — resolve child id from inner_categories
+  - User picks a main department id (10, 11) — show subcategory list, then products on subcategory id
+  - User sends explicit subcategory id (e.g. 1014)
+
+Rules:
+  - main_category_id is the top nav id from nav_cat_data (10=Men Fashion, 11=Women Fashion, 16=Electronics, …)
+  - Prefer leaf/child id for products/search when user names a specific subcategory (Shoes, Belts)
+  - Use categories=<resolved_id> without a conflicting name filter (same as top-level category browse)
+  - If user says "men" + subcategory, scope to main_category_id=10; "women" + item → main 11
+
+------------------------------------------------------------
 3) TODAY DEALS (Deals / Offers)
 ------------------------------------------------------------
 Endpoint:
@@ -113,7 +133,7 @@ Deals product field mapping (UI):
   - product name: p.name
   - product image: p.thumbnail_img  (NOTE: key is thumbnail_img, not thumbnail_image)
   - price to show: p.new_price (and strike-through p.old_price if present)
-  - product link: https://welfog.com/product/<p.slug>
+  - product link: https://welfog.com/product_details/<p.slug>
 
 ------------------------------------------------------------
 4) CATEGORY-WISE PRODUCT FEED (Home feed style)
@@ -167,7 +187,7 @@ Category-wise field mapping (UI):
   - show 3-5 products per category: item.products[]
   - product image: product.image
   - product price: product.price
-  - product link: https://welfog.com/product/<product.link>
+  - product link: https://welfog.com/product_details/<product.link>
   - pagination: use meta.next_page if available, else page+1 only if has_next_page=true
 
 ------------------------------------------------------------

@@ -1,0 +1,64 @@
+WELFOG ORDER ID — API KNOWLEDGE BASE (for AI routing + execution)
+===============================================================
+
+Use when the customer talks about ORDER ID (not full product catalog, not wishlist).
+
+------------------------------------------------------------
+1) WHAT IS A WELFOG ORDER ID?
+------------------------------------------------------------
+- Unique id for each purchase (often same as `oid` / `id` in APIs).
+- Format: numeric 4–20 digits, or mixed letters+numbers 4–20 characters (as shown in SMS/email/My Orders).
+- Used for live tracking, refund/payment lookup, support.
+- NOT the same as catalog product id (pro_id / 7-digit product numbers).
+
+------------------------------------------------------------
+2) SHOW MY ORDER IDs (list in chat)
+------------------------------------------------------------
+API: GET https://welfogapi.welfog.com/api/v2/purchase-history/{user_id}
+
+When to use (action = show_my_order_ids):
+  User wants THEIR order IDs displayed — any wording:
+  - "mere order id dikhao", "welfog pe order id dikhao", "my order ids"
+  - "order id list", "saare order id batao", "konsa id tha"
+  - Show compact list: Order ID + product title + date + status
+
+Requires logged-in user_id in chat URL.
+
+NOT show_my_order_ids when:
+  - User only asks HOW/WHERE to find id (no "dikhao/list") → order_id_where_how
+  - User gave one id and wants tracking → track_with_order_id
+
+------------------------------------------------------------
+3) WHERE / HOW TO FIND ORDER ID (steps — no API list)
+------------------------------------------------------------
+When to use (action = order_id_where_how):
+  - "order id kahan se nikalu", "kaise milega", "kese nikalte", "api se order id kaise"
+  - "where to find order id", "how do I get order id"
+  - User explains they don't know where id is — NOT asking to list all ids here
+
+Use system message: order_id_help
+Optionally add: "You can also ask me: show my order ids"
+
+------------------------------------------------------------
+4) TRACK ONE ORDER (live status)
+------------------------------------------------------------
+API: POST https://welfogapi.welfog.com/api/onedelivery/welfog_track
+Body: { "order_id": "<id>", "user_id": <logged-in> }
+
+When to use (action = track_with_order_id):
+  - User pasted or named a specific order id AND wants status/ETA/delay
+  - "2605201 ka status", "track order id 12345"
+
+When to use (action = ask_order_id_for_tracking):
+  - Wants tracking but no id in message → ask for id + short help
+
+------------------------------------------------------------
+5) AI DECISION RULES
+------------------------------------------------------------
+- Semantic meaning over exact keywords; Hinglish/typos normal.
+- "order id dikhao" / "mere order id" → show_my_order_ids (API)
+- "kahan se nikalu" / "kaise nikale" without list verbs → order_id_where_how (KB)
+- "order nahi aaya" without id focus → NOT this playbook (order tracking elsewhere)
+- Read RECENT CONVERSATION for follow-ups ("ha wahi id", "pehle wala order")
+
+Return action names exactly as above.

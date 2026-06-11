@@ -1,32 +1,189 @@
-Order Placement, Modification & Cancellation:
-To place an order on Welfog, select your product, add it to the cart, and proceed to checkout using your registered account. You generally cannot modify an order once it is placed, but you can cancel it before it is shipped and place a new one. Orders may be cancelled automatically if there is an inventory issue or a payment failure.
+How do I place an order on Welfog?
+To place an order on Welfog, start by selecting your delivery location to view available products. Add your desired items to the cart, proceed to checkout, enter your shipping details, and complete the payment to confirm your order.
 
-Order Tracking & Status Meanings:
-You can track your package directly from the 'Order History' section in your account. The order statuses mean: 'Pending' (awaiting payment/confirmation), 'Accepted' (confirmed by the seller), 'Shipped' (dispatched via our courier partners), and 'Delivered' (reached your address).
 
-Invoices & Order History:
-Welfog provides a valid invoice or bill for every order. You can view your complete order history, check order details, and easily download your invoice directly from the 'Order History' section after the purchase is confirmed.
+How can I track my order?
+To track your order on Welfog, you can either log in and click on the user icon at the top-right corner, select “My Orders”, and then click “Track Order” for your desired order, or scroll down to the footer, click on “Track Order”, and enter your order number to see its current status.
 
-Payment Methods & Security:
-Welfog accepts multiple secure payment methods including UPI, Credit/Debit Cards, Net Banking, and Wallets. Cash on Delivery (COD) is also available depending on your PIN code eligibility. Your payment information is 100% safe, processed through encrypted gateways, and Welfog does not charge any hidden fees.
 
-Payment Failures & Deductions:
-If your payment failed but the amount was deducted from your bank account, please do not panic. The transaction will automatically be reversed by your bank, and the refund will reflect in your account within 5-7 business days. If you face issues during checkout, please check your internet connection or try another payment method.
+Can I modify my order after placing it?
+Once an order is placed on Welfog, it cannot be modified. You can cancel the order (if eligible) and place a new one with the desired changes.
 
-Shipping & Delivery Time:
-Order processing and delivery usually take 3-5 days depending on your location and PIN code availability. Shipping charges (or free shipping eligibility) will be calculated and displayed at checkout. If your package is delayed, lost, or you are not available at the time of delivery, our courier partners will attempt delivery again or you can contact support.
 
-Returns, Replacements & Damaged Items:
-You can initiate a return or replacement request within 7 days of delivery through your 'Order History'. If you receive a wrong, damaged, or defective item, please upload clear photos while raising the request. Please note that certain perishable or hygiene products may not be eligible for return.
+What should I do if I haven’t received my order yet?
+If you haven't received your order from Welfog, please follow these steps:
+	Verify your order status: Visit the Welfog website and use the "Track Order" feature by entering your order number.
+	Contact Welfog Support: If you still haven't received your order, reach out to Welfog's customer support for assistance.
 
-Refund Processing Time:
-Once your return is approved and the item is successfully picked up, or if your order is cancelled prior to shipping, the refund is processed within 5-7 business days to your original payment method.
 
-Coupons & Discounts:
-You can apply a valid coupon or discount code at the checkout page before making the payment. If your coupon code isn't working, it might have expired, may not be applicable to the selected products, or the minimum cart value hasn't been met.
+What does each order status (Pending, Accepted, Hold, Shipped, Delivered) mean?
+Here’s a simple explanation of Welfog’s order statuses:
+Pending – Your order has been placed but not yet confirmed by Welfog.
+Accepted – Welfog has confirmed your order and is preparing it for shipment.
+Hold – Your order is temporarily on hold due to issues like payment verification or stock availability.
+Shipped – Your order has been dispatched and is on the way to your delivery address.
+Delivered – Your order has been successfully delivered to the provided address.
 
-Account Details & Customer Support:
-You can update your delivery address, phone number, and personal details directly from your Account Settings. For any issues, queries, or to report a problem, you can contact Welfog customer support through the 'Help & Support' section in the Welfog mobile app or email us at grievance@welfog.com.
 
-Product Reviews:
-You can leave a review and rating for a product after it has been delivered to you. Welfog values authentic feedback and verifies product reviews to ensure they are from genuine buyers.
+How do I reorder a previous purchase?
+To reorder a previous purchase on Welfog, log in to your account, click on the user icon at the top-right corner, go to “My Orders”, find the order you want to buy again, and click “Reorder” to add the same items to your cart and place a new order.
+
+
+How can I verify that my order was successfully placed?
+can verify your Welfog order by checking for an order confirmation message on the website.
+
+
+How can I view my complete order history?
+To view your complete order history on Welfog, log in to your account, click on the user icon at the top-right corner, and select “My Orders” to see all your past orders.
+
+
+Will I receive an invoice or bill for my order?
+Yes, Welfog provides an invoice for every order, which you can view or download from your Order History after the purchase is confirmed.
+
+
+What should I do if I receive the wrong or damaged item?
+If you receive a wrong or damaged item from Welfog, contact their customer support immediately to report the issue and request a replacement or refund.
+
+
+How long does it take to process and ship my order?
+Welfog typically processes and ships orders within 1–3 business days, depending on product availability and delivery location.
+
+
+Do I need an account to place an order on Welfog?
+Yes, you need to create an account on Welfog to place an order and track your purchases.
+
+
+How do I apply a coupon or discount code to my order?
+To apply a coupon or discount code on Welfog, enter the code in the “Apply Coupon” field during checkout, then click “Apply” to see the discount reflected in your order total.
+
+
+What should I do if my payment failed but the amount was deducted?
+If your payment failed on Welfog but the amount was deducted, contact customer support immediately with your payment details to resolve the issue and get a refund or confirmation.
+
+
+Can I cancel my order?
+Yes, you can cancel your Welfog order if it is still pending or not yet shipped by visiting your “My Orders” section and selecting the order you want to cancel.
+
+
+Why was my order cancelled automatically?
+Your Welfog order may be cancelled automatically due to reasons like payment failure, unavailability of the product, or verification issues.
+
+
+Do you offer free shipping?
+Yes, Welfog offers free shipping on select products, while shipping charges may apply to others depending on your location and the item.
+
+
+What is Welfog’s return policy
+Welfog allows returns within 5 days of delivery for unused items in original packaging.
+
+
+Is my payment information safe on Welfog?
+Yes, Welfog secures your payment information using standard online security measures.
+
+
+What payment methods does Welfog accept?
+Welfog accepts credit/debit cards, net banking, and Cash on Delivery (COD) in select locations.
+
+
+Is Cash on Delivery (COD) available?
+Cash on Delivery (COD) on Welfog is available only for select locations and products, and will appear as a payment option during checkout if eligible.
+
+
+I was charged but my order didn’t go through — what should I do?
+If you were charged but your Welfog order didn’t go through, contact Welfog customer support immediately with your payment details so they can verify the transaction and issue a refund or help complete your order.
+
+
+How can I download my invoice?
+To download your invoice on Welfog, first log in to your account by clicking the user icon at the top-right corner of the website. Once logged in, navigate to “My Orders” from the dropdown menu. Find the order for which you want the invoice and click on it to open the order details page. On this page, you will see a “Download Invoice” button or link—click it to download your invoice as a PDF. This allows you to easily access and save your invoice for any order.
+
+
+Does Welfog charge any hidden fees?
+Welfog does not charge hidden fees, but shipping or payment-related charges may apply depending on your location and chosen payment method.
+
+
+Why did my payment fail?
+Your payment may have failed due to issues like an unstable internet connection, insufficient balance, incorrect card details, or temporary issues with your bank or payment gateway. Try again after some time or use a different payment method.
+
+
+How long does it take for a refund to be processed?
+Refunds on Welfog are usually processed within 5–7 business days after the returned item is received and verified. The exact time may vary depending on your payment method or bank’s processing time.
+
+
+How long will it take to deliver my order?
+Delivery times on Welfog vary by location and product, and estimated delivery is shown during checkout.
+
+
+Which courier partners does Welfog use?
+Welfog does not publicly list its courier partners; contact customer support for delivery details.
+
+
+How can I track the delivery of my package?
+You can track your Welfog package by logging into your account, going to “My Orders”, and clicking “Track Order” next to the order to see its current delivery status.
+
+
+What should I do if my package is delayed or lost?
+If your Welfog package is delayed or lost, check “My Orders” for tracking, verify your address, and contact customer support for assistance.
+
+
+Do you deliver to my PIN code or location?
+Welfog delivers to select locations; enter your PIN code on the website to check availability.
+
+
+What happens if I’m not available at the time of delivery?
+If you’re not available at the time of delivery, Welfog courier will usually attempt redelivery or leave a notification. You may need to reschedule delivery or contact customer support to arrange another delivery time.
+
+
+How can I initiate a return or replacement request?
+To initiate a return or replacement on Welfog, go to “My Orders”, select the order, and click “Return” or “Replace”, or contact customer support for assistance.
+
+
+Can I return a product if I no longer want it?
+Yes, you can return a product on Welfog within 5 days of delivery if you no longer want it. The item must be unused and in its original packaging. To return it, log in to your account, go to “My Orders”, select the order, and click “Return”, or contact Welfog’s customer support for assistance.
+
+
+What if I receive a damaged or defective item?
+If you receive a damaged or defective item, Welfog will either replace it with a new one or refund your money, depending on their return policy.
+
+
+Are there any products that are not eligible for return?
+Yes, certain products on Welfog may not be eligible for return, such as perishable items, personal care products, or items marked as non-returnable. Always check the product details or contact customer support for confirmation.
+
+
+How will I know if my return has been approved?
+You will know your Welfog return has been approved when you receive a confirmation notification from Welfog via your account, or order status update, indicating that your return request has been accepted.
+
+
+How can I update my address or phone number?
+You can update your address or phone number on Welfog by logging into your account, going to the “My Profile” section, and editing your saved address or contact details.
+
+
+Why isn’t my coupon code working?
+Your coupon code may not be working because it’s expired, already used, invalid for selected products, or doesn’t meet the minimum order value. Double-check the coupon terms before applying it again.
+
+
+Is my personal information safe with Welfog?
+Yes — Welfog takes steps to protect your personal information through standard security practices and keeps it confidential within its systems. They do not share your personal data with third parties without your consent, unless required by law. However, as with any online platform, no system is 100% risk-proof.
+
+
+How can I contact Welfog customer support?
+You can contact Welfog customer support via phone, email, or the Help Center on their website for assistance.
+
+
+Does Welfog have a mobile app?
+Yes, Welfog has a mobile app that lets you browse products, place orders, track shipments, and manage your account on the go.
+
+
+How can I leave a review for a product?
+You can leave a review for a product on Welfog by logging into your account, going to the product page, scrolling to the “Write a Review” section, and submitting your rating and comments.
+
+
+Do you verify product reviews?
+Yes, only verified buyers can post reviews on Welfog to ensure authenticity.
+
+
+Where can I find my order invoice?
+You can find your Welfog order invoice by logging into your account, going to “My Orders”, selecting the completed order, and clicking “Download Invoice” on the order details page.
+
+
+I’m facing an issue during checkout — what should I do?
+Refresh the page, check your internet connection, and try again. If the problem continues, contact support.

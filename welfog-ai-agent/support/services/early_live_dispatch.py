@@ -1,0 +1,472 @@
+"""
+Unified early live-API dispatch for ALL personal-data intents.
+
+After the main AI router runs once, call try_early_live_api_reply() before KB
+pre-scope or duplicate micro-classifiers (track, refund, details, invoice,
+wishlist, order history, pincode).
+"""
+from __future__ import annotations
+
+from typing import Any, Optional
+
+from utils.reasoning_log import log_reasoning
+
+_LIVE_API_HANDLERS = frozenset(
+    {
+        "wishlist_api",
+        "order_ai_flow",
+        "order_tracking_api",
+        "order_details_api",
+        "refund_status_api",
+        "pincode_delivery_api",
+    }
+)
+
+
+def ai_route_is_live_api_turn(
+    ai_route: dict | None,
+    route_decision: Any = None,
+) -> bool:
+    """True when this turn needs a live API — never informational KB pre-scope."""
+    r = ai_route or {}
+    handler = (
+        (getattr(route_decision, "handler", None) if route_decision else None)
+        or r.get("route_handler")
+        or ""
+    ).strip().lower()
+    channel = (r.get("data_channel") or "").strip().lower()
+    intent = (
+        (getattr(route_decision, "intent", None) if route_decision else None)
+        or r.get("intent")
+        or ""
+    ).strip().lower()
+    if handler in _LIVE_API_HANDLERS:
+        return True
+    if channel == "live_api" and intent in (
+        "order",
+        "refund",
+        "payment",
+        "order_history",
+        "wishlist",
+        "pincode_check",
+    ):
+        return True
+    olk = (r.get("order_lookup_kind") or "").strip().lower()
+    if olk in ("track", "tracking", "details", "invoice", "refund_status"):
+        return True
+    return False
+
+
+def turn_blocks_kb_pre_scope(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    ai_route: dict | None = None,
+    route_decision: Any = None,
+) -> str:
+    """Non-empty reason ⇒ skip KB pre-scope (live API or personal data)."""
+    if ai_route_is_live_api_turn(ai_route, route_decision):
+        return "live_api_route"
+
+    try:
+        from services.account_list_semantics import (
+            turn_requests_purchase_history_in_chat,
+            turn_requests_wishlist_in_chat,
+        )
+
+        if turn_requests_wishlist_in_chat(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        ):
+            return "wishlist_in_chat"
+        if turn_requests_purchase_history_in_chat(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        ):
+            return "order_history_in_chat"
+    except ImportError:
+        pass
+
+    try:
+        from services.refund_status_semantics import ai_route_requests_refund_status_lookup
+        from services.order_details_flow import message_wants_order_details_or_invoice
+        from utils.helpers import user_turn_qualifies_for_live_order_api
+
+        if ai_route_requests_refund_status_lookup(
+            ai_route, original_msg, msg_en, conversation_context
+        ):
+            return "refund_status"
+        if message_wants_order_details_or_invoice(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        ):
+            return "order_details_invoice"
+        if user_turn_qualifies_for_live_order_api(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        ):
+            return "live_order_lookup"
+    except ImportError:
+        pass
+
+    return ""
+
+
+def _record_live(intent: str, source: str) -> None:
+    try:
+        from services.chat_flow_telemetry import record_route
+
+        record_route(intent=intent, source=source)
+    except ImportError:
+        pass
+
+
+def try_early_live_api_reply(
+    *,
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str,
+    user_id: str,
+    lang: str,
+    ctx: dict,
+    route_decision: Any,
+    ai_route: dict | None,
+    reply_for_live_order_id_lookup,
+    reset_context_fn,
+) -> Optional[str]:
+    """
+    Dispatch live APIs immediately after main route.
+    Returns reply HTML or None (caller continues normal flow).
+    """
+    handler = (getattr(route_decision, "handler", None) or "").strip().lower()
+    intent = (
+        (getattr(route_decision, "intent", None) or "")
+        or ((ai_route or {}).get("intent") or "")
+    ).strip().lower()
+    olk = ((ai_route or {}).get("order_lookup_kind") or "").strip().lower()
+
+    # --- Pincode delivery (handler OR semantic delivery turn) ---
+    try:
+        from services.entity_first_handlers import try_pincode_delivery_reply
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+
+        pincode_turn = (
+            handler == "pincode_delivery_api"
+            or intent == "pincode_check"
+            or turn_requests_delivery_serviceability(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                ai_route=ai_route,
+                allow_llm=True,
+            )
+        )
+        if pincode_turn:
+            pin = try_pincode_delivery_reply(
+                original_msg, msg_en, conv_for_llm, lang, ctx, ai_route=ai_route
+            )
+            if pin:
+                log_reasoning("Early live dispatch: pincode delivery API.")
+                _record_live("pincode_check", "pincode_delivery_api")
+                return pin
+    except ImportError:
+        pass
+
+    # --- Wishlist list in chat ---
+    try:
+        from services.account_list_semantics import turn_requests_wishlist_in_chat
+        from services.welfog_api import format_wishlist_reply
+
+        if (
+            handler == "wishlist_api"
+            or intent == "wishlist"
+            or turn_requests_wishlist_in_chat(
+                original_msg, msg_en, conv_for_llm, ai_route=ai_route
+            )
+        ):
+            from services.account_list_semantics import ai_route_requests_wishlist_howto
+
+            if not ai_route_requests_wishlist_howto(ai_route):
+                log_reasoning("Early live dispatch: wishlist API.")
+                _record_live("wishlist", "wishlist_api")
+                reset_context_fn(ctx)
+                ctx["last"] = "wishlist"
+                ctx.setdefault("data", {})["topic_mode"] = "wishlist_list"
+                return format_wishlist_reply(user_id, page=1, append_only=False)
+    except ImportError:
+        pass
+
+    # --- Purchase / order history list in chat ---
+    try:
+        from services.account_list_semantics import (
+            ai_route_requests_order_history_howto,
+            turn_requests_purchase_history_in_chat,
+        )
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+        from services.welfog_api import format_purchase_history_reply
+
+        pincode_turn = (
+            handler == "pincode_delivery_api"
+            or intent == "pincode_check"
+            or turn_requests_delivery_serviceability(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                ai_route=ai_route,
+                allow_llm=True,
+            )
+        )
+        if (
+            not pincode_turn
+            and (
+                handler == "order_ai_flow"
+                or intent == "order_history"
+                or turn_requests_purchase_history_in_chat(
+                    original_msg, msg_en, conv_for_llm, ai_route=ai_route
+                )
+            )
+        ):
+            if not ai_route_requests_order_history_howto(ai_route):
+                log_reasoning("Early live dispatch: purchase-history API.")
+                _record_live("order_history", "order_ai_flow")
+                reset_context_fn(ctx)
+                ctx["last"] = "order_history"
+                ctx.setdefault("data", {})["topic_mode"] = "order_history_list"
+                return format_purchase_history_reply(user_id, page=1, append_only=False)
+    except ImportError:
+        pass
+
+    # --- Refund status (before details/invoice — refund beats stale locks) ---
+    try:
+        from services.refund_status_flow import run_refund_status_ai_flow
+        from services.refund_status_semantics import (
+            KIND_PERSONAL_STATUS,
+            resolve_refund_turn,
+        )
+
+        resolved = resolve_refund_turn(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            ai_route=ai_route,
+            reply_lang=lang,
+            allow_llm=True,
+        )
+        wants_refund = resolved.kind == KIND_PERSONAL_STATUS
+        if wants_refund or handler == "refund_status_api" or olk == "refund_status":
+            result = run_refund_status_ai_flow(
+                original_msg,
+                msg_en,
+                user_id,
+                conversation_context=conv_for_llm,
+                reply_lang=lang,
+                ai_route=ai_route,
+            )
+            if result.handled and result.reply_html:
+                log_reasoning(
+                    f"Early live dispatch: refund status API ({wants_refund or olk or handler})."
+                )
+                _record_live("refund", "refund_status_api")
+                reset_context_fn(ctx)
+                ctx["last"] = "refund"
+                if result.order_id:
+                    ctx["order_id"] = result.order_id
+                ctx["awaiting"] = "order_id" if result.needs_order_id else None
+                return result.reply_html
+    except ImportError:
+        pass
+
+    # --- Order details / invoice ---
+    try:
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+        from services.order_details_flow import (
+            message_wants_order_details_or_invoice,
+            run_order_details_ai_flow,
+        )
+
+        pincode_blocks_order = (
+            handler == "pincode_delivery_api"
+            or intent == "pincode_check"
+            or turn_requests_delivery_serviceability(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                ai_route=ai_route,
+                allow_llm=True,
+            )
+        )
+        wants_od = (
+            ""
+            if pincode_blocks_order
+            else message_wants_order_details_or_invoice(
+                original_msg, msg_en, conv_for_llm, ai_route=ai_route
+            )
+        )
+        if (
+            not pincode_blocks_order
+            and (
+                wants_od
+                or handler == "order_details_api"
+                or olk in ("details", "invoice", "order_details", "order_invoice")
+            )
+        ):
+            result = run_order_details_ai_flow(
+                original_msg,
+                msg_en,
+                user_id,
+                conversation_context=conv_for_llm,
+                reply_lang=lang,
+                ai_route=ai_route,
+            )
+            if result.handled and result.reply_html:
+                log_reasoning(f"Early live dispatch: order details API ({wants_od or olk or handler}).")
+                _record_live("order", "order_details_api")
+                reset_context_fn(ctx)
+                ctx["last"] = "order"
+                if result.order_id:
+                    ctx["order_id"] = result.order_id
+                ctx["awaiting"] = "order_id" if result.needs_order_id else None
+                return result.reply_html
+    except ImportError:
+        pass
+
+    # --- Account list follow-up (self-view in chat) before wrong tracking/KB ---
+    try:
+        from services.account_list_semantics import detect_account_list_followup_in_chat
+        from services.welfog_api import format_purchase_history_reply, format_wishlist_reply
+
+        follow = detect_account_list_followup_in_chat(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            ctx=ctx,
+            ai_route=ai_route,
+            reply_lang=lang,
+        )
+        if follow == "wishlist":
+            log_reasoning("Early live dispatch: wishlist follow-up in chat.")
+            _record_live("wishlist", "wishlist_api")
+            reset_context_fn(ctx)
+            ctx["last"] = "wishlist"
+            ctx.setdefault("data", {})["topic_mode"] = "wishlist_list"
+            return format_wishlist_reply(user_id, page=1, append_only=False)
+        if follow == "order_history":
+            log_reasoning("Early live dispatch: order-history follow-up in chat.")
+            _record_live("order_history", "order_ai_flow")
+            reset_context_fn(ctx)
+            ctx["last"] = "order_history"
+            ctx.setdefault("data", {})["topic_mode"] = "order_history_list"
+            return format_purchase_history_reply(user_id, page=1, append_only=False)
+    except ImportError:
+        pass
+
+    # --- Order tracking ---
+    if handler == "order_tracking_api" or olk in ("track", "tracking"):
+        try:
+            from utils.helpers import extract_order_id, resolve_order_id_for_tracking
+
+            oid = extract_order_id(f"{original_msg} {msg_en}", conv_for_llm)
+            if not oid:
+                oid = resolve_order_id_for_tracking(
+                    original_msg.strip() or msg_en.strip(), conv_for_llm
+                )
+            if not oid:
+                from services.account_list_semantics import (
+                    detect_account_list_followup_in_chat,
+                    turn_requests_purchase_history_in_chat,
+                )
+
+                um = ((ai_route or {}).get("user_meaning") or "").lower()
+                if (
+                    detect_account_list_followup_in_chat(
+                        original_msg,
+                        msg_en,
+                        conv_for_llm,
+                        ctx=ctx,
+                        ai_route=ai_route,
+                        reply_lang=lang,
+                    )
+                    or turn_requests_purchase_history_in_chat(
+                        original_msg, msg_en, conv_for_llm, ai_route=ai_route
+                    )
+                    or (
+                        "order history" in um
+                        and "track" not in um
+                        and "shipment" not in um
+                    )
+                ):
+                    log_reasoning(
+                        "Early live dispatch: skip tracking — account list / history turn."
+                    )
+                    return None
+        except ImportError:
+            pass
+        try:
+            from services.order_tracking_flow import run_order_tracking_ai_flow
+
+            result = run_order_tracking_ai_flow(
+                original_msg,
+                msg_en,
+                user_id,
+                conversation_context=conv_for_llm,
+                reply_lang=lang,
+            )
+            if result.handled and result.reply_html:
+                log_reasoning("Early live dispatch: order tracking API.")
+                _record_live("order", "order_tracking_api")
+                reset_context_fn(ctx)
+                ctx["last"] = "order"
+                if result.order_id:
+                    ctx["order_id"] = result.order_id
+                ctx["awaiting"] = "order_id" if result.needs_order_id else None
+                return result.reply_html
+        except ImportError:
+            pass
+
+    # --- Live order-id lookup (track / refund / payment) when ID present ---
+    try:
+        from services.order_details_flow import message_wants_order_details_or_invoice
+        from utils.helpers import (
+            _message_is_order_id_followup_submission,
+            resolve_order_id_for_tracking,
+            resolve_live_api_intent_from_conversation,
+            should_attempt_live_order_api_reply,
+            user_turn_qualifies_for_live_order_api,
+        )
+
+        if message_wants_order_details_or_invoice(
+            original_msg, msg_en, conv_for_llm, ai_route=ai_route
+        ):
+            return None
+        if user_turn_qualifies_for_live_order_api(
+            original_msg, msg_en, conv_for_llm, ai_route=ai_route
+        ) and should_attempt_live_order_api_reply(
+            original_msg, msg_en, conv_for_llm, ai_route=ai_route
+        ):
+            pending_oid = resolve_order_id_for_tracking(
+                original_msg.strip() or msg_en.strip(),
+                conv_for_llm,
+                bot_awaiting_order_id=ctx.get("awaiting") == "order_id"
+                or _message_is_order_id_followup_submission(original_msg, conv_for_llm),
+            )
+            if pending_oid:
+                live_intent = resolve_live_api_intent_from_conversation(
+                    conv_for_llm,
+                    ctx.get("last"),
+                    original_msg,
+                    msg_en,
+                    ai_route=ai_route if isinstance(ai_route, dict) else None,
+                )
+                log_reasoning(
+                    f"Early live dispatch: {live_intent} for order {pending_oid}."
+                )
+                _record_live(live_intent, f"live_{live_intent}_api")
+                ctx["last"] = (
+                    live_intent if live_intent in ("refund", "payment", "order") else "order"
+                )
+                ctx["order_id"] = pending_oid
+                ctx["awaiting"] = None
+                return reply_for_live_order_id_lookup(
+                    live_intent, pending_oid, user_id, original_msg, lang
+                )
+    except ImportError:
+        pass
+
+    return None
