@@ -70,13 +70,68 @@ def apply_embedded_identifiers_from_message(
                 live_intent = "payment"
             else:
                 live_intent = "order"
+        try:
+            from services.order_details_flow import _fast_order_lookup_goal
+
+            fast_goal = _fast_order_lookup_goal(
+                original_msg, msg_en, conversation_context, out
+            )
+        except ImportError:
+            fast_goal = ""
+        if fast_goal == "order_invoice":
+            out["intent"] = "order"
+            out["order_lookup_kind"] = "invoice"
+            out["route_handler"] = "order_details_api"
+            out["needs_order_id"] = True
+            out["numeric_context"] = "order_id"
+            out["data_channel"] = "live_api"
+            out["extracted_pincode"] = ""
+            log_reasoning(
+                f"Query has Order ID {oid} — invoice/details API (not generic track)."
+            )
+            return out
+        if fast_goal == "order_details":
+            out["intent"] = "order"
+            out["order_lookup_kind"] = "details"
+            out["route_handler"] = "order_details_api"
+            out["needs_order_id"] = True
+            out["numeric_context"] = "order_id"
+            out["data_channel"] = "live_api"
+            out["extracted_pincode"] = ""
+            log_reasoning(
+                f"Query has Order ID {oid} — order details API (address/amount/payment)."
+            )
+            return out
+        if _text_has_refund_or_return_intent(comb):
+            try:
+                from services.refund_status_semantics import (
+                    current_turn_wants_personal_refund_status,
+                )
+
+                if current_turn_wants_personal_refund_status(
+                    original_msg, msg_en, conversation_context, ai_route=out, allow_llm=False
+                ):
+                    out["intent"] = "refund"
+                    out["order_lookup_kind"] = "refund_status"
+                    out["route_handler"] = "refund_status_api"
+                    out["needs_order_id"] = True
+                    out["numeric_context"] = "order_id"
+                    out["data_channel"] = "live_api"
+                    out["extracted_pincode"] = ""
+                    log_reasoning(
+                        f"Query has Order ID {oid} — refund status API (not order list/track)."
+                    )
+                    return out
+            except ImportError:
+                pass
         if (
             _text_is_order_tracking_intent(comb)
-            or _text_has_refund_or_return_intent(comb)
             or _user_explicitly_asks_payment_status(comb)
             or _user_denies_pincode_insists_order_id(comb)
             or live_intent in ("order", "refund", "payment")
         ):
+            if _text_has_refund_or_return_intent(comb) and live_intent != "refund":
+                live_intent = "refund"
             out["intent"] = live_intent
             out["needs_order_id"] = True
             out["numeric_context"] = "order_id"
@@ -1489,6 +1544,36 @@ def _apply_ai_route_corrections_body(
         log_reasoning("Safety: history how-to overrides awaiting-order-id lock.")
         return out
 
+    try:
+        from services.conversation_thread_semantics import (
+            apply_thread_goal_to_route,
+            resolve_explicit_turn_goal_from_message,
+        )
+
+        explicit_goal = resolve_explicit_turn_goal_from_message(
+            original_msg, msg_en, conversation_context, out, allow_llm=True
+        )
+        if explicit_goal in (
+            "refund_status",
+            "track",
+            "order_invoice",
+            "order_details",
+            "payment",
+        ):
+            out = apply_thread_goal_to_route(out, explicit_goal, "explicit_turn_goal")
+            out["needs_order_id"] = True
+            out["numeric_context"] = "order_id"
+            oid = extract_order_id(original_msg, conversation_context) or extract_latest_order_id_from_user_conversation(
+                conversation_context, original_msg
+            )
+            log_reasoning(
+                f"Safety: explicit turn goal={explicit_goal}"
+                + (f" order_id={oid}." if oid else " (await id).")
+            )
+            return out
+    except ImportError:
+        pass
+
     if _conversation_awaiting_order_id(conversation_context) and not message_is_user_feedback_or_closing(
         comb
     ):
@@ -1508,19 +1593,43 @@ def _apply_ai_route_corrections_body(
             out["data_channel"] = "live_api"
             log_reasoning("Safety: purchase list overrides stale awaiting-order-id state.")
             return out
-        tail = (conversation_context or "")[-3500:].lower()
-        if any(
-            x in tail
-            for x in (
-                "refund", "return daal", "return daale", "refund nhi", "refund nahi",
-                "paise wapas", "paise nahi", "money back",
+        thread = ""
+        try:
+            from services.conversation_thread_semantics import (
+                apply_thread_goal_to_route,
+                infer_order_thread_goal,
             )
-        ):
-            out["intent"] = "refund"
-        elif "payment" in tail and "refund" not in tail:
-            out["intent"] = "payment"
-        else:
-            out["intent"] = "order"
+
+            thread = infer_order_thread_goal(
+                conversation_context,
+                comb,
+                ai_route=out,
+                allow_llm=True,
+            )
+            if thread in ("refund_status", "track", "order_invoice", "order_details", "payment"):
+                out = apply_thread_goal_to_route(out, thread, "awaiting_order_id_thread")
+        except ImportError:
+            thread = ""
+        if not thread:
+            tail = (conversation_context or "")[-3500:].lower()
+            if any(
+                x in tail
+                for x in (
+                    "refund", "return daal", "return daale", "refund nhi", "refund nahi",
+                    "paise wapas", "paise nahi", "money back",
+                )
+            ):
+                out["intent"] = "refund"
+                out["order_lookup_kind"] = "refund_status"
+                out["route_handler"] = "refund_status_api"
+                out["data_channel"] = "live_api"
+            elif "payment" in tail and "refund" not in tail:
+                out["intent"] = "payment"
+            else:
+                out["intent"] = "order"
+                out["order_lookup_kind"] = "track"
+                out["route_handler"] = "order_tracking_api"
+                out["data_channel"] = "live_api"
         out["needs_order_id"] = True
         out["numeric_context"] = "order_id"
         out["extracted_pincode"] = ""
@@ -1528,7 +1637,10 @@ def _apply_ai_route_corrections_body(
             conversation_context, original_msg
         )
         if oid:
-            log_reasoning(f"Safety: bot asked Order ID — live {out['intent']} lookup for {oid}.")
+            log_reasoning(
+                f"Safety: bot asked Order ID — live {out.get('intent')} "
+                f"({out.get('order_lookup_kind') or '-'}) for {oid}."
+            )
         else:
             log_reasoning("Safety: bot asked Order ID — wait for id.")
         return out

@@ -132,6 +132,33 @@ def should_skip_ctx_last_pinning(
     ):
         log_reasoning("Skip ctx.last pin — AI chose live single-order lookup.")
         return True
+    try:
+        from services.order_details_flow import message_wants_order_details_or_invoice
+
+        if message_wants_order_details_or_invoice(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        ):
+            log_reasoning("Skip ctx.last pin — order details/invoice on this turn.")
+            return True
+    except ImportError:
+        pass
+    try:
+        from services.conversation_thread_semantics import (
+            resolve_explicit_turn_goal_from_message,
+        )
+
+        explicit = resolve_explicit_turn_goal_from_message(
+            original_msg, msg_en, conversation_context, ai_route, allow_llm=False
+        )
+        if explicit and explicit != "refund_status":
+            log_reasoning(f"Skip ctx.last pin — explicit turn goal={explicit}.")
+            return True
+    except ImportError:
+        pass
+    olk = (ai_route.get("order_lookup_kind") or "").strip().lower()
+    if olk in ("invoice", "details", "track", "order_invoice", "order_details"):
+        log_reasoning(f"Skip ctx.last pin — order_lookup_kind={olk}.")
+        return True
     if ai_route_requests_order_history_list(ai_route):
         log_reasoning("Skip ctx.last pin — AI chose order_history list (fresh API).")
         return True

@@ -17,6 +17,7 @@ _pincode_intent_guard = threading.local()
 _pincode_light_guard = threading.local()
 _order_tracking_guard = threading.local()
 _extract_oid_guard = threading.local()
+_refund_lookup_guard = threading.local()
 
 
 def _strip_html_for_context(text: str, max_len: int = 280) -> str:
@@ -1603,6 +1604,7 @@ def _text_has_explicit_pincode_subject(t: str) -> bool:
         x in tl
         for x in (
             "pincode", "pin code", "pin-code", "zip code", "postal code",
+            "pincod", "pin cod", "pin  cod",
             "delivery available", "serviceability", "deliver ho", "milegi delivery",
             "delivery milegi", "service area", "6-digit pin", "6 digit pin",
             "delivery", "delevery", "delivry", "deliver", "pahucha", "pahunch",
@@ -1731,8 +1733,8 @@ def _pincode_delivery_signal_leaf(t: str) -> bool:
     has_pin = bool(re.search(r"\b[1-9]\d{5}\b", raw))
     delivery_markers = (
         "delivery", "delevery", "delivry", "deliver", "service", "pahucha", "pahunch",
-        "phocha", "milega", "milegi", "mil jaygi", "mil jayega", "milta", "milti",
-        "available", "serviceable", "pincode", "pin code", " per ", " par ", " pe ",
+        "phocha", "milega", "milegi", "mil jaygi", "mil jayega", "mil jayegi", "milta", "milti",
+        "available", "serviceable", "pincode", "pincod", "pin code", " per ", " par ", " pe ",
         "yaha", "yahan", "waha", "wahan", "area", "check kr", "check kar", "check kro",
         "bta de", "bata de", "kya service",
     )
@@ -2584,6 +2586,24 @@ def _extract_order_id_impl(msg, conversation_context: str = ""):
     return None
 
 
+def _user_demands_immediate_track_action(text: str) -> bool:
+    """Imperative 'track it now' after bot asked — not a hypothetical capability question."""
+    raw = _normalize_order_chat_text(text or "")
+    if not raw.strip() or re.search(r"\b[0-9]{4,20}\b", raw):
+        return False
+    tl = f" {raw.lower()} "
+    if "track" not in tl and "status" not in tl:
+        return False
+    if any(x in tl for x in ("dega kya", "dega na kya", "krega kya", "karega kya", "ho sakta", "possible")):
+        return False
+    return bool(
+        re.search(r"\b(?:ab|abhi)\s+(?:kr|kar)\s+de\b", tl)
+        or re.search(r"\b(?:kr|kar)\s+de\s+(?:to\s+)?track\b", tl)
+        or re.search(r"\btrack\s+(?:kr|kar)\s+de\b", tl)
+        or re.search(r"\b(?:krdo|kardo|kr do|kar do)\b", tl)
+    )
+
+
 def _user_asks_hypothetical_tracking_capability(text: str) -> bool:
     """
     User asks IF bot can track another id / ETA / cancel — no id digits in this message.
@@ -2591,6 +2611,8 @@ def _user_asks_hypothetical_tracking_capability(text: str) -> bool:
     """
     raw = _normalize_order_chat_text(text or "")
     if not raw.strip() or re.search(r"\b[0-9]{4,20}\b", raw):
+        return False
+    if _user_demands_immediate_track_action(raw):
         return False
     tl = f" {raw.lower()} "
     if not ("order" in tl or "id" in tl or "track" in tl or "cancel" in tl):
@@ -2788,7 +2810,35 @@ def resolve_order_id_for_tracking(
         if _conversation_bot_asked_for_pincode(conversation_context):
             return None
         if _conversation_bot_offered_order_id_or_tracking(conversation_context) or bot_awaiting_order_id:
-            return extract_order_id_from_recent_user_lines(conversation_context, msg)
+            recent = extract_order_id_from_recent_user_lines(conversation_context, msg)
+            if recent:
+                return recent
+
+    if _conversation_awaiting_order_id(conversation_context) or bot_awaiting_order_id:
+        try:
+            from services.conversation_thread_semantics import (
+                resolve_explicit_turn_goal_from_message,
+            )
+
+            explicit = resolve_explicit_turn_goal_from_message(
+                msg, "", conversation_context, None, allow_llm=False
+            )
+            if explicit in (
+                "track",
+                "refund_status",
+                "payment",
+                "order_invoice",
+                "order_details",
+            ):
+                recent = extract_order_id_from_recent_user_lines(conversation_context, msg)
+                if recent:
+                    return recent
+        except ImportError:
+            pass
+        if _user_demands_immediate_track_action(msg):
+            recent = extract_order_id_from_recent_user_lines(conversation_context, msg)
+            if recent:
+                return recent
 
     if _user_references_prior_submission(msg):
         latest = extract_latest_order_id_from_user_conversation(conversation_context, msg)
@@ -2859,6 +2909,25 @@ def resolve_live_api_intent_from_conversation(
 
     if ctx_last in ("order", "refund"):
         return ctx_last
+
+    try:
+        from services.conversation_thread_semantics import (
+            infer_order_thread_goal,
+            message_needs_thread_continuation,
+        )
+
+        if message_needs_thread_continuation(turn, conversation_context):
+            thread = infer_order_thread_goal(
+                conversation_context, turn, ctx_last=ctx_last
+            )
+            if thread == "refund_status":
+                return "refund"
+            if thread == "payment":
+                return "payment"
+            if thread in ("track", "order_details", "order_invoice"):
+                return "order"
+    except ImportError:
+        pass
     return "order"
 
 
@@ -3012,6 +3081,7 @@ def should_attempt_live_order_api_reply(
         if oid and (
             _text_is_order_tracking_intent(comb)
             or _text_is_refund_return_status_lookup(comb, conversation_context)
+            or _user_demands_immediate_track_action(comb)
             or (
                 "order" in comb.lower()
                 and any(
@@ -3022,6 +3092,18 @@ def should_attempt_live_order_api_reply(
                     )
                 )
             )
+        ):
+            return True
+    if _conversation_awaiting_order_id(conversation_context):
+        oid = resolve_order_id_for_tracking(
+            original_msg.strip() or msg_en.strip(),
+            conversation_context,
+            bot_awaiting_order_id=True,
+        )
+        if oid and (
+            _message_is_order_id_followup_submission(original_msg, conversation_context)
+            or _user_demands_immediate_track_action(comb)
+            or _text_is_order_tracking_intent_leaf(comb)
         ):
             return True
     return False
@@ -3587,6 +3669,47 @@ def _text_has_order_placement_intent(t: str) -> bool:
     return True
 
 
+def _leaf_non_tracking_order_id_intent(t: str) -> bool:
+    """
+    Leaf-only: order id present but user wants invoice, refund, address, amount — not shipment track.
+    Must not import order_details_flow (breaks recursion with _text_is_order_tracking_intent_leaf).
+    """
+    raw = _normalize_order_chat_text((t or "").strip())
+    if not raw:
+        return False
+    if not (
+        re.search(r"\b\d{4,20}\b", raw) or re.search(r"\borders?\b", raw, re.I)
+    ):
+        return False
+    tl = f" {raw.lower()} "
+    if re.search(r"\brefund\b", tl) or "refund status" in tl or "return status" in tl:
+        return True
+    if re.search(
+        r"\b(?:invoice|invoic\w*|bill|receipt|gst|tax\s+invoice)\b", tl, re.I
+    ):
+        return True
+    if re.search(
+        r"\baddress\b|konsa\s+laga|lagaya\s+th|pata\b|shipping\s+address|delivery\s+address",
+        tl,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"\bamount\b|grand\s+total|total\s+amount|kitna\s+tha|kitne\s+ka|kitne\s+rs|"
+        r"how\s+much\s+(?:did\s+i\s+)?pay",
+        tl,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"payment\s+status|payment\s+mode|payment\s+ka|paid\s+or\s+not|unpaid|cod\b",
+        tl,
+        re.I,
+    ):
+        return True
+    return False
+
+
 def _text_is_order_tracking_intent_leaf(t: str) -> bool:
     """Order tracking markers only — never calls order_details heuristics (no recursion)."""
     try:
@@ -3615,6 +3738,8 @@ def _text_is_order_tracking_intent_leaf(t: str) -> bool:
     if _text_has_explicit_pincode_subject(raw) and re.search(r"\b[1-9]\d{5}\b", raw):
         return False
     if _text_has_order_placement_intent(raw):
+        return False
+    if _leaf_non_tracking_order_id_intent(raw):
         return False
     if native_order_tracking_request(raw) or multilingual_order_tracking_match(raw, raw):
         return True
@@ -5484,6 +5609,9 @@ def _current_turn_has_order_id(original_msg: str, msg_en: str = "") -> bool:
     tl = f" {comb.lower()} "
     if re.search(r"\b(?:product\s*id|pro\s*id|sku)\b", tl) and "order" not in tl and "refund" not in tl:
         return False
+    if re.fullmatch(r"[0-9]{4,20}", comb) or re.fullmatch(r"[A-Za-z0-9]{4,20}", comb):
+        if _is_plausible_order_id(oid, context=comb, shallow=True):
+            return True
     return _text_has_order_id_context(comb) or _text_has_light_order_tracking_markers(comb)
 
 
@@ -5492,6 +5620,16 @@ def _text_is_refund_return_status_lookup(t: str, conversation_context: str = "")
     LLM-unavailable failsafe only — personal refund/return status on one order.
     When Groq routing is available, use refund_status_semantics + order_lookup_kind.
     """
+    if getattr(_refund_lookup_guard, "active", False):
+        return False
+    _refund_lookup_guard.active = True
+    try:
+        return _text_is_refund_return_status_lookup_impl(t, conversation_context)
+    finally:
+        _refund_lookup_guard.active = False
+
+
+def _text_is_refund_return_status_lookup_impl(t: str, conversation_context: str = "") -> bool:
     raw = _normalize_order_chat_text(t or "")
     if not raw.strip():
         return False
@@ -5540,8 +5678,13 @@ def _text_is_refund_return_policy_howto(t: str) -> bool:
     """
     Return/refund process or wrong-item help — KB, not repeated live API on a stale Order ID.
     """
+    if getattr(_refund_lookup_guard, "active", False):
+        return False
     raw = _normalize_order_chat_text(t or "")
     if not raw.strip():
+        return False
+    tl_pre = f" {raw.lower()} "
+    if "refund status" in tl_pre or "return status" in tl_pre:
         return False
     if _text_is_refund_return_status_lookup(raw):
         return False
@@ -5638,6 +5781,16 @@ def user_turn_qualifies_for_live_order_api(
         )
     if _message_is_order_id_followup_submission(original_msg, conversation_context):
         return True
+    if _conversation_awaiting_order_id(conversation_context) and (
+        _user_demands_immediate_track_action(comb)
+        or _text_is_order_tracking_intent_leaf(comb)
+    ):
+        if resolve_order_id_for_tracking(
+            original_msg.strip() or msg_en.strip(),
+            conversation_context,
+            bot_awaiting_order_id=True,
+        ):
+            return True
     if isinstance(ai_route, dict) and (ai_route.get("data_channel") or "").lower() == "live_api":
         intent = (ai_route.get("intent") or "").strip().lower()
         if intent in ("order", "refund", "payment") and _text_suggests_single_order_status_lookup(comb):

@@ -142,6 +142,44 @@ def try_early_live_api_reply(
     ).strip().lower()
     olk = ((ai_route or {}).get("order_lookup_kind") or "").strip().lower()
 
+    # --- Pincode delivery: direct API when PIN is already in the message ---
+    try:
+        from services.pincode_delivery_fast_path import try_pincode_delivery_fast_reply
+
+        pin_handoff = try_pincode_delivery_fast_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            lang,
+            ctx,
+            reset_context_fn=reset_context_fn,
+        )
+        if pin_handoff:
+            log_reasoning("Early live dispatch: pincode delivery fast path.")
+            return pin_handoff
+    except ImportError:
+        pass
+
+    # --- Order-ID handoff: one API for the submitted id (no routing LLM stack) ---
+    try:
+        from services.order_id_handoff_fast_path import try_order_id_handoff_reply
+
+        handoff = try_order_id_handoff_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            user_id,
+            lang,
+            ctx,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context_fn,
+        )
+        if handoff:
+            log_reasoning("Early live dispatch: order-ID handoff fast path.")
+            return handoff
+    except ImportError:
+        pass
+
     # --- Pincode delivery (handler OR semantic delivery turn) ---
     try:
         from services.entity_first_handlers import try_pincode_delivery_reply
@@ -213,8 +251,32 @@ def try_early_live_api_reply(
                 allow_llm=True,
             )
         )
+        single_order_intent = False
+        try:
+            from services.order_details_flow import (
+                message_has_non_tracking_order_id_intent,
+                message_wants_order_details_or_invoice,
+            )
+            from services.refund_status_semantics import current_turn_wants_personal_refund_status
+
+            if message_has_non_tracking_order_id_intent(
+                original_msg, msg_en, conv_for_llm, ai_route=ai_route
+            ):
+                single_order_intent = True
+            elif message_wants_order_details_or_invoice(
+                original_msg, msg_en, conv_for_llm, ai_route=ai_route
+            ):
+                single_order_intent = True
+            elif current_turn_wants_personal_refund_status(
+                original_msg, msg_en, conv_for_llm, ai_route=ai_route, allow_llm=False
+            ):
+                single_order_intent = True
+        except ImportError:
+            pass
+
         if (
             not pincode_turn
+            and not single_order_intent
             and (
                 handler == "order_ai_flow"
                 or intent == "order_history"
@@ -241,6 +303,26 @@ def try_early_live_api_reply(
             resolve_refund_turn,
         )
 
+        thread_refund = False
+        try:
+            from services.conversation_thread_semantics import (
+                infer_order_thread_goal,
+                message_needs_thread_continuation,
+            )
+
+            if message_needs_thread_continuation(
+                f"{original_msg} {msg_en}".strip(), conv_for_llm
+            ):
+                thread_refund = (
+                    infer_order_thread_goal(
+                        conv_for_llm,
+                        f"{original_msg} {msg_en}".strip(),
+                        ctx_last=ctx.get("last") if isinstance(ctx, dict) else None,
+                    )
+                    == "refund_status"
+                )
+        except ImportError:
+            pass
         resolved = resolve_refund_turn(
             original_msg,
             msg_en,
@@ -249,7 +331,7 @@ def try_early_live_api_reply(
             reply_lang=lang,
             allow_llm=True,
         )
-        wants_refund = resolved.kind == KIND_PERSONAL_STATUS
+        wants_refund = resolved.kind == KIND_PERSONAL_STATUS or thread_refund
         if wants_refund or handler == "refund_status_api" or olk == "refund_status":
             result = run_refund_status_ai_flow(
                 original_msg,
@@ -358,6 +440,24 @@ def try_early_live_api_reply(
         pass
 
     # --- Order tracking ---
+    try:
+        from services.conversation_thread_semantics import (
+            infer_order_thread_goal,
+            message_needs_thread_continuation,
+        )
+
+        _comb_track = f"{original_msg} {msg_en}".strip()
+        if message_needs_thread_continuation(_comb_track, conv_for_llm):
+            _thread = infer_order_thread_goal(
+                conv_for_llm,
+                _comb_track,
+                ctx_last=ctx.get("last") if isinstance(ctx, dict) else None,
+            )
+            if _thread == "refund_status":
+                handler = ""
+                olk = ""
+    except ImportError:
+        pass
     if handler == "order_tracking_api" or olk in ("track", "tracking"):
         try:
             from utils.helpers import extract_order_id, resolve_order_id_for_tracking
@@ -431,6 +531,18 @@ def try_early_live_api_reply(
             user_turn_qualifies_for_live_order_api,
         )
 
+        try:
+            from services.conversation_thread_semantics import (
+                resolve_explicit_turn_goal_from_message,
+            )
+
+            explicit = resolve_explicit_turn_goal_from_message(
+                original_msg, msg_en, conv_for_llm, ai_route, allow_llm=False
+            )
+            if explicit in ("order_invoice", "order_details"):
+                return None
+        except ImportError:
+            pass
         if message_wants_order_details_or_invoice(
             original_msg, msg_en, conv_for_llm, ai_route=ai_route
         ):

@@ -116,7 +116,9 @@ _LOOSE_DETAIL_ACTION_MARKERS = (
 
 _PAYMENT_FOCUS_RE = re.compile(
     r"(?:payment\s+status|paid\s+or\s+not|payment\s+done|paisa|paid|unpaid|cod|"
-    r"upi|razorpay|payment\s+mode|kitna\s+pay|payment\s+ka)",
+    r"upi|razorpay|payment\s+mode|kitna\s+pay|payment\s+ka|"
+    r"\bamount\b|total\s+amount|grand\s+total|kitna\s+tha|kitne\s+ka|kitne\s+rs|"
+    r"how\s+much\s+(?:did\s+i\s+)?pay|order\s+amount)",
     re.IGNORECASE,
 )
 
@@ -130,7 +132,7 @@ _DELIVERY_FOCUS_RE = re.compile(
     r"(?:delivery\s+status|delivery\s+address|shipping\s+address|ship\s+status|"
     r"delivered\s+or\s+not|dispatch|shipped\s+or\s+not|"
     r"\baddress\b|pata\b|konsa\s+laga|kahan\s+bhej|ship\s+kahan|"
-    r"delivery\s+kahan|address\s+konsa|konsa\s+address)",
+    r"delivery\s+kahan|address\s+konsa|konsa\s+address|lagaya\s+tha|lagaya\s+th)",
     re.IGNORECASE,
 )
 
@@ -342,6 +344,9 @@ def _resolve_brain_goal_with_message_override(
     if _user_rejects_invoice_wants_details(comb, conversation_context):
         if brain_goal == "order_invoice":
             return "order_details"
+    fast = _fast_order_lookup_goal(comb, "", conversation_context)
+    if fast in ("order_invoice", "order_details"):
+        return fast
     if _current_turn_wants_tracking(comb, conversation_context):
         if brain_goal in ("order_invoice", "order_details"):
             return "track_single_order"
@@ -375,9 +380,17 @@ def _goal_from_brain_route(ai_route: dict | None) -> str:
             "product in order",
             "what did i order",
             "delivery address",
+            "shipping address",
+            "address",
+            "amount",
+            "total",
+            "grand total",
+            "how much",
         )
     ):
         return "order_details"
+    if any(x in um for x in ("refund status", "return status", "refund for", "return for")):
+        return ""
     if any(
         x in um
         for x in ("track", "tracking", "eta", "where is", "kab aayega", "shipment", "courier")
@@ -419,7 +432,17 @@ def _single_order_from_locked_ai_route(
                 goal, comb, conversation_context
             )
         elif rh == "order_tracking_api" or olk in ("track", "tracking"):
-            goal = "track_single_order"
+            fast = _fast_order_lookup_goal(comb, "", conversation_context, ai_route)
+            if fast in ("order_invoice", "order_details"):
+                goal = fast
+            elif fast == "track_single_order":
+                goal = fast
+            elif _text_wants_order_invoice(comb, conversation_context):
+                goal = "order_invoice"
+            elif _text_wants_order_details_not_tracking(comb, conversation_context):
+                goal = "order_details"
+            else:
+                goal = "track_single_order"
         elif rh == "refund_status_api" or olk == "refund_status":
             return None
         elif intent == "refund":
@@ -682,7 +705,8 @@ Return ONLY valid JSON:
 
 MEANING RULES (latest message wins; use RECENT CONVERSATION only for pronouns / bare-id follow-ups):
 - order_invoice: download bill/invoice/receipt/GST for ONE order they already placed.
-- order_details: payment mode, address, product name, totals, summary — NOT shipment ETA.
+- order_details: payment mode, address, product name, totals, amount, summary — NOT shipment ETA.
+  "address konsa lagaya", "kitna amount", "payment status" on one order id → order_details.
   If user says invoice/bill NOT wanted but wants full/pure/complete details → order_details NOT order_invoice.
 - track_live: shipment status, where is package, ETA, delay, courier, "status check", "track krke" — live timeline.
   If user says track/status/kahan hai/kab aayega → track_live even when order id is present.
@@ -751,8 +775,28 @@ def heuristic_understand_single_order_request(
         )
         return base
 
+    try:
+        from services.refund_status_semantics import current_turn_wants_personal_refund_status
+
+        if current_turn_wants_personal_refund_status(
+            msg, "", conversation_context, allow_llm=False
+        ):
+            base.update(
+                action="not_order_topic",
+                field_focus="summary",
+                extracted_order_id=str(oid or ""),
+                confidence="high",
+                reasoning="Heuristic: refund status — refund API path",
+            )
+            return base
+    except ImportError:
+        pass
+
+    _refund_status_ctx = "refund status" in tl or "return status" in tl
     if any(m in tl for m in _TRACK_ETA_MARKERS) or (
-        oid and re.search(r"\b(?:track|status|kahan|kab)\b", tl)
+        oid
+        and not _refund_status_ctx
+        and re.search(r"\b(?:track|status|kahan|kab)\b", tl)
     ):
         base.update(
             action="track_live" if oid else "ask_order_id",
@@ -773,6 +817,16 @@ def heuristic_understand_single_order_request(
                 extracted_order_id=str(oid),
                 confidence="high",
                 reasoning="Heuristic: invoice/bill with order id",
+            )
+            return base
+        if _text_wants_order_details_not_tracking(msg, conversation_context):
+            focus = detect_order_details_focus(msg, action="order_details")
+            base.update(
+                action="order_details",
+                field_focus=focus,
+                extracted_order_id=str(oid),
+                confidence="high",
+                reasoning="Heuristic: order details (address/amount/payment) with order id",
             )
             return base
         base.update(
@@ -854,6 +908,44 @@ def _pack_understanding_result(
     }
 
 
+def message_has_non_tracking_order_id_intent(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    ai_route: dict | None = None,
+) -> bool:
+    """
+    True when user gave/pasted an order id but wants invoice, details, or refund — not shipment track.
+    Prevents generic 'order id' phrases from hijacking invoice/refund/address flows.
+    """
+    comb = _combined(original_msg, msg_en)
+    if not comb:
+        return False
+    if not (re.search(r"\b\d{4,20}\b", comb) or re.search(r"\borders?\b", comb, re.I)):
+        return False
+    try:
+        from services.refund_status_semantics import current_turn_wants_personal_refund_status
+
+        if current_turn_wants_personal_refund_status(
+            original_msg, msg_en, conversation_context, ai_route=ai_route, allow_llm=False
+        ):
+            return True
+    except ImportError:
+        pass
+    if _text_wants_order_invoice(comb, conversation_context):
+        return True
+    try:
+        from utils.helpers import _leaf_non_tracking_order_id_intent
+
+        if _leaf_non_tracking_order_id_intent(comb):
+            return True
+    except ImportError:
+        if _text_wants_order_details_not_tracking(comb, conversation_context):
+            return True
+    brain = _goal_from_brain_route(ai_route)
+    return brain in ("order_invoice", "order_details")
+
+
 def _fast_order_lookup_goal(
     text: str,
     msg_en: str = "",
@@ -863,14 +955,25 @@ def _fast_order_lookup_goal(
     """
     Resolve track/details/invoice without specialist LLM when meaning is already clear.
     AI router JSON + message semantics first; LLM only when still ambiguous.
-    Priority: track > details (incl. invoice rejection) > invoice.
+    Priority: invoice > details > track (latest message beats stale router track lock).
     """
     comb = _combined(text, msg_en)
     if not comb:
         return ""
-    if _current_turn_wants_tracking(comb, conversation_context):
-        return "track_single_order"
+    try:
+        from services.refund_status_semantics import current_turn_wants_personal_refund_status
+
+        if current_turn_wants_personal_refund_status(
+            text, msg_en, conversation_context, ai_route=ai_route, allow_llm=False
+        ):
+            return ""
+    except ImportError:
+        pass
     if _user_rejects_invoice_wants_details(comb, conversation_context):
+        return "order_details"
+    if _text_wants_order_invoice(comb, conversation_context):
+        return "order_invoice"
+    if _text_wants_order_details_not_tracking(comb, conversation_context):
         return "order_details"
     brain = _goal_from_brain_route(ai_route)
     if brain in ("order_invoice", "order_details", "track_single_order"):
@@ -889,10 +992,8 @@ def _fast_order_lookup_goal(
     fast = _lightweight_details_or_invoice_signal(comb)
     if fast in ("order_invoice", "order_details"):
         return fast
-    if _text_wants_order_invoice(comb, conversation_context):
-        return "order_invoice"
-    if _text_wants_order_details_not_tracking(comb, conversation_context):
-        return "order_details"
+    if _current_turn_wants_tracking(comb, conversation_context):
+        return "track_single_order"
     return ""
 
 
@@ -936,6 +1037,20 @@ def _infer_followup_goal_keyword_fallback(
     if not _message_is_order_id_followup_submission(text, conversation_context):
         return ""
     try:
+        from services.conversation_thread_semantics import infer_order_thread_goal
+
+        thread = infer_order_thread_goal(conversation_context, text)
+        if thread == "refund_status":
+            return ""
+        if thread == "track":
+            return "track_single_order"
+        if thread == "order_invoice":
+            return "order_invoice"
+        if thread == "order_details":
+            return "order_details"
+    except ImportError:
+        pass
+    try:
         from utils.helpers import _text_is_refund_return_status_lookup
 
         if _text_is_refund_return_status_lookup(text, conversation_context):
@@ -963,11 +1078,16 @@ def _infer_followup_goal_keyword_fallback(
             body
         ):
             return "order_details"
-    if (
-        _conversation_bot_offered_order_id_or_tracking(conversation_context)
-        or _conversation_in_order_tracking_flow(conversation_context)
-    ):
-        return "track_single_order"
+    try:
+        from services.conversation_thread_semantics import infer_order_thread_goal
+
+        thread = infer_order_thread_goal(conversation_context, text)
+        if thread == "track":
+            return "track_single_order"
+        if thread in ("order_invoice", "order_details"):
+            return thread
+    except ImportError:
+        pass
     return ""
 
 
@@ -1418,11 +1538,26 @@ def _lightweight_details_or_invoice_signal_impl(text: str) -> str:
             r"\b\d{4,20}\b", text
         ):
             return "order_details"
+    if _text_wants_order_invoice(text, ""):
+        return "order_invoice"
     try:
-        from utils.helpers import _text_is_order_tracking_intent_leaf
+        from services.refund_status_semantics import current_turn_wants_personal_refund_status
 
-        if _text_is_order_tracking_intent_leaf(text):
+        if current_turn_wants_personal_refund_status(text, "", "", allow_llm=False):
             return ""
+    except ImportError:
+        pass
+    if (
+        _PAYMENT_FOCUS_RE.search(text)
+        or _PRODUCT_FOCUS_RE.search(text)
+        or _DELIVERY_FOCUS_RE.search(text)
+    ):
+        return "order_details"
+    try:
+        from utils.helpers import _leaf_non_tracking_order_id_intent
+
+        if _leaf_non_tracking_order_id_intent(text):
+            return "order_details"
     except ImportError:
         pass
     tl_guard = f" {(text or '').lower()} "
@@ -1624,10 +1759,17 @@ def _text_wants_order_invoice(text: str, conversation_context: str = "") -> bool
 
 
 def _text_wants_order_details_not_tracking(text: str, conversation_context: str = "") -> bool:
-    from utils.helpers import _text_is_order_tracking_intent
-
     if not (text or "").strip():
         return False
+    try:
+        from services.refund_status_semantics import current_turn_wants_personal_refund_status
+
+        if current_turn_wants_personal_refund_status(
+            text, "", conversation_context, allow_llm=False
+        ):
+            return False
+    except ImportError:
+        pass
     if message_is_catalog_product_browse_not_order_details(text):
         return False
     if _text_wants_order_invoice(text):
@@ -1638,8 +1780,13 @@ def _text_wants_order_details_not_tracking(text: str, conversation_context: str 
         or _DELIVERY_FOCUS_RE.search(text)
     ):
         return True
-    if _text_is_order_tracking_intent(text):
-        return False
+    try:
+        from utils.helpers import _text_is_order_tracking_intent_leaf
+
+        if _text_is_order_tracking_intent_leaf(text):
+            return False
+    except ImportError:
+        pass
     tl = f" {text.lower()} "
     if any(m in tl for m in _TRACK_ETA_MARKERS):
         return False
@@ -2138,6 +2285,19 @@ def promote_order_details_on_route(
             return out
     except ImportError:
         pass
+
+    fast_pre = _fast_order_lookup_goal(
+        original_msg, msg_en, conversation_context, ai_route=out
+    )
+    if fast_pre in ("order_invoice", "order_details"):
+        if fast_pre == "order_invoice":
+            log_invoice_flow(
+                intent="order_invoice",
+                order_id=_resolve_order_id(original_msg, msg_en, conversation_context),
+                selected_flow="message_semantics",
+                invoice_status="routed",
+            )
+        return _apply_order_details_to_route(out, fast_pre, "message_semantics")
 
     if _current_turn_wants_tracking(comb, conversation_context):
         out.pop("order_lookup_kind", None)

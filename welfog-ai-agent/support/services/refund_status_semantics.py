@@ -191,7 +191,73 @@ def resolve_refund_turn(
     AI-first: personal refund STATUS (live API) vs refund POLICY how-to (KB).
     """
     comb = _combined(original_msg, msg_en)
+    try:
+        from services.conversation_thread_semantics import (
+            _EXPLICIT_GOAL_GUARD,
+            infer_order_thread_goal,
+            message_needs_thread_continuation,
+        )
+
+        if getattr(_EXPLICIT_GOAL_GUARD, "active", False):
+            pass
+        elif message_needs_thread_continuation(comb, conversation_context):
+            thread = infer_order_thread_goal(
+                conversation_context,
+                comb,
+                ctx_last=(
+                    (ai_route or {}).get("_ctx_last")
+                    if isinstance(ai_route, dict)
+                    else None
+                ),
+                ai_route=ai_route if isinstance(ai_route, dict) else None,
+                reply_lang=reply_lang,
+                allow_llm=allow_llm,
+            )
+            if thread == "refund_status":
+                out = ResolvedRefundTurn(
+                    kind=KIND_PERSONAL_STATUS,
+                    source="thread_continuation",
+                    confidence="high",
+                    user_meaning="Continue refund status thread with supplied order id",
+                )
+                _RESOLVE_REFUND_CACHE.key = (
+                    f"{hash(comb)}|{hash((conversation_context or '')[-400:])}|{allow_llm}"
+                )
+                _RESOLVE_REFUND_CACHE.result = out
+                return out
+    except ImportError:
+        pass
     if not _message_has_refund_topic(comb):
+        try:
+            from utils.helpers import (
+                _text_has_refund_or_return_intent,
+                _text_is_refund_return_policy_howto,
+                extract_latest_order_id_from_user_conversation,
+                extract_order_id,
+            )
+
+            if _text_has_refund_or_return_intent(comb) and not _text_is_refund_return_policy_howto(
+                comb
+            ):
+                prior_oid = extract_order_id(comb, conversation_context) or (
+                    extract_latest_order_id_from_user_conversation(
+                        conversation_context, comb
+                    )
+                )
+                if prior_oid:
+                    out = ResolvedRefundTurn(
+                        kind=KIND_PERSONAL_STATUS,
+                        source="refund_correction_with_prior_id",
+                        confidence="high",
+                        user_meaning="User insists on refund status for order id already shared",
+                    )
+                    _RESOLVE_REFUND_CACHE.key = (
+                        f"{hash(comb)}|{hash((conversation_context or '')[-400:])}|{allow_llm}"
+                    )
+                    _RESOLVE_REFUND_CACHE.result = out
+                    return out
+        except ImportError:
+            pass
         return ResolvedRefundTurn(kind=KIND_NONE)
 
     cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-400:])}|{allow_llm}"
@@ -515,6 +581,31 @@ def promote_refund_status_on_route(
     """Align Groq route: personal refund STATUS (API) vs refund POLICY (KB)."""
     out = dict(route or {})
     comb = _combined(original_msg, msg_en)
+
+    try:
+        from services.conversation_thread_semantics import (
+            infer_order_thread_goal,
+            message_needs_thread_continuation,
+            resolve_explicit_turn_goal_from_message,
+        )
+
+        explicit = resolve_explicit_turn_goal_from_message(
+            original_msg, msg_en, conversation_context, out, allow_llm=False
+        )
+        if explicit and explicit != "refund_status":
+            return out
+        if message_needs_thread_continuation(comb, conversation_context):
+            thread = infer_order_thread_goal(
+                conversation_context,
+                comb,
+                ai_route=out,
+                reply_lang=reply_lang,
+                allow_llm=False,
+            )
+            if thread == "refund_status":
+                return _apply_refund_status_to_route(out, "thread_continuation")
+    except ImportError:
+        pass
 
     if not _message_has_refund_topic(comb):
         return out

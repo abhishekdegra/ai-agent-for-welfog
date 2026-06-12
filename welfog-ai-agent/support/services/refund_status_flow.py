@@ -131,7 +131,21 @@ def run_refund_status_ai_flow(
             needs_order_id=True,
         )
 
-    oid = resolve_order_id_for_tracking(user_line, conversation_context)
+    from utils.helpers import _message_is_order_id_followup_submission
+
+    oid = resolve_order_id_for_tracking(
+        user_line,
+        conversation_context,
+        bot_awaiting_order_id=_message_is_order_id_followup_submission(
+            user_line, conversation_context
+        ),
+    )
+    if not oid:
+        from utils.helpers import extract_latest_order_id_from_user_conversation
+
+        oid = extract_latest_order_id_from_user_conversation(
+            conversation_context, user_line
+        )
     if not oid:
         body = _localized_sysmsg("ask_order_id_for_intent", original_msg, reply_lang=rl, intent="refund") or ""
         log_reasoning("Refund status — need Order ID from customer.")

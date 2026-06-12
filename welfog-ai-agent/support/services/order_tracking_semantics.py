@@ -273,14 +273,34 @@ def promote_order_tracking_on_route(
 
     try:
         from services.order_details_flow import (
+            message_has_non_tracking_order_id_intent,
             message_user_wants_order_invoice,
             order_details_route_is_locked,
-        )
-
-        from services.order_details_flow import (
             _infer_followup_goal_from_conversation,
             _message_explicitly_wants_tracking,
         )
+
+        try:
+            from services.conversation_thread_semantics import infer_order_thread_goal
+
+            if infer_order_thread_goal(conversation_context, _combined(original_msg, msg_en)) in (
+                "refund_status",
+                "order_details",
+                "order_invoice",
+            ):
+                return out
+        except ImportError:
+            pass
+        try:
+            from utils.helpers import _leaf_non_tracking_order_id_intent
+
+            if _leaf_non_tracking_order_id_intent(_combined(original_msg, msg_en)):
+                return out
+        except ImportError:
+            if message_has_non_tracking_order_id_intent(
+                original_msg, msg_en, conversation_context, ai_route=out
+            ):
+                return out
 
         wants_track_now = (
             _message_explicitly_wants_tracking(comb, conversation_context)

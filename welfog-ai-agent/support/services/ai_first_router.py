@@ -1138,13 +1138,40 @@ def _decision_from_ai_route(
                 is_welfog_related=True,
                 reason=f"AI: live order tracking — {reasoning}",
             )
+        try:
+            from services.order_tracking_semantics import message_user_wants_order_tracking
+            from utils.helpers import _text_is_order_tracking_intent_leaf
+
+            if message_user_wants_order_tracking(
+                comb_route, comb_hist
+            ) or _text_is_order_tracking_intent_leaf(comb_route):
+                log_reasoning(
+                    "Order intent without needs_order_id — live track API (not how-to KB)."
+                )
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_tracking_api",
+                    is_welfog_related=True,
+                    reason=f"Live order tracking — {reasoning}",
+                )
+        except ImportError:
+            pass
+        if _text_is_tracking_howto_request(comb_route):
+            return AnswerRouteDecision(
+                source="kb",
+                intent="general",
+                handler="order_tracking_howto_kb",
+                is_welfog_related=True,
+                kb_keys=kb_keys or ["shipping", "faqs"],
+                reason=f"AI: order help / how-to track — {reasoning}",
+            )
         return AnswerRouteDecision(
-            source="kb",
-            intent="general",
-            handler="order_tracking_howto_kb",
+            source="api",
+            intent="order",
+            handler="order_tracking_api",
             is_welfog_related=True,
-            kb_keys=kb_keys or ["shipping", "faqs"],
-            reason=f"AI: order help / how-to track — {reasoning}",
+            reason=f"Live order tracking (ask order id) — {reasoning}",
         )
 
     if intent in ("refund", "payment", "seller"):
@@ -1626,6 +1653,25 @@ def resolve_answer_route_ai_first(
             None,
         )
 
+    try:
+        from services.pincode_delivery_fast_path import try_pincode_delivery_fast_route
+
+        pin_fast = try_pincode_delivery_fast_route(
+            original_msg, msg_en, conv_for_llm, ctx=ctx
+        )
+        if pin_fast:
+            decision, route_data = pin_fast
+            try:
+                from services.chat_flow_telemetry import record_route_step, store_turn_analysis
+
+                record_route_step("pincode_delivery_fast")
+                store_turn_analysis(route_data, decision)
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
     conv_fast = _try_conversational_fast_path(
         original_msg, msg_en, conv_for_llm, reply_lang
     )
@@ -1652,6 +1698,25 @@ def resolve_answer_route_ai_first(
             pass
         return decision, route_data
 
+    try:
+        from services.order_id_handoff_fast_path import try_order_id_handoff_route
+
+        handoff_route = try_order_id_handoff_route(
+            original_msg, msg_en, conv_for_llm, ctx=ctx
+        )
+        if handoff_route:
+            decision, route_data = handoff_route
+            try:
+                from services.chat_flow_telemetry import record_route_step, store_turn_analysis
+
+                record_route_step("order_id_handoff_fast")
+                store_turn_analysis(route_data, decision)
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
     preflight = _try_policy_kb_preflight(original_msg, msg_en, reply_lang)
     if preflight:
         decision, route_data = preflight
@@ -1677,6 +1742,9 @@ def resolve_answer_route_ai_first(
 
     dbg("H1", "ai_first_router.py:pre_brain", "before ai_brain_route", {"msg_len": len(original_msg or "")})
     route_data = ai_brain_route(original_msg, conv_for_llm, reply_lang=reply_lang)
+    if route_data and isinstance(ctx, dict) and ctx.get("last"):
+        route_data = dict(route_data)
+        route_data["_ctx_last"] = ctx.get("last")
     dbg(
         "H1",
         "ai_first_router.py:post_brain",
@@ -1725,23 +1793,27 @@ def resolve_answer_route_ai_first(
             pass
         try:
             from services.chitchat_resolver import try_chitchat_routing_decision
+            from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
 
-            scope_fast = try_chitchat_routing_decision(
-                route_data, original_msg, msg_en, conv_for_llm, reply_lang
-            )
-            if scope_fast:
-                decision, route_data = scope_fast
-                try:
-                    from services.chat_flow_telemetry import (
-                        record_route_step,
-                        store_turn_analysis,
-                    )
+            if not turn_is_pincode_delivery_fast_path(
+                original_msg, msg_en, conv_for_llm, ctx
+            ):
+                scope_fast = try_chitchat_routing_decision(
+                    route_data, original_msg, msg_en, conv_for_llm, reply_lang
+                )
+                if scope_fast:
+                    decision, route_data = scope_fast
+                    try:
+                        from services.chat_flow_telemetry import (
+                            record_route_step,
+                            store_turn_analysis,
+                        )
 
-                    record_route_step("scope_routing_gate")
-                    store_turn_analysis(route_data, decision)
-                except ImportError:
-                    pass
-                return decision, route_data
+                        record_route_step("scope_routing_gate")
+                        store_turn_analysis(route_data, decision)
+                    except ImportError:
+                        pass
+                    return decision, route_data
         except ImportError:
             pass
         try:

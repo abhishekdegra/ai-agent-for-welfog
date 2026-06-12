@@ -197,7 +197,8 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Personal refund/return status for ONE order (any language, any wording) → intent=refund, order_lookup_kind=refund_status, data_channel=live_api, needs_order_id=true. NOT general refund policy KB.
 - General refund policy / how to return / refund time / process (no personal order status) → intent=refund or general, data_channel=kb, kb_keys include refund — NOT return-request API.
 - Infer personal refund status vs policy from user_meaning — do NOT match fixed Hindi/English keyword lists in the customer message.
-- ONE order track/shipment timeline → order_lookup_kind=track. Invoice/bill → invoice. Payment/product/address info → details.
+- ONE order track/shipment timeline → order_lookup_kind=track. Invoice/bill/receipt/GST → invoice (NOT track). Payment/amount/total/product/address on ONE order → order_lookup_kind=details (NOT order_history list, NOT track).
+- "Order ID: 12345 invoice/refund/address/amount" → set order_lookup_kind from what they asked (invoice/refund_status/details), NOT track, NOT purchase_history_in_chat.
 - Saved/liked products IN CHAT ("meri wishlist dikhao", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api. NOT pincode or catalog.
 - HOW/WHERE to view wishlist in app (steps, navigation, "wishlist kaise dekhu") → account_list_kind=wishlist_howto, data_channel=kb — NOT pincode_check, NOT product catalog.
 - Saved/liked products → intent=wishlist (NOT order_history). Amazon/Flipkart etc. → out_of_domain.

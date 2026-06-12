@@ -744,7 +744,36 @@ def run_order_tracking_ai_flow(
 
         )
 
-    from utils.helpers import _user_asks_hypothetical_tracking_capability
+    from utils.helpers import (
+        _conversation_awaiting_order_id,
+        _message_is_order_id_followup_submission,
+        _user_asks_hypothetical_tracking_capability,
+        _user_demands_immediate_track_action,
+        resolve_order_id_for_tracking,
+    )
+
+    if _conversation_awaiting_order_id(conversation_context):
+        proceed_id = resolve_order_id_for_tracking(
+            user_line,
+            conversation_context,
+            bot_awaiting_order_id=True,
+        )
+        if proceed_id and (
+            _user_demands_immediate_track_action(user_line)
+            or _message_is_order_id_followup_submission(user_line, conversation_context)
+        ):
+            log_reasoning(
+                f"Order-ID handoff in tracking flow — live track id={proceed_id}."
+            )
+            body = _fetch_and_format_tracking(
+                proceed_id, user_id, original_msg, rl
+            )
+            return OrderFlowResult(
+                handled=True,
+                reply_html=body,
+                intent="order",
+                order_id=proceed_id,
+            )
 
     if _user_asks_hypothetical_tracking_capability(user_line):
 

@@ -97,6 +97,29 @@ def _should_invoke_chitchat_classifier(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return False
+    try:
+        from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+
+        if turn_is_pincode_delivery_fast_path(
+            original_msg, msg_en, conversation_context
+        ):
+            return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import (
+            _text_is_pincode_serviceability_question,
+            message_has_live_pincode_check_intent,
+        )
+
+        if message_has_live_pincode_check_intent(
+            original_msg, conversation_context, msg_en
+        ):
+            return False
+        if _text_is_pincode_serviceability_question(comb, conversation_context):
+            return False
+    except ImportError:
+        pass
     if turn_requests_catalog_menu(
         original_msg, msg_en, ai_route=ai_route, conversation_context=conversation_context, allow_llm=False
     ):
@@ -284,6 +307,29 @@ def try_chitchat_routing_decision(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
+    try:
+        from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+
+        if turn_is_pincode_delivery_fast_path(
+            original_msg, msg_en, conversation_context
+        ):
+            return None
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import (
+            _text_is_pincode_serviceability_question,
+            message_has_live_pincode_check_intent,
+        )
+
+        if message_has_live_pincode_check_intent(
+            original_msg, conversation_context, msg_en
+        ):
+            return None
+        if _text_is_pincode_serviceability_question(comb, conversation_context):
+            return None
+    except ImportError:
+        pass
     if turn_requests_catalog_menu(
         original_msg, msg_en, ai_route=route_data, conversation_context=conversation_context
     ):
@@ -417,10 +463,19 @@ def try_chitchat_ai_preflight(
         return None
     if _has_definite_welfog_shopping_signal(comb):
         return None
+    try:
+        from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+
+        if turn_is_pincode_delivery_fast_path(
+            original_msg, msg_en, conversation_context
+        ):
+            return None
+    except ImportError:
+        pass
     low = comb.lower()
     if re.search(
-        r"\b(?:chahiye|chiye|dikha|dikhao|milega|milta|buy|need|want|order|track|refund|"
-        r"pincode|delivery|wishlist|invoice|payment)\b",
+        r"\b(?:chahiye|chiye|dikha|dikhao|milega|milegi|mil jayeg|milta|buy|need|want|order|track|refund|"
+        r"pincode|pincod|pin\s*cod|delivery|deliver|service|availab|wishlist|invoice|payment)\b",
         low,
     ):
         return None

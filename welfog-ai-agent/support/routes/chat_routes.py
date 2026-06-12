@@ -1111,6 +1111,44 @@ def chat():
     except ImportError:
         pass
 
+    # === Pincode delivery: named PIN + serviceability → one live API, no chitchat/routing LLMs ===
+    try:
+        from services.pincode_delivery_fast_path import try_pincode_delivery_fast_reply
+
+        pin_fast = try_pincode_delivery_fast_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            lang,
+            ctx,
+            reset_context_fn=reset_context,
+        )
+        if pin_fast:
+            log_reasoning("Pincode delivery fast path — reply before AI routing.")
+            return send_reply(pin_fast, lang)
+    except ImportError:
+        pass
+
+    # === Order-ID handoff: bare ID after bot asked → one live API, no routing LLM stack ===
+    try:
+        from services.order_id_handoff_fast_path import try_order_id_handoff_reply
+
+        handoff_reply = try_order_id_handoff_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            user_id,
+            lang,
+            ctx,
+            reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context,
+        )
+        if handoff_reply:
+            log_reasoning("Order-ID handoff fast path — reply before AI routing.")
+            return send_reply(handoff_reply, lang)
+    except ImportError:
+        pass
+
     # === AI-FIRST: Groq/LLM classifies intent → then KB / live API / AI answer ===
     log_reasoning(f"AI routing: {original_msg[:120]!r}")
     from services.ai_first_router import resolve_answer_route_ai_first
@@ -1390,6 +1428,19 @@ def chat():
         route_handler=(route_decision.handler or ""),
     )
     dbg("H2", "chat_routes.py:post_scope", "conversation_scope checked", {"has_reply": bool(scope_early)})
+    if scope_early:
+        try:
+            from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+
+            if turn_is_pincode_delivery_fast_path(
+                original_msg, msg_en, conv_for_llm, ctx
+            ):
+                log_reasoning(
+                    "Skip chitchat scope — pincode delivery turn (live API wins)."
+                )
+                scope_early = None
+        except ImportError:
+            pass
     if scope_early:
         log_reasoning("AI conversation scope — chitchat/out_of_domain (skip KB/API/catalog).")
         reset_context(ctx)
