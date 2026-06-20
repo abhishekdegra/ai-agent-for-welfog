@@ -36,11 +36,39 @@ def merge_ai_into_catalog_spec(
     if not ai:
         return spec
 
+    try:
+        from services.catalog_spec_semantics import resolve_is_sku_label_turn
+
+        label_mode, label_named = resolve_is_sku_label_turn(original_msg or "")
+    except ImportError:
+        label_mode, label_named = "", ""
+    if label_mode == "sku":
+        ai = dict(ai)
+        ai["sku"] = (ai.get("sku") or label_named or "").strip()
+        ai["search_terms"] = ""
+        ai.pop("brand", None)
+        ai.pop("color", None)
+        ai.pop("mandatory_match_tokens", None)
+    elif label_mode == "title":
+        ai = dict(ai)
+        ai["search_terms"] = label_named
+        ai.pop("sku", None)
+        ai["match_mode"] = "strict"
+        mandatory = list(ai.get("mandatory_match_tokens") or [])
+        for tok in re.findall(r"[a-z0-9]{2,}", label_named.lower()):
+            if tok in ("back", "cover", "case", "mobile", "phone"):
+                continue
+            if tok not in mandatory:
+                mandatory.append(tok)
+        if mandatory:
+            ai["mandatory_match_tokens"] = mandatory
+
     terms = polish_search_terms((ai.get("search_terms") or "").strip(), original_msg)
     if terms:
         spec["title_query"] = terms
 
-    if terms:
+    skip_cat_lookup = bool(spec.get("_ai_single_pass") or ai.get("_ai_first"))
+    if terms and not skip_cat_lookup:
         try:
             from services.welfog_api import get_category_id_from_text
 
@@ -52,6 +80,17 @@ def merge_ai_into_catalog_spec(
             pass
 
     brand = (ai.get("brand") or "").strip()
+    if brand:
+        try:
+            from services.product_catalog_resolver import sanitize_catalog_brand
+
+            brand = sanitize_catalog_brand(
+                brand,
+                product_name=terms or (ai.get("search_terms") or ""),
+                explicit_from_brain=True,
+            )
+        except ImportError:
+            pass
     if brand:
         spec["brand"] = brand
 
@@ -67,6 +106,7 @@ def merge_ai_into_catalog_spec(
         str(ai.get("color") or ""),
         terms,
         original_msg,
+        trust_llm=bool(ai.get("_ai_first")),
     )
     if llm_color:
         spec["color"] = llm_color  # AI colour beats regex/heuristic parse
@@ -102,11 +142,18 @@ def merge_ai_into_catalog_spec(
     except ImportError:
         color_tokens = frozenset()
 
-    if terms:
+    if terms and not ai.get("_ai_first"):
         for tok in re.findall(r"[a-z0-9]{3,}", terms.lower()):
             if tok in ("cover", "covers", "case", "mobile", "phone", "bumper", "products", "product"):
                 continue
             if color_tokens and tok in color_tokens:
+                continue
+            if tok.isdigit() or re.fullmatch(r"\d{2,6}", tok):
+                continue
+            if tok in (
+                "under", "below", "above", "over", "upto", "rating", "rated", "stars", "star",
+                "rs", "rupee", "rupees", "inr", "budget", "price", "kam", "sasta",
+            ):
                 continue
             if tok not in aliases:
                 aliases.append(tok)
@@ -173,8 +220,19 @@ def merge_ai_into_catalog_spec(
     except ImportError:
         pass
 
+    try:
+        from services.catalog_spec_semantics import resolve_is_sku_label_turn
+
+        label_mode, label_named = resolve_is_sku_label_turn(original_msg or "")
+    except ImportError:
+        label_mode, label_named = "", ""
     ai_sku = str(ai.get("sku") or "").strip()
-    if ai_sku or (original_msg and re.search(r"\bsku\b", original_msg, re.I)):
+    if label_mode == "title":
+        spec.pop("sku", None)
+        spec.pop("strict_sku_match", None)
+    elif label_mode == "sku" or ai_sku or (
+        original_msg and re.search(r"\bsku\b", original_msg, re.I)
+    ):
         try:
             from services.catalog_spec_semantics import user_mentions_sku_this_turn
             from services.opensearch_products import (
@@ -182,7 +240,11 @@ def merge_ai_into_catalog_spec(
                 _sku_token_acceptable,
             )
 
-            raw_sku = ai_sku or (_extract_sku_from_text(original_msg or "") or "").strip()
+            raw_sku = (
+                ai_sku
+                or label_named
+                or (_extract_sku_from_text(original_msg or "") or "").strip()
+            )
             sku_ok = bool(
                 raw_sku
                 and _sku_token_acceptable(raw_sku, explicit_sku_mention=True)
@@ -233,13 +295,15 @@ def merge_ai_into_catalog_spec(
         allow_price = allow_rating = True
 
     if allow_price or ai.get("_ai_first"):
-        for key in ("max_price", "min_price", "purchase_price_max", "purchase_price_min"):
-            if ai.get(key) is not None:
+        for src, dst in (
+            ("max_price", "purchase_price_max"),
+            ("min_price", "purchase_price_min"),
+            ("purchase_price_max", "purchase_price_max"),
+            ("purchase_price_min", "purchase_price_min"),
+        ):
+            if ai.get(src) is not None:
                 try:
-                    if key in ("max_price", "purchase_price_max"):
-                        spec["purchase_price_max"] = float(ai[key])
-                    else:
-                        spec["purchase_price_min"] = float(ai[key])
+                    spec[dst] = float(ai[src])
                 except (TypeError, ValueError):
                     pass
 
@@ -262,6 +326,8 @@ def merge_ai_into_catalog_spec(
                 pass
 
     spec["_catalog_ai"] = True
+    if ai.get("_ai_first"):
+        spec["_ai_single_pass"] = True
     if ai.get("strict_no_relax"):
         spec["strict_no_relax"] = True
     if ai.get("strict_sku_match"):
@@ -275,6 +341,34 @@ def merge_ai_into_catalog_spec(
         try:
             spec["purchase_price_max"] = float(ai["purchase_price_max"])
         except (TypeError, ValueError):
+            pass
+
+    cat_browse = (ai.get("category_browse") or "").strip()
+    if cat_browse:
+        try:
+            from services.welfog_api import get_category_id_from_text
+
+            cid = get_category_id_from_text(cat_browse)
+            if cid:
+                spec["category_id"] = int(cid)
+                if ai.get("category_only_browse") or not (spec.get("title_query") or "").strip():
+                    spec["title_query"] = ""
+                    spec.pop("brand", None)
+                    spec.pop("brand_aliases", None)
+                    spec.pop("brand_name_match_only", None)
+        except (TypeError, ValueError, ImportError):
+            pass
+
+    if spec.get("category_id") and original_msg:
+        try:
+            from services.welfog_api import query_should_use_category_id_only
+
+            if query_should_use_category_id_only(spec["category_id"], original_msg, ctx=None):
+                spec["title_query"] = ""
+                spec.pop("brand", None)
+                spec.pop("brand_aliases", None)
+                spec.pop("brand_name_match_only", None)
+        except ImportError:
             pass
 
     try:

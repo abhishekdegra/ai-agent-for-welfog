@@ -113,6 +113,19 @@ def message_user_rejects_refund_wants_tracking(text: str) -> bool:
 def order_tracking_route_is_locked(route: dict | None) -> bool:
     if not route:
         return False
+    try:
+        from services.ai_route_semantics import (
+            ai_meaning_describes_order_details,
+            correct_order_details_vs_tracking_from_ai_meaning,
+        )
+
+        corrected = correct_order_details_vs_tracking_from_ai_meaning(dict(route))
+        if ai_meaning_describes_order_details(corrected):
+            olk = (corrected.get("order_lookup_kind") or "").strip().lower()
+            if olk in ("details", "invoice"):
+                return False
+    except ImportError:
+        pass
     olk = (route.get("order_lookup_kind") or "").strip().lower()
     if olk in ("track", "tracking", "track_single_order"):
         return True

@@ -13,6 +13,258 @@ from services.ai_service import ai_brain_route
 from services.message_understanding import apply_ai_route_corrections
 from utils.reasoning_log import log_reasoning
 
+# Existing handlers only — maps route_handler → (source, default_intent). No new APIs.
+_EXISTING_HANDLER_SOURCES: dict[str, tuple[str, str]] = {
+    "pincode_delivery_api": ("api", "pincode_check"),
+    "order_tracking_api": ("api", "order"),
+    "order_details_api": ("api", "order"),
+    "refund_status_api": ("api", "refund"),
+    "order_ai_flow": ("ai_order", "order_history"),
+    "order_id_ai_flow": ("ai_order_id", "order_id"),
+    "product_ai_flow": ("ai_product", "product"),
+    "catalog_pro_id": ("api", "product"),
+    "wishlist_api": ("api", "wishlist"),
+    "deals_api": ("api", "deals"),
+    "categories_api": ("api", "categories"),
+    "category_feed_api": ("api", "category_feed"),
+    "ai_route_and_answer": ("kb_ai", "general"),
+    "dynamic_kb": ("kb", "general"),
+    "kb_grounded_ai": ("kb_ai", "general"),
+    "knowledge_topic_kb": ("kb", "general"),
+    "policy_structured_kb": ("kb", "refund"),
+    "seller_kb": ("kb", "seller"),
+    "welfog_about_kb": ("kb", "general"),
+    "wishlist_howto_kb": ("kb", "general"),
+    "order_history_howto_kb": ("kb", "general"),
+    "order_tracking_howto_kb": ("kb", "general"),
+    "order_id_help_kb": ("kb", "general"),
+    "order_placement_kb": ("kb", "general"),
+    "warm_feedback": ("kb", "general"),
+    "warm_greeting": ("kb", "general"),
+    "off_topic": ("reject", "out_of_domain"),
+    "temporary_load": ("reject", "general"),
+}
+
+_LIVE_API_HANDLERS = frozenset(
+    h for h, (src, _) in _EXISTING_HANDLER_SOURCES.items() if src == "api"
+)
+
+
+def _decision_from_existing_handler(
+    route_data: dict,
+    handler: str,
+    reasoning: str,
+    *,
+    kb_keys: list | None = None,
+    search_query: str = "",
+) -> AnswerRouteDecision:
+    """Map brain route_handler → existing tool with correct source (never default to kb for APIs)."""
+    h = (handler or "").strip().lower()
+    intent = (route_data.get("intent") or "general").strip().lower()
+    src, default_intent = _EXISTING_HANDLER_SOURCES.get(h, ("kb", intent or "general"))
+    resolved_intent = intent if intent not in ("", "general") else default_intent
+    if h in _LIVE_API_HANDLERS and intent in ("refund", "payment", "order") and h != "pincode_delivery_api":
+        resolved_intent = intent
+    keys = list(kb_keys or route_data.get("kb_keys") or [])
+    if src in ("kb", "kb_ai") and not keys:
+        keys = ["faqs"]
+    sq = (search_query or route_data.get("search_query") or "").strip()
+    return AnswerRouteDecision(
+        source=src,
+        intent=resolved_intent,
+        handler=h,
+        search_query=sq if h == "product_ai_flow" else "",
+        kb_keys=keys if src in ("kb", "kb_ai") else None,
+        is_welfog_related=bool(route_data.get("is_welfog_related", True)),
+        reason=f"Brain handler {h} — {reasoning}",
+    )
+
+
+def _brain_route_is_fast_lockable(route_data: dict) -> bool:
+    """True when universal brain already chose a concrete existing handler — skip re-routing."""
+    if not route_data.get("_universal_brain_route"):
+        return False
+    rh = (route_data.get("route_handler") or "").strip().lower()
+    olk = (route_data.get("order_lookup_kind") or "").strip().lower()
+    ch = (route_data.get("data_channel") or "").strip().lower()
+    intent = (route_data.get("intent") or "").strip().lower()
+    if rh in _EXISTING_HANDLER_SOURCES:
+        return True
+    if olk in ("track", "tracking", "details", "invoice", "refund_status") and ch == "live_api":
+        return True
+    if intent in ("pincode_check", "deals", "categories", "wishlist", "order_history") and ch == "live_api":
+        return True
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+
+        if account_list_route_is_locked(route_data):
+            return True
+    except ImportError:
+        pass
+    if route_data.get("_product_catalog_locked") or (intent == "product" and ch == "catalog"):
+        return True
+    return False
+
+
+def _quick_decision_from_locked_brain_route(
+    route_data: dict,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> Optional[AnswerRouteDecision]:
+    """Locked brain JSON → handler decision without extra micro-classifiers."""
+    if not isinstance(route_data, dict):
+        return None
+    from services.account_list_semantics import (
+        KIND_PURCHASE_HOWTO,
+        KIND_PURCHASE_IN_CHAT,
+        KIND_WISHLIST_HOWTO,
+        KIND_WISHLIST_IN_CHAT,
+        _kind_from_meaning_blob,
+        _norm_account_list_kind,
+    )
+
+    reasoning = (route_data.get("reasoning") or "")[:200]
+    intent = (route_data.get("intent") or "general").strip().lower()
+    rh = (route_data.get("route_handler") or "").strip().lower()
+    kb_keys = list(route_data.get("kb_keys") or ["faqs"])
+    alk = _norm_account_list_kind(route_data.get("account_list_kind") or "")
+
+    olk = (route_data.get("order_lookup_kind") or "").strip().lower()
+    channel = (route_data.get("data_channel") or "").strip().lower()
+
+    if rh == "refund_status_api" or olk == "refund_status":
+        return AnswerRouteDecision(
+            source="api",
+            intent="refund",
+            handler="refund_status_api",
+            is_welfog_related=True,
+            reason=f"Brain refund status — {reasoning}",
+        )
+    if rh == "order_tracking_api" or olk in ("track", "tracking"):
+        return AnswerRouteDecision(
+            source="api",
+            intent="order",
+            handler="order_tracking_api",
+            is_welfog_related=True,
+            reason=f"Brain order tracking — {reasoning}",
+        )
+    if rh == "order_details_api" or olk in ("details", "invoice"):
+        return AnswerRouteDecision(
+            source="api",
+            intent="order",
+            handler="order_details_api",
+            is_welfog_related=True,
+            reason=f"Brain order details/invoice — {reasoning}",
+        )
+    if rh == "pincode_delivery_api" or intent == "pincode_check":
+        return AnswerRouteDecision(
+            source="api",
+            intent="pincode_check",
+            handler="pincode_delivery_api",
+            is_welfog_related=True,
+            reason=f"Brain pincode delivery — {reasoning}",
+        )
+    if rh == "deals_api" or intent == "deals":
+        return AnswerRouteDecision(
+            source="api",
+            intent="deals",
+            handler="deals_api",
+            is_welfog_related=True,
+            reason=f"Brain deals — {reasoning}",
+        )
+    if rh in ("categories_api", "category_feed_api") or intent in ("categories", "category_feed"):
+        h_cat = rh if rh in ("categories_api", "category_feed_api") else "categories_api"
+        return AnswerRouteDecision(
+            source="api",
+            intent=intent if intent in ("categories", "category_feed") else "categories",
+            handler=h_cat,
+            is_welfog_related=True,
+            reason=f"Brain categories — {reasoning}",
+        )
+    meaning_kind = _kind_from_meaning_blob(
+        f" {(route_data.get('user_meaning') or '').lower()} "
+        f" {(route_data.get('reasoning') or '').lower()} "
+    )
+    if meaning_kind == KIND_WISHLIST_IN_CHAT:
+        return AnswerRouteDecision(
+            source="api",
+            intent="wishlist",
+            handler="wishlist_api",
+            is_welfog_related=True,
+            reason=f"Brain wishlist API (meaning) — {reasoning}",
+        )
+    if meaning_kind == KIND_WISHLIST_HOWTO:
+        return AnswerRouteDecision(
+            source="kb",
+            intent="general",
+            handler="wishlist_howto_kb",
+            kb_keys=kb_keys or ["faqs", "welfog_api_wishlist"],
+            is_welfog_related=True,
+            reason=f"Brain wishlist how-to (meaning) — {reasoning}",
+        )
+    if alk == KIND_WISHLIST_IN_CHAT or (intent == "wishlist" and rh != "wishlist_howto_kb"):
+        return AnswerRouteDecision(
+            source="api",
+            intent="wishlist",
+            handler="wishlist_api",
+            is_welfog_related=True,
+            reason=f"Brain wishlist API — {reasoning}",
+        )
+    if alk == KIND_WISHLIST_HOWTO:
+        return AnswerRouteDecision(
+            source="kb",
+            intent="general",
+            handler="wishlist_howto_kb",
+            kb_keys=kb_keys or ["faqs", "welfog_api_wishlist"],
+            is_welfog_related=True,
+            reason=f"Brain wishlist how-to — {reasoning}",
+        )
+    if alk == KIND_PURCHASE_IN_CHAT or intent == "order_history":
+        return AnswerRouteDecision(
+            source="ai_order",
+            intent="order_history",
+            handler="order_ai_flow",
+            is_welfog_related=True,
+            reason=f"Brain order history — {reasoning}",
+        )
+    if alk == KIND_PURCHASE_HOWTO:
+        return AnswerRouteDecision(
+            source="kb",
+            intent="general",
+            handler="order_history_howto_kb",
+            kb_keys=kb_keys or ["welfog_api_order_history", "faqs"],
+            is_welfog_related=True,
+            reason=f"Brain order history how-to — {reasoning}",
+        )
+    if route_data.get("_product_catalog_locked") or (
+        intent == "product" and route_data.get("run_catalog_search")
+    ):
+        sq = (route_data.get("search_query") or "").strip()
+        return AnswerRouteDecision(
+            source="ai_product",
+            intent="product",
+            handler="product_ai_flow",
+            search_query=sq,
+            is_welfog_related=True,
+            reason=f"Brain product catalog — {reasoning}",
+        )
+    scope = (route_data.get("conversation_scope") or "").strip().lower()
+    if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+        sr = (route_data.get("scope_reply") or "").strip()
+        handler = "warm_feedback" if scope == "general_chitchat" else "off_topic"
+        return AnswerRouteDecision(
+            source="scope",
+            intent="general" if scope == "general_chitchat" else "out_of_domain",
+            handler=handler,
+            is_welfog_related=scope != "out_of_domain",
+            reason=f"Brain scope {scope} — {reasoning}",
+        )
+    if rh:
+        return _decision_from_existing_handler(
+            route_data, rh, reasoning, kb_keys=kb_keys
+        )
+    return None
+
 
 def _wishlist_answer_route_decision(
     route_data: dict,
@@ -254,6 +506,18 @@ def _decision_from_ai_route(
 
     comb_hist = f"{original_msg} {msg_en}".strip()
 
+    # Trust locked universal brain handler before keyword semantic overrides.
+    if route_data.get("_universal_brain_route"):
+        locked_dec = _quick_decision_from_locked_brain_route(
+            route_data, original_msg, msg_en
+        )
+        if locked_dec is not None:
+            log_reasoning(
+                f"AI route → locked brain tool={locked_dec.handler} "
+                f"intent={locked_dec.intent} source={locked_dec.source}."
+            )
+            return locked_dec
+
     from services.semantic_intent import ai_route_requests_pincode_delivery
     from utils.helpers import message_has_live_pincode_check_intent
 
@@ -459,9 +723,18 @@ def _decision_from_ai_route(
     if kb_brain is not None:
         return kb_brain
 
-    sem_goal = infer_customer_semantic_goal(
-        original_msg, msg_en, conv_for_llm, ai_route=route_data
-    )
+    sem_goal = ""
+    if not route_data.get("_universal_brain_route"):
+        sem_goal = infer_customer_semantic_goal(
+            original_msg, msg_en, conv_for_llm, ai_route=route_data
+        )
+    else:
+        try:
+            from services.chat_flow_telemetry import skip_step
+
+            skip_step("infer_customer_semantic_goal", "universal brain locked")
+        except ImportError:
+            pass
     # When Groq already chose pincode_check, do not let keyword semantic goals override.
     if ai_route_requests_pincode_delivery(route_data):
         sem_goal = sem_goal if sem_goal == "pincode_delivery" else "pincode_delivery"
@@ -937,13 +1210,11 @@ def _decision_from_ai_route(
             reason=f"Order details/invoice API — {reasoning}",
         )
     if rh:
-        return AnswerRouteDecision(
-            source="kb",
-            intent=(route_data.get("intent") or "general"),
-            handler=rh,
+        return _decision_from_existing_handler(
+            route_data,
+            rh,
+            reasoning,
             kb_keys=list(route_data.get("kb_keys") or []),
-            is_welfog_related=True,
-            reason=f"Structured procedure handler from AI corrections — {reasoning}",
         )
 
     from services.support_scope import message_mentions_other_company_support
@@ -1116,6 +1387,71 @@ def _decision_from_ai_route(
                 reason=f"How to place order (not tracking) — {reasoning}",
             )
         if needs_order_id:
+            from services.ai_route_semantics import infer_semantic_goal_from_ai_route
+
+            sem_goal = infer_semantic_goal_from_ai_route(route_data)
+            if sem_goal == "order_details":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_details_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: order details — {reasoning}",
+                )
+            if sem_goal == "order_invoice":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_details_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: order invoice — {reasoning}",
+                )
+            if sem_goal == "track_single_order":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_tracking_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: order tracking — {reasoning}",
+                )
+            if sem_goal == "refund_status":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="refund",
+                    handler="refund_status_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: refund status — {reasoning}",
+                )
+            olk_live = (route_data.get("order_lookup_kind") or "").strip().lower()
+            if olk_live in ("details", "invoice"):
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_details_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: order_lookup_kind={olk_live} — {reasoning}",
+                )
+            if olk_live in ("track", "tracking"):
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_tracking_api",
+                    is_welfog_related=True,
+                    reason=f"AI brain: order_lookup_kind=track — {reasoning}",
+                )
+            try:
+                from services.semantic_intent import strict_ai_semantic_mode
+
+                if strict_ai_semantic_mode():
+                    return AnswerRouteDecision(
+                        source="api",
+                        intent="order",
+                        handler="order_details_api",
+                        is_welfog_related=True,
+                        reason=f"AI order live — details default (brain olk unset) — {reasoning}",
+                    )
+            except ImportError:
+                pass
             od_goal = (route_data.get("_semantic_goal") or "").strip()
             if od_goal not in ("order_invoice", "order_details"):
                 from services.order_details_flow import infer_order_details_semantic_goal
@@ -1131,6 +1467,51 @@ def _decision_from_ai_route(
                     is_welfog_related=True,
                     reason=f"AI: order details/invoice — {reasoning}",
                 )
+            from services.ai_route_semantics import brain_route_to_live_goal
+
+            live_goal = brain_route_to_live_goal(
+                route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=comb_hist,
+            )
+            if live_goal in ("order_invoice", "order_details"):
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_details_api",
+                    is_welfog_related=True,
+                    reason=f"AI: order {live_goal} — {reasoning}",
+                )
+            if live_goal == "track":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_tracking_api",
+                    is_welfog_related=True,
+                    reason=f"AI: order tracking — {reasoning}",
+                )
+            if live_goal == "refund_status":
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="refund",
+                    handler="refund_status_api",
+                    is_welfog_related=True,
+                    reason=f"AI: refund status — {reasoning}",
+                )
+            try:
+                from services.semantic_intent import strict_ai_semantic_mode
+
+                if strict_ai_semantic_mode():
+                    return AnswerRouteDecision(
+                        source="api",
+                        intent="order",
+                        handler="order_details_api",
+                        is_welfog_related=True,
+                        reason=f"AI order live — details default (goal unset) — {reasoning}",
+                    )
+            except ImportError:
+                pass
             return AnswerRouteDecision(
                 source="api",
                 intent="order",
@@ -1166,6 +1547,19 @@ def _decision_from_ai_route(
                 kb_keys=kb_keys or ["shipping", "faqs"],
                 reason=f"AI: order help / how-to track — {reasoning}",
             )
+        try:
+            from services.semantic_intent import strict_ai_semantic_mode
+
+            if strict_ai_semantic_mode():
+                return AnswerRouteDecision(
+                    source="api",
+                    intent="order",
+                    handler="order_details_api",
+                    is_welfog_related=True,
+                    reason=f"AI order live — ask order id (details default) — {reasoning}",
+                )
+        except ImportError:
+            pass
         return AnswerRouteDecision(
             source="api",
             intent="order",
@@ -1609,6 +2003,372 @@ def _try_policy_kb_preflight(
     )
 
 
+def _brain_route_is_usable(route_data: dict | None) -> bool:
+    if not isinstance(route_data, dict):
+        return False
+    if route_data.get("llm_unavailable"):
+        return False
+    return bool(
+        (route_data.get("user_meaning") or "").strip()
+        or (route_data.get("intent") or "").strip()
+        or (route_data.get("conversation_scope") or "").strip()
+    )
+
+
+def early_universal_brain_route(
+    original_msg: str,
+    conv_for_llm: str = "",
+    reply_lang: str = "en",
+    *,
+    msg_en: str = "",
+    ctx: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    ONE LLM at turn start — meaning + intent for greeting, chitchat, API, KB, product, order.
+    Cached for the rest of the HTTP request (no duplicate micro-classifiers).
+    """
+    try:
+        from services.chat_flow_telemetry import get_cached_brain_route
+
+        cached = get_cached_brain_route()
+        if _brain_route_is_usable(cached) and cached.get("_turn_promotions_done"):
+            log_reasoning(
+                f"Universal brain route (cached): intent={cached.get('intent')} "
+                f"scope={cached.get('conversation_scope')}"
+            )
+            return cached
+    except ImportError:
+        pass
+
+    route_data = ai_brain_route(original_msg, conv_for_llm, reply_lang=reply_lang)
+    if not _brain_route_is_usable(route_data):
+        return route_data if isinstance(route_data, dict) else None
+
+    route_data = dict(route_data)
+    route_data["_universal_brain_route"] = True
+    try:
+        from services.ai_route_semantics import enrich_universal_brain_route
+
+        route_data = enrich_universal_brain_route(
+            route_data,
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            reply_lang=reply_lang,
+            ctx=ctx,
+        )
+    except ImportError:
+        if isinstance(ctx, dict) and ctx.get("last"):
+            route_data["_ctx_last"] = ctx.get("last")
+
+    um = (route_data.get("user_meaning") or "").strip()
+    log_reasoning(
+        f"Universal brain route: intent={route_data.get('intent')} "
+        f"channel={route_data.get('data_channel')} "
+        f"olk={route_data.get('order_lookup_kind')} — {um[:90] or '-'}"
+    )
+    try:
+        from services.chat_flow_telemetry import store_brain_route_result
+
+        store_brain_route_result(route_data)
+    except ImportError:
+        pass
+    return route_data
+
+
+def _finalize_brain_route_decision(
+    route_data: dict,
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str = "",
+    reply_lang: str = "en",
+    ctx: Optional[dict] = None,
+) -> tuple[AnswerRouteDecision, dict]:
+    """Enrich cached brain JSON → locked handler decision (no extra routing LLM)."""
+    from utils.debug_session_log import dbg
+    from services.ai_route_semantics import _normalize_llm_route
+
+    route_data = _normalize_llm_route(dict(route_data))
+    route_data.setdefault("_universal_brain_route", True)
+
+    try:
+        from services.account_list_semantics import (
+            account_list_route_is_locked,
+            promote_account_list_on_route,
+        )
+
+        if route_data.get("_universal_brain_route"):
+            route_data = promote_account_list_on_route(
+                route_data,
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang,
+                allow_llm=False,
+            )
+            comb_ub = f"{original_msg} {msg_en}".strip()
+            if (route_data.get("intent") or "").strip().lower() == "refund":
+                try:
+                    import re
+
+                    from utils.helpers import (
+                        _text_is_refund_return_status_lookup,
+                        extract_order_id,
+                    )
+
+                    if _text_is_refund_return_status_lookup(
+                        comb_ub, conv_for_llm
+                    ) and (extract_order_id(comb_ub) or re.search(r"\b\d{6,}\b", comb_ub)):
+                        route_data["data_channel"] = "live_api"
+                        route_data["route_handler"] = "refund_status_api"
+                        route_data["order_lookup_kind"] = "refund_status"
+                        route_data["needs_order_id"] = True
+                        route_data["numeric_context"] = "order_id"
+                        route_data["run_catalog_search"] = False
+                        log_reasoning(
+                            "Universal brain fast path: refund + order id → live API."
+                        )
+                except ImportError:
+                    pass
+            fast_locked = account_list_route_is_locked(route_data)
+            if not fast_locked:
+                intent_ub = (route_data.get("intent") or "").strip().lower()
+                ch_ub = (route_data.get("data_channel") or "").strip().lower()
+                if intent_ub == "product" and ch_ub == "catalog":
+                    sq_ub = (route_data.get("search_query") or "").strip()
+                    if not sq_ub:
+                        try:
+                            from utils.helpers import extract_product_search_query
+
+                            sq_ub = extract_product_search_query(
+                                original_msg,
+                                msg_en,
+                                route_data.get("search_query"),
+                                ai_route=route_data,
+                            ) or comb_ub
+                        except ImportError:
+                            sq_ub = comb_ub
+                    route_data["search_query"] = sq_ub
+                    route_data["run_catalog_search"] = True
+                    route_data["_product_catalog_locked"] = True
+                    route_data["needs_order_id"] = False
+                    route_data["numeric_context"] = "none"
+                    fast_locked = True
+                    log_reasoning(
+                        f"Universal brain fast path: product catalog sq={sq_ub!r}."
+                    )
+                else:
+                    try:
+                        from services.product_catalog_resolver import (
+                            apply_product_catalog_to_route,
+                            product_catalog_route_is_locked,
+                        )
+
+                        route_data = apply_product_catalog_to_route(
+                            route_data,
+                            original_msg,
+                            msg_en,
+                            conversation_context=conv_for_llm,
+                            reply_lang=reply_lang,
+                        )
+                        fast_locked = product_catalog_route_is_locked(route_data)
+                    except ImportError:
+                        pass
+            elif (route_data.get("route_handler") or "").strip() == "refund_status_api":
+                fast_locked = True
+            elif _brain_route_is_fast_lockable(route_data):
+                fast_locked = True
+                log_reasoning(
+                    f"Universal brain fast lock: handler={route_data.get('route_handler')} "
+                    f"olk={route_data.get('order_lookup_kind')} channel={route_data.get('data_channel')}."
+                )
+            if fast_locked:
+                try:
+                    from services.ai_route_semantics import enrich_route_from_llm
+
+                    route_data = enrich_route_from_llm(
+                        route_data, original_msg, msg_en, conv_for_llm
+                    )
+                except ImportError:
+                    pass
+                try:
+                    route_data = apply_ai_route_corrections(
+                        route_data, original_msg, msg_en, conv_for_llm
+                    )
+                except Exception as exc:
+                    from services.ai_route_semantics import _normalize_llm_route
+
+                    log_reasoning(
+                        f"apply_ai_route_corrections failed (using normalized route): {exc}"
+                    )
+                    route_data = _normalize_llm_route(route_data)
+                decision = (
+                    _quick_decision_from_locked_brain_route(
+                        route_data, original_msg, msg_en
+                    )
+                    or _decision_from_ai_route(
+                        route_data, original_msg, msg_en, conv_for_llm, ctx=ctx
+                    )
+                )
+                try:
+                    from services.chat_flow_telemetry import store_turn_analysis
+
+                    store_turn_analysis(
+                        route_data,
+                        decision,
+                        original_msg=original_msg,
+                        msg_en=msg_en,
+                        conversation_context=conv_for_llm,
+                    )
+                except ImportError:
+                    pass
+                return decision, route_data
+    except ImportError:
+        pass
+    except Exception as exc:
+        log_reasoning(f"Universal brain fast finalize error (non-fatal): {exc}")
+
+    try:
+        from services.catalog_menu_resolver import try_catalog_menu_routing_decision
+
+        menu_dec = try_catalog_menu_routing_decision(
+            route_data,
+            original_msg,
+            msg_en,
+            conversation_context=conv_for_llm,
+            reply_lang=reply_lang,
+            ctx=ctx,
+        )
+        if menu_dec:
+            decision, route_data = menu_dec
+            try:
+                from services.chat_flow_telemetry import (
+                    record_route_step,
+                    store_turn_analysis,
+                )
+
+                record_route_step("catalog_menu_ai_route")
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.product_catalog_resolver import apply_product_catalog_to_route
+        from services.account_list_semantics import account_list_route_is_locked
+
+        if not account_list_route_is_locked(route_data):
+            route_data = apply_product_catalog_to_route(
+                route_data,
+                original_msg,
+                msg_en,
+                conversation_context=conv_for_llm,
+                reply_lang=reply_lang,
+            )
+    except ImportError:
+        pass
+
+    try:
+        from services.chitchat_resolver import try_chitchat_routing_decision
+        from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+
+        if not turn_is_pincode_delivery_fast_path(
+            original_msg, msg_en, conv_for_llm, ctx
+        ):
+            scope_fast = try_chitchat_routing_decision(
+                route_data, original_msg, msg_en, conv_for_llm, reply_lang
+            )
+            if scope_fast:
+                decision, route_data = scope_fast
+                try:
+                    from services.chat_flow_telemetry import (
+                        record_route_step,
+                        store_turn_analysis,
+                    )
+
+                    record_route_step("scope_routing_gate")
+                    store_turn_analysis(
+                        route_data,
+                        decision,
+                        original_msg=original_msg,
+                        msg_en=msg_en,
+                        conversation_context=conv_for_llm,
+                    )
+                except ImportError:
+                    pass
+                return decision, route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.ai_route_semantics import enrich_route_from_llm
+
+        route_data = enrich_route_from_llm(
+            route_data, original_msg, msg_en, conv_for_llm
+        )
+    except ImportError:
+        pass
+
+    try:
+        route_data = apply_ai_route_corrections(
+            route_data, original_msg, msg_en, conv_for_llm
+        )
+    except Exception as exc:
+        from services.ai_route_semantics import _normalize_llm_route
+
+        log_reasoning(
+            f"apply_ai_route_corrections failed (using normalized route): {exc}"
+        )
+        route_data = _normalize_llm_route(route_data)
+
+    try:
+        if not route_data.get("_universal_brain_route"):
+            from services.query_understanding import apply_query_understanding
+
+            route_data = apply_query_understanding(
+                route_data, original_msg, msg_en, conv_for_llm, reply_lang=reply_lang
+            )
+    except Exception as exc:
+        log_reasoning(f"query_understanding skipped (non-fatal): {exc}")
+
+    log_reasoning(
+        f"AI-first route: intent={route_data.get('intent')} "
+        f"numeric={route_data.get('numeric_context')} "
+        f"continue_topic={route_data.get('continue_previous_topic')} — "
+        f"{(route_data.get('reasoning') or '')[:100]}"
+    )
+    decision = _decision_from_ai_route(
+        route_data, original_msg, msg_en, conv_for_llm, ctx=ctx
+    )
+    dbg(
+        "H1",
+        "ai_first_router.py:return",
+        "route decision ready",
+        {"intent": decision.intent, "handler": decision.handler},
+    )
+    try:
+        from services.chat_flow_telemetry import store_turn_analysis
+
+        store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+    except ImportError:
+        pass
+    return decision, route_data
+
+
 def resolve_answer_route_ai_first(
     original_msg: str,
     msg_en: str,
@@ -1654,6 +2414,53 @@ def resolve_answer_route_ai_first(
         )
 
     try:
+        from services.chat_flow_telemetry import get_cached_brain_route
+
+        cached_brain = get_cached_brain_route()
+        if _brain_route_is_usable(cached_brain):
+            log_reasoning(
+                "resolve_answer_route: reuse universal brain route — skip pre-route LLM stack."
+            )
+            return _finalize_brain_route_decision(
+                cached_brain,
+                original_msg,
+                msg_en,
+                conv_for_llm=conv_for_llm,
+                reply_lang=reply_lang,
+                ctx=ctx,
+            )
+    except ImportError:
+        pass
+
+    try:
+        from services.account_list_fast_path import try_account_list_fast_route
+
+        account_fast = try_account_list_fast_route(
+            original_msg, msg_en, conv_for_llm, reply_lang=reply_lang
+        )
+        if account_fast:
+            decision, route_data = account_fast
+            try:
+                from services.chat_flow_telemetry import (
+                    record_route_step,
+                    store_turn_analysis,
+                )
+
+                record_route_step("account_list_fast")
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
+    try:
         from services.pincode_delivery_fast_path import try_pincode_delivery_fast_route
 
         pin_fast = try_pincode_delivery_fast_route(
@@ -1665,7 +2472,94 @@ def resolve_answer_route_ai_first(
                 from services.chat_flow_telemetry import record_route_step, store_turn_analysis
 
                 record_route_step("pincode_delivery_fast")
-                store_turn_analysis(route_data, decision)
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.order_live_intent_fast_path import try_order_live_intent_fast_route
+
+        live_fast = try_order_live_intent_fast_route(
+            original_msg, msg_en, conv_for_llm, ctx=ctx, reply_lang=reply_lang
+        )
+        if live_fast:
+            decision, route_data = live_fast
+            try:
+                from services.chat_flow_telemetry import (
+                    record_route_step,
+                    store_turn_analysis,
+                )
+
+                record_route_step("order_live_intent_fast")
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.order_id_handoff_fast_path import try_order_id_handoff_route
+
+        handoff_route = try_order_id_handoff_route(
+            original_msg, msg_en, conv_for_llm, ctx=ctx
+        )
+        if handoff_route:
+            decision, route_data = handoff_route
+            try:
+                from services.chat_flow_telemetry import (
+                    record_route_step,
+                    store_turn_analysis,
+                )
+
+                record_route_step("order_id_handoff_fast")
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+            except ImportError:
+                pass
+            return decision, route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.refund_intent_fast_path import try_refund_intent_fast_route
+
+        refund_fast = try_refund_intent_fast_route(
+            original_msg, msg_en, conv_for_llm, ctx=ctx, reply_lang=reply_lang
+        )
+        if refund_fast:
+            decision, route_data = refund_fast
+            try:
+                from services.chat_flow_telemetry import record_route_step, store_turn_analysis
+
+                record_route_step("refund_intent_fast")
+                store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
             except ImportError:
                 pass
             return decision, route_data
@@ -1681,7 +2575,13 @@ def resolve_answer_route_ai_first(
             from services.chat_flow_telemetry import record_route_step, store_turn_analysis
 
             record_route_step("conversational_fast")
-            store_turn_analysis(route_data, decision)
+            store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
         except ImportError:
             pass
         return decision, route_data
@@ -1693,29 +2593,16 @@ def resolve_answer_route_ai_first(
             from services.chat_flow_telemetry import record_route_step, store_turn_analysis
 
             record_route_step("account_list_fast")
-            store_turn_analysis(route_data, decision)
+            store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
         except ImportError:
             pass
         return decision, route_data
-
-    try:
-        from services.order_id_handoff_fast_path import try_order_id_handoff_route
-
-        handoff_route = try_order_id_handoff_route(
-            original_msg, msg_en, conv_for_llm, ctx=ctx
-        )
-        if handoff_route:
-            decision, route_data = handoff_route
-            try:
-                from services.chat_flow_telemetry import record_route_step, store_turn_analysis
-
-                record_route_step("order_id_handoff_fast")
-                store_turn_analysis(route_data, decision)
-            except ImportError:
-                pass
-            return decision, route_data
-    except ImportError:
-        pass
 
     preflight = _try_policy_kb_preflight(original_msg, msg_en, reply_lang)
     if preflight:
@@ -1732,7 +2619,13 @@ def resolve_answer_route_ai_first(
             from services.chat_flow_telemetry import record_route_step, store_turn_analysis
 
             record_route_step("kb_preflight")
-            store_turn_analysis(route_data, decision)
+            store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
         except ImportError:
             pass
         return decision, route_data
@@ -1753,119 +2646,14 @@ def resolve_answer_route_ai_first(
     )
 
     if route_data:
-        try:
-            from services.catalog_menu_resolver import try_catalog_menu_routing_decision
-
-            menu_dec = try_catalog_menu_routing_decision(
-                route_data,
-                original_msg,
-                msg_en,
-                conversation_context=conv_for_llm,
-                reply_lang=reply_lang,
-                ctx=ctx,
-            )
-            if menu_dec:
-                decision, route_data = menu_dec
-                try:
-                    from services.chat_flow_telemetry import (
-                        record_route_step,
-                        store_turn_analysis,
-                    )
-
-                    record_route_step("catalog_menu_ai_route")
-                    store_turn_analysis(route_data, decision)
-                except ImportError:
-                    pass
-                return decision, route_data
-        except ImportError:
-            pass
-        try:
-            from services.product_catalog_resolver import apply_product_catalog_to_route
-
-            route_data = apply_product_catalog_to_route(
-                route_data,
-                original_msg,
-                msg_en,
-                conversation_context=conv_for_llm,
-                reply_lang=reply_lang,
-            )
-        except ImportError:
-            pass
-        try:
-            from services.chitchat_resolver import try_chitchat_routing_decision
-            from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
-
-            if not turn_is_pincode_delivery_fast_path(
-                original_msg, msg_en, conv_for_llm, ctx
-            ):
-                scope_fast = try_chitchat_routing_decision(
-                    route_data, original_msg, msg_en, conv_for_llm, reply_lang
-                )
-                if scope_fast:
-                    decision, route_data = scope_fast
-                    try:
-                        from services.chat_flow_telemetry import (
-                            record_route_step,
-                            store_turn_analysis,
-                        )
-
-                        record_route_step("scope_routing_gate")
-                        store_turn_analysis(route_data, decision)
-                    except ImportError:
-                        pass
-                    return decision, route_data
-        except ImportError:
-            pass
-        try:
-            from services.ai_route_semantics import enrich_route_from_llm
-
-            dbg("H1", "ai_first_router.py:pre_enrich", "before enrich_route_from_llm", {})
-            route_data = enrich_route_from_llm(
-                route_data, original_msg, msg_en, conv_for_llm
-            )
-            dbg(
-                "H1",
-                "ai_first_router.py:post_enrich",
-                "after enrich_route_from_llm",
-                {"intent": route_data.get("intent"), "scope": route_data.get("conversation_scope")},
-            )
-        except ImportError:
-            pass
-        try:
-            route_data = apply_ai_route_corrections(route_data, original_msg, msg_en, conv_for_llm)
-        except Exception as exc:
-            from services.ai_route_semantics import _normalize_llm_route
-
-            log_reasoning(f"apply_ai_route_corrections failed (using normalized route): {exc}")
-            route_data = _normalize_llm_route(route_data)
-        try:
-            from services.query_understanding import apply_query_understanding
-
-            route_data = apply_query_understanding(
-                route_data, original_msg, msg_en, conv_for_llm, reply_lang=reply_lang
-            )
-        except Exception as exc:
-            log_reasoning(f"query_understanding skipped (non-fatal): {exc}")
-        log_reasoning(
-            f"AI-first route: intent={route_data.get('intent')} "
-            f"numeric={route_data.get('numeric_context')} "
-            f"continue_topic={route_data.get('continue_previous_topic')} — "
-            f"{(route_data.get('reasoning') or '')[:100]}"
+        return _finalize_brain_route_decision(
+            route_data,
+            original_msg,
+            msg_en,
+            conv_for_llm=conv_for_llm,
+            reply_lang=reply_lang,
+            ctx=ctx,
         )
-        decision = _decision_from_ai_route(route_data, original_msg, msg_en, conv_for_llm, ctx=ctx)
-        dbg(
-            "H1",
-            "ai_first_router.py:return",
-            "route decision ready",
-            {"intent": decision.intent, "handler": decision.handler},
-        )
-        try:
-            from services.chat_flow_telemetry import store_turn_analysis
-
-            store_turn_analysis(route_data, decision)
-        except ImportError:
-            pass
-        return decision, route_data
 
     # === LLM unavailable — deterministic fallbacks only ===
     conv_fallback = _try_conversational_keyword_fallback(
@@ -1881,7 +2669,13 @@ def resolve_answer_route_ai_first(
             from services.chat_flow_telemetry import record_route_step, store_turn_analysis
 
             record_route_step("catalog_menu_fast_fallback")
-            store_turn_analysis(route_data, decision)
+            store_turn_analysis(
+            route_data,
+            decision,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
         except ImportError:
             pass
         return decision, route_data

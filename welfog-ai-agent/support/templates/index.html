@@ -10,6 +10,7 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
 <script src="{{ url_for('static', filename='js/voice-dictation.js') }}" defer></script>
+<script src="{{ url_for('static', filename='js/product-carousel.js') }}" defer></script>
 </head>
 <body class="app-body">
 
@@ -125,6 +126,9 @@ function addMessage(text, type){
     div.className = "msg " + type;
     div.innerHTML = text;
     chat.appendChild(div);
+    if (typeof window.welfogInitProductCarousels === "function") {
+        window.welfogInitProductCarousels(div);
+    }
     chat.scrollTop = chat.scrollHeight;
 }
 
@@ -232,7 +236,7 @@ async function send(){
         showTyping();
 
         const chatCtrl = new AbortController();
-        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 48000);
+        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 120000);
         let res;
         try {
             res = await fetch(addUserIdToApiPath("/chat"), {
@@ -247,7 +251,7 @@ async function send(){
         if (!res.ok) {
             removeTyping();
             addMessage(
-                "<div style='color:#333;line-height:1.55;'>We're experiencing very high traffic right now. Please try again in a minute or two. Thank you for your patience.</div>",
+                "<div style='color:#333;line-height:1.55;'>Sorry — something went wrong on our side. Please try again in a moment.</div>",
                 "bot"
             );
             return;
@@ -270,7 +274,7 @@ async function send(){
     } catch (e) {
         removeTyping();
         const busyMsg = (e && e.name === "AbortError")
-            ? "<div style='color:#333;line-height:1.55;'>We're experiencing very high traffic right now. Please try again in a minute or two. Thank you for your patience.</div>"
+            ? "<div style='color:#333;line-height:1.55;'>This is taking longer than usual — your reply may still be processing. Please wait a few seconds and send the same message again if nothing appears.</div>"
             : "<div style='color:#333;line-height:1.55;'>Sorry — we could not reach the server. Please check your connection and try again in a moment.</div>";
         addMessage(busyMsg, "bot");
     } finally {
@@ -418,6 +422,9 @@ if (chat) {
                 if (tailOld) tailOld.remove();
                 if (data.tail_html) {
                     root.insertAdjacentHTML("beforeend", data.tail_html);
+                }
+                if (typeof window.welfogInitProductCarousels === "function") {
+                    window.welfogInitProductCarousels(root);
                 }
             } else if (data.data) {
                 addMessage(data.data, "bot");

@@ -444,10 +444,22 @@ def execute_locked_route_turn(
         ):
             from services.early_live_dispatch import ai_route_is_live_api_turn
 
+            handler_concrete = handler in (
+                "wishlist_api",
+                "order_ai_flow",
+                "order_tracking_api",
+                "order_details_api",
+                "refund_status_api",
+                "pincode_delivery_api",
+                "product_ai_flow",
+                "deals_api",
+                "categories_api",
+            )
             can_proceed = (
-                ai_route_is_live_api_turn(ai_route, route_decision)
+                handler_concrete
+                or ai_route_is_live_api_turn(ai_route, route_decision)
                 or handler in _KB_AI_HANDLERS
-                or route_decision.source in ("api", "kb", "kb_ai", "ai")
+                or route_decision.source in ("api", "kb", "kb_ai", "ai", "ai_product", "ai_order")
                 or (ai_route or {}).get("data_channel") in ("live_api", "kb", "catalog")
             )
             if not can_proceed and handler not in _SCOPE_HANDLERS:
@@ -572,6 +584,25 @@ def execute_locked_route_turn(
                 "payment",
                 "order",
             ) else (ctx.get("last") or "order")
+            olk = ((ai_route or {}).get("order_lookup_kind") or "").strip().lower()
+            try:
+                from services.ai_route_semantics import brain_route_to_live_goal
+
+                goal = brain_route_to_live_goal(ai_route) or "order_details"
+            except ImportError:
+                goal = "order_details"
+                if olk in ("invoice",):
+                    goal = "order_invoice"
+                elif olk in ("details", "order_details"):
+                    goal = "order_details"
+                elif olk in ("track", "tracking"):
+                    goal = "track"
+                elif olk == "refund_status" or route_decision.intent == "refund":
+                    goal = "refund_status"
+                elif route_decision.intent == "payment":
+                    goal = "payment"
+            ctx.setdefault("data", {})["pending_action"] = goal
+            ctx["data"]["topic_mode"] = f"order_{goal}"
         elif handler in ("wishlist_howto_kb", "wishlist_api") or route_decision.intent == "wishlist":
             reset_context_fn(ctx)
             ctx["last"] = "wishlist"
@@ -681,6 +712,48 @@ def execute_locked_route_turn(
     return None
 
 
+def execute_locked_route_or_fallback(
+    *,
+    route_decision: AnswerRouteDecision,
+    ai_route: dict | None,
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str,
+    retrieval_query: str,
+    user_id: str,
+    lang: str,
+    ctx: dict,
+    reset_context_fn: Callable,
+    reply_for_live_order_id_lookup: Callable,
+) -> Optional[str]:
+    """Single execution pass after routing is locked — no legacy cascade."""
+    locked_reply = execute_locked_route_turn(
+        route_decision=route_decision,
+        ai_route=ai_route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conv_for_llm=conv_for_llm,
+        retrieval_query=retrieval_query,
+        user_id=user_id,
+        lang=lang,
+        ctx=ctx,
+        reset_context_fn=reset_context_fn,
+        reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+    )
+    if locked_reply:
+        return locked_reply
+    return locked_route_fallback(
+        route_decision=route_decision,
+        ai_route=ai_route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conv_for_llm=conv_for_llm,
+        retrieval_query=retrieval_query,
+        lang=lang,
+        ctx=ctx,
+    )
+
+
 def _try_assistant_scope_fallback(
     *,
     ai_route: dict | None,
@@ -739,7 +812,7 @@ def _try_assistant_scope_fallback(
             reply_lang=lang,
             ai_route=ai_route,
             route_handler="",
-            prefer_llm=False,
+            prefer_llm=True,
         )
         if scope_html:
             log_reasoning("Locked fallback: conversation scope reply.")
@@ -851,6 +924,29 @@ def _skip_kb_fallback_for_misrouted_live_api(
     return False
 
 
+def _pincode_fallback_reply(
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str,
+    lang: str,
+) -> Optional[str]:
+    try:
+        from services.pincode_delivery_flow import build_pincode_missing_or_invalid_reply
+
+        body = build_pincode_missing_or_invalid_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            reply_lang=lang,
+        )
+        if body:
+            log_reasoning("Locked fallback: pincode ask-PIN (not clarify menu).")
+            return body
+    except ImportError:
+        pass
+    return None
+
+
 def locked_route_fallback(
     *,
     route_decision: AnswerRouteDecision,
@@ -873,6 +969,11 @@ def locked_route_fallback(
     block_kb = _skip_kb_fallback_for_misrouted_live_api(
         route_decision, ai_route, original_msg, msg_en, conv_for_llm, ctx=ctx
     )
+
+    if intent == "pincode_check" or handler == "pincode_delivery_api":
+        pin_fb = _pincode_fallback_reply(original_msg, msg_en, conv_for_llm, lang)
+        if pin_fb:
+            return pin_fb
 
     if vague_turn and route_decision.is_welfog_related:
         clarify = _try_assistant_clarify_fallback(original_msg, msg_en, lang)
@@ -962,7 +1063,7 @@ def locked_route_fallback(
             reply_lang=lang,
             ai_route=ai_route,
             conversation_context=conv_for_llm,
-            prefer_llm=False,
+            prefer_llm=True,
         )
         if off:
             log_reasoning("Locked fallback: final off-topic polite.")
@@ -970,11 +1071,28 @@ def locked_route_fallback(
     except ImportError:
         pass
 
-    # Tier 6: high traffic / infra only
+    # Tier 6: high traffic / infra only — never mask a routed API/KB turn
+    if handler in (
+        "order_tracking_api",
+        "order_details_api",
+        "refund_status_api",
+        "wishlist_api",
+        "order_ai_flow",
+        "pincode_delivery_api",
+        "product_ai_flow",
+    ) or intent in ("order", "refund", "wishlist", "order_history", "product", "pincode_check"):
+        if intent == "pincode_check" or handler == "pincode_delivery_api":
+            pin_fb = _pincode_fallback_reply(original_msg, msg_en, conv_for_llm, lang)
+            if pin_fb:
+                return pin_fb
+        clarify = _try_assistant_clarify_fallback(original_msg, msg_en, lang)
+        if clarify:
+            return clarify
+
     try:
         from services.chat_resilience import build_busy_reply_html
 
-        log_reasoning("Locked fallback: infra busy reply.")
+        log_reasoning("Locked fallback: infra busy reply (last resort).")
         return build_busy_reply_html(original_msg, lang)
     except ImportError:
         return None

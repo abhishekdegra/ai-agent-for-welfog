@@ -22,6 +22,90 @@ _LIVE_API_HANDLERS = frozenset(
     }
 )
 
+_LIVE_ORDER_GOALS = frozenset(
+    {
+        "refund_status",
+        "order_invoice",
+        "order_details",
+        "track",
+        "payment",
+    }
+)
+
+
+def _brain_locked_single_order_turn(
+    ai_route: dict | None,
+    *,
+    handler: str = "",
+    olk: str = "",
+) -> bool:
+    """True when ai_brain_route already locked a single-order live API this turn."""
+    try:
+        from services.semantic_intent import llm_semantic_route_available
+    except ImportError:
+        return False
+    if not llm_semantic_route_available(ai_route):
+        return False
+    r = ai_route or {}
+    rh = (handler or r.get("route_handler") or "").strip().lower()
+    olk_v = (olk or r.get("order_lookup_kind") or "").strip().lower()
+    if rh in ("order_tracking_api", "order_details_api", "refund_status_api"):
+        return True
+    if olk_v in (
+        "track",
+        "tracking",
+        "details",
+        "invoice",
+        "order_details",
+        "refund_status",
+    ):
+        return True
+    intent = (r.get("intent") or "").strip().lower()
+    channel = (r.get("data_channel") or "").strip().lower()
+    return (
+        intent in ("order", "refund", "payment")
+        and channel == "live_api"
+        and bool(r.get("needs_order_id"))
+    )
+
+
+def _stamp_order_id_pending_from_brain(
+    ctx: dict,
+    *,
+    ai_route: dict | None,
+    handler: str = "",
+    olk: str = "",
+) -> str:
+    goal = ""
+    try:
+        from services.ai_route_semantics import brain_route_to_live_goal
+
+        goal = brain_route_to_live_goal(ai_route or {}) or ""
+    except ImportError:
+        pass
+    if goal not in _LIVE_ORDER_GOALS:
+        olk_v = (olk or (ai_route or {}).get("order_lookup_kind") or "").strip().lower()
+        rh = (handler or (ai_route or {}).get("route_handler") or "").strip().lower()
+        by_olk = {
+            "track": "track",
+            "tracking": "track",
+            "invoice": "order_invoice",
+            "details": "order_details",
+            "order_details": "order_details",
+            "refund_status": "refund_status",
+        }
+        by_rh = {
+            "order_tracking_api": "track",
+            "order_details_api": "order_details",
+            "refund_status_api": "refund_status",
+        }
+        goal = by_olk.get(olk_v) or by_rh.get(rh) or "track"
+    ctx.setdefault("data", {})["pending_action"] = goal
+    ctx["data"]["topic_mode"] = f"order_{goal}"
+    if isinstance(ai_route, dict):
+        ctx["data"]["ai_route"] = dict(ai_route)
+    return goal
+
 
 def ai_route_is_live_api_turn(
     ai_route: dict | None,
@@ -142,6 +226,48 @@ def try_early_live_api_reply(
     ).strip().lower()
     olk = ((ai_route or {}).get("order_lookup_kind") or "").strip().lower()
 
+    # --- Order history list + wishlist before single-order APIs ---
+    try:
+        from services.account_list_fast_path import try_account_list_fast_reply
+        from services.kb_service import sysmsg
+        from services.translation_service import localized_sysmsg_for_customer
+        from services.welfog_api import format_purchase_history_reply, format_wishlist_reply
+
+        def _loc_sys(key: str, user_msg: str, reply_lang: str = "en") -> str:
+            return localized_sysmsg_for_customer(key, user_msg, reply_lang=reply_lang)
+
+        account_handoff = try_account_list_fast_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            user_id,
+            lang,
+            ctx,
+            format_purchase_history_reply=format_purchase_history_reply,
+            format_wishlist_reply=format_wishlist_reply,
+            localized_sysmsg=_loc_sys,
+            sysmsg=sysmsg,
+            reset_context_fn=reset_context_fn,
+        )
+        if account_handoff:
+            log_reasoning("Early live dispatch: account-list fast path.")
+            return account_handoff
+    except ImportError:
+        pass
+
+    # --- Other company / person — decline before pincode or order fast paths ---
+    try:
+        from services.support_scope import try_external_scope_fast_decline
+
+        external = try_external_scope_fast_decline(
+            original_msg, msg_en, conv_for_llm, reply_lang=lang
+        )
+        if external:
+            log_reasoning("Early live dispatch: external scope decline.")
+            return external
+    except ImportError:
+        pass
+
     # --- Pincode delivery: direct API when PIN is already in the message ---
     try:
         from services.pincode_delivery_fast_path import try_pincode_delivery_fast_reply
@@ -157,6 +283,102 @@ def try_early_live_api_reply(
         if pin_handoff:
             log_reasoning("Early live dispatch: pincode delivery fast path.")
             return pin_handoff
+    except ImportError:
+        pass
+
+    # --- Latest-turn order goal (details / invoice / track / refund) before stale refund thread ---
+    try:
+        from services.order_live_intent_fast_path import try_order_live_intent_fast_reply
+
+        live_handoff = try_order_live_intent_fast_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            user_id,
+            lang,
+            ctx,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context_fn,
+        )
+        if live_handoff:
+            log_reasoning("Early live dispatch: order live intent fast path.")
+            return live_handoff
+    except ImportError:
+        pass
+
+    # Enriched brain JSON may resolve goal when resolve_current_live_goal did not.
+    try:
+        from services.semantic_intent import llm_semantic_route_available
+        from services.ai_route_semantics import (
+            brain_route_to_live_goal,
+            ensure_brain_order_route_locked,
+        )
+        from services.order_live_intent_fast_path import try_order_live_intent_fast_reply
+
+        if llm_semantic_route_available(ai_route):
+            locked = ensure_brain_order_route_locked(
+                ai_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            )
+            brain_goal = brain_route_to_live_goal(
+                locked,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            )
+            if brain_goal in _LIVE_ORDER_GOALS:
+                brain_fast = try_order_live_intent_fast_reply(
+                    original_msg,
+                    msg_en,
+                    conv_for_llm,
+                    user_id,
+                    lang,
+                    ctx,
+                    reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+                    reset_context_fn=reset_context_fn,
+                    preset_goal=brain_goal,
+                )
+                if brain_fast:
+                    log_reasoning(
+                        f"Early live dispatch: brain-locked order goal={brain_goal} "
+                        "(no specialist order LLM)."
+                    )
+                    return brain_fast
+    except ImportError:
+        pass
+
+    # --- FAQ / policy KB (vector) before refund misroute ---
+    try:
+        from services.knowledge_fast_path import try_knowledge_fast_reply
+
+        kb_handoff = try_knowledge_fast_reply(
+            original_msg, msg_en, conv_for_llm, reply_lang=lang
+        )
+        if kb_handoff:
+            log_reasoning("Early live dispatch: knowledge fast path.")
+            return kb_handoff
+    except ImportError:
+        pass
+
+    # --- Refund: policy KB / API / ask Order ID (locked route, no cascade) ---
+    try:
+        from services.refund_intent_fast_path import try_refund_intent_fast_reply
+
+        refund_handoff = try_refund_intent_fast_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            user_id,
+            lang,
+            ctx,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context_fn,
+        )
+        if refund_handoff:
+            log_reasoning("Early live dispatch: refund intent fast path.")
+            return refund_handoff
     except ImportError:
         pass
 
@@ -274,9 +496,17 @@ def try_early_live_api_reply(
         except ImportError:
             pass
 
+        refund_topic = False
+        try:
+            from services.refund_intent_fast_path import turn_has_refund_topic
+
+            refund_topic = turn_has_refund_topic(original_msg, msg_en)
+        except ImportError:
+            pass
         if (
             not pincode_turn
             and not single_order_intent
+            and not refund_topic
             and (
                 handler == "order_ai_flow"
                 or intent == "order_history"
@@ -333,25 +563,37 @@ def try_early_live_api_reply(
         )
         wants_refund = resolved.kind == KIND_PERSONAL_STATUS or thread_refund
         if wants_refund or handler == "refund_status_api" or olk == "refund_status":
-            result = run_refund_status_ai_flow(
-                original_msg,
-                msg_en,
-                user_id,
-                conversation_context=conv_for_llm,
-                reply_lang=lang,
-                ai_route=ai_route,
-            )
-            if result.handled and result.reply_html:
-                log_reasoning(
-                    f"Early live dispatch: refund status API ({wants_refund or olk or handler})."
+            if not _brain_locked_single_order_turn(ai_route, handler=handler, olk=olk):
+                result = run_refund_status_ai_flow(
+                    original_msg,
+                    msg_en,
+                    user_id,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                    ai_route=ai_route,
                 )
-                _record_live("refund", "refund_status_api")
-                reset_context_fn(ctx)
-                ctx["last"] = "refund"
-                if result.order_id:
-                    ctx["order_id"] = result.order_id
-                ctx["awaiting"] = "order_id" if result.needs_order_id else None
-                return result.reply_html
+                if result.handled and result.reply_html:
+                    log_reasoning(
+                        f"Early live dispatch: refund status API ({wants_refund or olk or handler})."
+                    )
+                    _record_live("refund", "refund_status_api")
+                    if result.needs_order_id and isinstance(ctx, dict):
+                        goal = _stamp_order_id_pending_from_brain(
+                            ctx, ai_route=ai_route, handler=handler, olk=olk
+                        )
+                        ctx["last"] = "refund"
+                        ctx["awaiting"] = "order_id"
+                    else:
+                        reset_context_fn(ctx)
+                        ctx["last"] = "refund"
+                        if result.order_id:
+                            ctx["order_id"] = result.order_id
+                        ctx["awaiting"] = None
+                    return result.reply_html
+            else:
+                log_reasoning(
+                    "Skip refund specialist LLM — brain already locked single-order turn."
+                )
     except ImportError:
         pass
 
@@ -389,23 +631,37 @@ def try_early_live_api_reply(
                 or olk in ("details", "invoice", "order_details", "order_invoice")
             )
         ):
-            result = run_order_details_ai_flow(
-                original_msg,
-                msg_en,
-                user_id,
-                conversation_context=conv_for_llm,
-                reply_lang=lang,
-                ai_route=ai_route,
-            )
-            if result.handled and result.reply_html:
-                log_reasoning(f"Early live dispatch: order details API ({wants_od or olk or handler}).")
-                _record_live("order", "order_details_api")
-                reset_context_fn(ctx)
-                ctx["last"] = "order"
-                if result.order_id:
-                    ctx["order_id"] = result.order_id
-                ctx["awaiting"] = "order_id" if result.needs_order_id else None
-                return result.reply_html
+            if not _brain_locked_single_order_turn(ai_route, handler=handler, olk=olk):
+                result = run_order_details_ai_flow(
+                    original_msg,
+                    msg_en,
+                    user_id,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                    ai_route=ai_route,
+                )
+                if result.handled and result.reply_html:
+                    log_reasoning(
+                        f"Early live dispatch: order details API ({wants_od or olk or handler})."
+                    )
+                    _record_live("order", "order_details_api")
+                    if result.needs_order_id and isinstance(ctx, dict):
+                        _stamp_order_id_pending_from_brain(
+                            ctx, ai_route=ai_route, handler=handler, olk=olk
+                        )
+                        ctx["last"] = "order"
+                        ctx["awaiting"] = "order_id"
+                    else:
+                        reset_context_fn(ctx)
+                        ctx["last"] = "order"
+                        if result.order_id:
+                            ctx["order_id"] = result.order_id
+                        ctx["awaiting"] = None
+                    return result.reply_html
+            else:
+                log_reasoning(
+                    "Skip order-details specialist LLM — brain already locked single-order turn."
+                )
     except ImportError:
         pass
 
@@ -498,27 +754,39 @@ def try_early_live_api_reply(
                     return None
         except ImportError:
             pass
-        try:
-            from services.order_tracking_flow import run_order_tracking_ai_flow
+        if not _brain_locked_single_order_turn(ai_route, handler=handler, olk=olk):
+            try:
+                from services.order_tracking_flow import run_order_tracking_ai_flow
 
-            result = run_order_tracking_ai_flow(
-                original_msg,
-                msg_en,
-                user_id,
-                conversation_context=conv_for_llm,
-                reply_lang=lang,
+                result = run_order_tracking_ai_flow(
+                    original_msg,
+                    msg_en,
+                    user_id,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                )
+                if result.handled and result.reply_html:
+                    log_reasoning("Early live dispatch: order tracking API.")
+                    _record_live("order", "order_tracking_api")
+                    if result.needs_order_id and isinstance(ctx, dict):
+                        _stamp_order_id_pending_from_brain(
+                            ctx, ai_route=ai_route, handler=handler, olk=olk
+                        )
+                        ctx["last"] = "order"
+                        ctx["awaiting"] = "order_id"
+                    else:
+                        reset_context_fn(ctx)
+                        ctx["last"] = "order"
+                        if result.order_id:
+                            ctx["order_id"] = result.order_id
+                        ctx["awaiting"] = None
+                    return result.reply_html
+            except ImportError:
+                pass
+        else:
+            log_reasoning(
+                "Skip order-tracking specialist LLM — brain already locked single-order turn."
             )
-            if result.handled and result.reply_html:
-                log_reasoning("Early live dispatch: order tracking API.")
-                _record_live("order", "order_tracking_api")
-                reset_context_fn(ctx)
-                ctx["last"] = "order"
-                if result.order_id:
-                    ctx["order_id"] = result.order_id
-                ctx["awaiting"] = "order_id" if result.needs_order_id else None
-                return result.reply_html
-        except ImportError:
-            pass
 
     # --- Live order-id lookup (track / refund / payment) when ID present ---
     try:

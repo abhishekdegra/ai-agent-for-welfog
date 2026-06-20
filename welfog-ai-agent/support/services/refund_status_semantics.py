@@ -192,6 +192,37 @@ def resolve_refund_turn(
     """
     comb = _combined(original_msg, msg_en)
     try:
+        from utils.helpers import (
+            _text_is_refund_return_policy_howto,
+            _text_is_refund_return_status_lookup,
+        )
+
+        if _text_is_refund_return_status_lookup(comb, conversation_context):
+            out = ResolvedRefundTurn(
+                kind=KIND_PERSONAL_STATUS,
+                source="message_status_early",
+                confidence="high",
+                user_meaning="Personal refund/return status for one order",
+            )
+            cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-400:])}|{allow_llm}"
+            _RESOLVE_REFUND_CACHE.key = cache_key
+            _RESOLVE_REFUND_CACHE.result = out
+            return out
+        if _text_is_refund_return_policy_howto(comb):
+            out = ResolvedRefundTurn(
+                kind=KIND_POLICY_HOWTO,
+                source="keyword_policy_early",
+                confidence="high",
+                user_meaning="General refund/return policy or timeline question",
+            )
+            cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-400:])}|{allow_llm}"
+            _RESOLVE_REFUND_CACHE.key = cache_key
+            _RESOLVE_REFUND_CACHE.result = out
+            return out
+    except ImportError:
+        pass
+
+    try:
         from services.conversation_thread_semantics import (
             _EXPLICIT_GOAL_GUARD,
             infer_order_thread_goal,
@@ -304,6 +335,23 @@ def resolve_refund_turn(
             kb_read = ai_route_is_kb_read(ai_route)
         except ImportError:
             kb_read = False
+        from utils.helpers import (
+            _text_is_refund_return_policy_howto,
+            _text_is_refund_return_status_lookup,
+        )
+
+        if _text_is_refund_return_status_lookup(comb, conversation_context):
+            out = ResolvedRefundTurn(
+                kind=KIND_PERSONAL_STATUS, source="message_status_semantics"
+            )
+            _RESOLVE_REFUND_CACHE.key = cache_key
+            _RESOLVE_REFUND_CACHE.result = out
+            return out
+        if _text_is_refund_return_policy_howto(comb):
+            out = ResolvedRefundTurn(kind=KIND_POLICY_HOWTO, source="message_policy_semantics")
+            _RESOLVE_REFUND_CACHE.key = cache_key
+            _RESOLVE_REFUND_CACHE.result = out
+            return out
         blob_kind = _kind_from_meaning_blob(_meaning_blob(ai_route))
         if blob_kind == KIND_PERSONAL_STATUS:
             out = ResolvedRefundTurn(kind=KIND_PERSONAL_STATUS, source="ai_route_meaning")
@@ -498,10 +546,21 @@ def ai_classify_refund_status_turn(
     reply_lang: str = "",
 ) -> Optional[dict]:
     """Micro-classifier: personal refund STATUS vs policy HOW-TO (any language)."""
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            log_reasoning(
+                "Refund-status LLM: defer/skip — universal brain route owns classification."
+            )
+            return None
+    except ImportError:
+        pass
+
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -509,7 +568,7 @@ def ai_classify_refund_status_turn(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -519,23 +578,40 @@ def ai_classify_refund_status_turn(
 
     system_prompt = f"""You classify Welfog refund/return questions for the LATEST user message.
 
-Two different intents (infer MEANING in ANY language — do NOT match fixed phrase lists):
+Customers write in ANY language, script, or style (English, Hinglish, Hindi, Tamil, Telugu, Bengali,
+Marathi, Gujarati, Kannada, Malayalam, Urdu, typos, voice-to-text). Infer MEANING — never match keywords.
+
+Two different intents:
 1) personal_status — customer wants THEIR refund/return status on a specific order they placed
-   (when approved, amount pending, "refund kab milega" WITH order id, check my refund for order X).
-   Needs Order ID if not given — if missing, still personal_status (bot will ask id).
-2) policy_howto — general rules/steps (how to return, refund policy, wrong/damaged item process,
-   "refund kitne din me aata hai" in general, return kaise kare, process/steps, eligibility).
+   (approved yet?, money not received, check my refund, when will MY refund arrive for MY order).
+   If Order ID is missing, still personal_status — bot will ask for it.
+2) policy_howto — general rules/steps/timeline (how to return, refund policy, eligibility,
+   how many days refunds usually take IN GENERAL, wrong/damaged item process).
    No live lookup for one order.
 
-Examples:
-- "2606020 ka refund kab milega" → personal_status
-- "ab bta 2606020 is ke liye kab milega refund" → personal_status
-- "refund kitne din me aata hai" → policy_howto
-- "return kaise kru welfog pe" → policy_howto
-- "galat product mila kya karu" → policy_howto
-- "mera refund approve hua kya" (no order id) → personal_status (status check)
+Critical distinction:
+- General WHEN/HOW LONG questions with no specific-order complaint and no Order ID
+  ("refund kitne din me aata hai", "mera refund kab tk aa jayega" as a general timeline question)
+  → policy_howto
+- Personal complaint or status check on THEIR purchase, even without Order ID yet
+  ("refund nahi aaya", "approve hua kya", "paise wapas nahi mile", "check my refund")
+  → personal_status (bot will ask Order ID if needed)
 
-If NOT about Welfog refund/return (product search, shipment tracking, invoice, greeting), use refund_turn_kind=none.
+Examples (same meaning → same refund_turn_kind):
+- "2606020 ka refund kab milega" → personal_status
+- "என் ரீபண்ட் எப்போ வரும்" → personal_status (Tamil: when will my refund come)
+- "refund এখনও আসেনি" → personal_status (Bengali: refund not come yet)
+- "refund kitne din me aata hai" → policy_howto (general timeline)
+- "mera refund kab tk aa jayega" (general when, no complaint) → policy_howto
+- "return kaise kru welfog pe" → policy_howto
+- "refund nhi aaya abhi tk" → personal_status
+- "mera refund approve hua kya" (no order id) → personal_status
+
+NOT refund/return (use refund_turn_kind=none): product search, shipment tracking, invoice,
+greeting, general DELIVERY TIME / shipping timeline / how long orders take to arrive.
+- "welfog pe delivery kitna time lgta hai" → none
+- "order kitne din me aata hai" → none
+- "refund kitne din me aata hai" → policy_howto
 
 Return ONLY valid JSON:
 {{
@@ -577,6 +653,8 @@ def promote_refund_status_on_route(
     msg_en: str = "",
     conversation_context: str = "",
     reply_lang: str = "",
+    *,
+    allow_llm: bool = False,
 ) -> dict:
     """Align Groq route: personal refund STATUS (API) vs refund POLICY (KB)."""
     out = dict(route or {})
@@ -626,7 +704,7 @@ def promote_refund_status_on_route(
         conversation_context,
         ai_route=out,
         reply_lang=reply_lang,
-        allow_llm=True,
+        allow_llm=allow_llm,
     )
     if resolved.user_meaning:
         out["user_meaning"] = resolved.user_meaning

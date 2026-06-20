@@ -181,30 +181,45 @@ def _has_definite_welfog_shopping_signal(text: str) -> bool:
         return False
     try:
         from utils.helpers import (
+            _is_light_smalltalk_fast,
+            _is_short_pure_greeting,
+            _looks_like_greeting_message,
             _message_has_catalog_product_signal,
+            _text_has_kb_topic_hint,
             _text_has_product_shopping_intent,
             extract_order_id,
             message_is_knowledge_information_request,
             message_is_welfog_about_request,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
+            message_asks_welfog_categories_list,
         )
+        from services.conversation_followup import is_deals_request_message
 
         comb = text
-        from services.conversation_followup import is_deals_request_message
-        from utils.helpers import message_asks_welfog_categories_list
+        if (
+            _looks_like_greeting_message(comb)
+            or _is_short_pure_greeting(comb.strip())
+            or _is_light_smalltalk_fast(comb, "")
+        ):
+            return False
 
         if message_asks_welfog_categories_list(comb) or is_deals_request_message(comb, ""):
             return True
-        if message_is_knowledge_information_request(comb) or message_is_welfog_about_request(comb):
-            return True
-        if _text_has_product_shopping_intent(comb) or _message_has_catalog_product_signal(comb):
-            return True
         if extract_order_id(comb, ""):
+            return True
+        if message_is_past_purchase_list_request(comb) or message_is_wishlist_like_request(comb):
             return True
         if re.search(r"\b[1-9]\d{5}\b", comb) and any(
             x in comb.lower()
             for x in ("delivery", "pincode", "pin code", "deliver", "milega", "pahunch")
         ):
             return True
+        if _text_has_product_shopping_intent(comb) or _message_has_catalog_product_signal(comb):
+            return True
+        if _text_has_kb_topic_hint(comb):
+            if message_is_knowledge_information_request(comb) or message_is_welfog_about_request(comb):
+                return True
     except ImportError:
         pass
     return False
@@ -232,7 +247,7 @@ def ai_classify_scope_and_reply(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -242,7 +257,7 @@ def ai_classify_scope_and_reply(
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -268,7 +283,7 @@ Return ONLY valid JSON:
 {{
   "user_meaning": "one English sentence — what they want this turn",
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain",
-  "scope_reply": "REQUIRED when scope is general_chitchat or out_of_domain: 1-3 sentences in the CUSTOMER's language/script; warm, polite, human. For out_of_domain: briefly acknowledge their topic, say you only help with Welfog shopping/support, invite a Welfog question. Do NOT answer off-topic facts. For general_chitchat: natural reply (greeting/thanks/who-is-bot). EMPTY string when welfog_support.",
+  "scope_reply": "REQUIRED when scope is general_chitchat or out_of_domain: 1-3 sentences in the CUSTOMER's language/script AND conversational style (casual, formal, slang, poetic — mirror how they wrote). Warm, polite, human like ChatGPT. For out_of_domain: briefly acknowledge their topic in their tone, say you only help with Welfog shopping/support, invite a Welfog question. Do NOT answer off-topic facts. For general_chitchat: natural reply — greeting in their style (not plain Hi), thanks/praise with welcome-back, bye with invite to return. EMPTY string when welfog_support.",
   "confidence": 0.0 to 1.0
 }}
 

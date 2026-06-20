@@ -68,6 +68,18 @@ _DELIVERY_PLACE_STOPWORDS_RE = re.compile(
     re.I,
 )
 
+# Tokens that name a person/relation/zone — not a geocodable city (structural, not product keywords).
+_RELATIONAL_PLACE_WORDS = frozenset(
+    {
+        "dost", "friend", "friends", "yaar", "bhai", "behan", "sister", "brother",
+        "cousin", "relative", "relatives", "papa", "mummy", "mom", "dad", "parents",
+        "wife", "husband", "ghar", "home", "office", "college", "school", "mere",
+        "mera", "meri", "uska", "uski", "unka", "unke", "didi", "bhabhi", "chacha",
+        "mama", "nana", "nani", "saas", "sasur", "beti", "beta", "saheli", "saheli",
+        "area", "locality", "ilaka", "jagah", "jagha", "pas", "paas", "aas", "ke",
+    }
+)
+
 
 @dataclass
 class ResolvedDeliveryLocation:
@@ -158,8 +170,25 @@ def extract_place_query_from_delivery_message(text: str) -> str:
     return " ".join(tokens[:4]).strip()
 
 
+def _place_is_relational_or_vague_reference(place: str) -> bool:
+    """Person/zone reference (friend's area) — not a geocodable city name."""
+    p = re.sub(r"\s+", " ", (place or "").strip().lower())
+    if not p:
+        return False
+    tokens = [t for t in p.split() if len(t) >= 2]
+    if not tokens:
+        return False
+    if all(t in _RELATIONAL_PLACE_WORDS for t in tokens):
+        return True
+    if len(tokens) == 1 and tokens[0] in ("area", "locality", "jagah", "jagha", "ilaka"):
+        return True
+    return False
+
+
 def _place_name_looks_gibberish(place: str) -> bool:
     """Random / nonsense place — safe to ask for PIN."""
+    if _place_is_relational_or_vague_reference(place):
+        return True
     p = re.sub(r"\s+", " ", (place or "").strip().lower())
     if not p or len(p) < 2:
         return True
@@ -182,6 +211,8 @@ def _delivery_question_incomplete(
     """User wants delivery check but did not name any place (half question)."""
     u = understood or DeliveryTurnUnderstanding()
     place = (u.city_name or "").strip() or extract_place_query_from_delivery_message(comb)
+    if place and _place_is_relational_or_vague_reference(place):
+        return True
     if place and len(place) >= 3 and not _place_name_looks_gibberish(place):
         return False
     return bool(
@@ -213,6 +244,10 @@ def should_ask_user_for_pincode(
 
     place = (u.city_name or "").strip() or extract_place_query_from_delivery_message(comb)
 
+    if place and _place_is_relational_or_vague_reference(place):
+        log_reasoning("Delivery: ask PIN — relational/vague area reference (not a city).")
+        return True
+
     if _delivery_question_incomplete(comb, u):
         log_reasoning("Delivery: ask PIN — question incomplete (no clear place).")
         return True
@@ -226,6 +261,10 @@ def should_ask_user_for_pincode(
         return True
 
     if u.location_kind == "ask_pin" and u.confidence >= _DELIVERY_AI_CONF_SERVICEABILITY:
+        resolved_pin = (loc or ResolvedDeliveryLocation()).pincode
+        if not resolved_pin:
+            log_reasoning("Delivery: ask PIN — delivery classifier (no resolved PIN).")
+            return True
         if not place:
             return True
         if _place_name_looks_gibberish(place):
@@ -538,6 +577,14 @@ def ai_understand_delivery_turn(
     if not comb:
         return None
 
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            return DeliveryTurnUnderstanding(source="deferred_brain")
+    except ImportError:
+        pass
+
     cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
     cached = _delivery_turn_cache_get(cache_key)
     if cached is not None:
@@ -546,12 +593,12 @@ def ai_understand_delivery_turn(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -686,6 +733,49 @@ def ai_extract_delivery_location(
     }
 
 
+def _city_label_from_ai_route(ai_route: dict | None) -> str:
+    """Place name from brain route — no extra LLM."""
+    if not isinstance(ai_route, dict):
+        return ""
+    for key in ("extracted_location", "extracted_city", "search_query"):
+        val = str(ai_route.get(key) or "").strip()
+        if not val or len(val) < 2:
+            continue
+        if re.search(r"\b[1-9]\d{5}\b", val):
+            continue
+        return val
+    return ""
+
+
+def _brain_route_implies_area_followup(ai_route: dict | None) -> bool:
+    """
+    Structural signals from brain route JSON only — no English/Hinglish phrase lists.
+    Language-specific follow-up meaning comes from ai_understand_delivery_turn().
+    """
+    if not isinstance(ai_route, dict):
+        return False
+    if ai_route.get("continue_previous_topic"):
+        return True
+    reuse = (ai_route.get("reuse_user_value_from_chat") or "").strip().lower()
+    if reuse == "pincode":
+        return True
+    intent = (ai_route.get("intent") or "").strip().lower()
+    handler = (ai_route.get("route_handler") or "").strip().lower()
+    if intent != "pincode_check" and handler != "pincode_delivery_api":
+        return False
+    pin = re.sub(r"\D", "", str(ai_route.get("extracted_pincode") or ""))
+    if len(pin) == 6 and pin[0] != "0":
+        return False
+    if _city_label_from_ai_route(ai_route):
+        return False
+    try:
+        from services.ai_route_semantics import ai_meaning_describes_delivery_serviceability
+
+        return ai_meaning_describes_delivery_serviceability(ai_route)
+    except ImportError:
+        return True
+
+
 def _understanding_from_ai_route(ai_route: dict | None) -> Optional[DeliveryTurnUnderstanding]:
     if not isinstance(ai_route, dict):
         return None
@@ -700,14 +790,22 @@ def _understanding_from_ai_route(ai_route: dict | None) -> Optional[DeliveryTurn
     if handler != "pincode_delivery_api" and intent != "pincode_check" and not meaning_ok:
         return None
     pin = re.sub(r"\D", "", str(ai_route.get("extracted_pincode") or ""))
+    city = _city_label_from_ai_route(ai_route)
     if len(pin) == 6 and pin[0] != "0":
         kind = "pincode"
+    elif city:
+        kind = "city"
+    elif meaning_ok:
+        kind = "ask_pin"
     else:
-        kind = "ask_pin" if meaning_ok else "none"
+        kind = "none"
+    area_followup = _brain_route_implies_area_followup(ai_route)
     return DeliveryTurnUnderstanding(
         is_serviceability=True,
+        is_area_followup=area_followup,
         location_kind=kind,
         pincode=pin if kind == "pincode" else "",
+        city_name=city if kind == "city" else "",
         user_meaning=str(ai_route.get("user_meaning") or "").strip(),
         confidence=0.88,
         source="ai_route",
@@ -772,12 +870,53 @@ def resolve_delivery_turn(
     AI-first delivery turn understanding — one classifier per turn (cached).
     Keyword lists are NOT used; LLM-down path uses structural signals only.
     """
+    if allow_llm:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+            if should_skip_micro_classifier_llm():
+                allow_llm = False
+        except ImportError:
+            pass
+
     cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
     cached = _delivery_turn_cache_get(cache_key)
     if cached is not None and cached.source != "pending":
         return cached
 
     route_u = _understanding_from_ai_route(ai_route)
+    route_needs_place_nlu = bool(
+        route_u
+        and not route_u.pincode
+        and route_u.location_kind in ("ask_pin", "none", "city")
+        and not (route_u.city_name and route_u.location_kind == "city")
+    )
+
+    if allow_llm and route_needs_place_nlu:
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+
+            if product_catalog_route_is_locked(ai_route):
+                if route_u:
+                    _delivery_turn_cache_put(cache_key, route_u)
+                    return route_u
+        except ImportError:
+            pass
+        ai_u = ai_understand_delivery_turn(
+            original_msg,
+            msg_en,
+            conversation_context,
+            ai_route=ai_route,
+            reply_lang=reply_lang,
+        )
+        if ai_u and (
+            ai_u.is_serviceability
+            or ai_u.is_area_followup
+            or ai_u.location_kind in ("pincode", "city", "ask_pin")
+        ):
+            _delivery_turn_cache_put(cache_key, ai_u)
+            return ai_u
+
     if route_u:
         _delivery_turn_cache_put(cache_key, route_u)
         return route_u
@@ -1177,21 +1316,38 @@ def turn_continues_pincode_area_check(
 
 
 def _short_area_followup_in_pincode_thread(text: str) -> bool:
-    """Short 'aur X me?' style follow-up while checking delivery — structural, not city keywords."""
+    """Short 'aur X me?' / another-area follow-up while checking delivery — structural."""
     raw = (text or "").strip()
-    if not raw or len(raw.split()) > 6:
+    if not raw or len(raw.split()) > 12:
         return False
     if _PIN_RE.search(raw):
         return True
     place = extract_place_query_from_delivery_message(raw)
     if place and len(place) >= 3 and not _place_name_looks_gibberish(place):
         return True
+    tl = f" {raw.lower()} "
+    if re.search(r"\b(?:aur|and|also|waha|vaha|wahan|vahan)\b", tl):
+        if re.search(
+            r"\b(?:area|locality|ghar|jagah|ilaka|pincode|pin\s*code)\b", tl
+        ):
+            return True
+        if re.search(
+            r"\b(?:dost|friend|bhai|behan|papa|mummy|office|college|relative)\b",
+            tl,
+        ):
+            return True
+    if re.search(r"\barea\b", tl) and re.search(r"\b(?:me|mein|par|pe|per)\b", tl):
+        return True
     if re.search(
         r"(?:\b(?:aur|and|also)\s+)?\w{3,15}\s*(?:me|mein|par|pe|per)\s*\??",
         raw,
         re.I,
     ):
-        return bool(extract_place_query_from_delivery_message(raw))
+        return bool(extract_place_query_from_delivery_message(raw)) or bool(
+            _place_is_relational_or_vague_reference(
+                extract_place_query_from_delivery_message(raw)
+            )
+        )
     return False
 
 

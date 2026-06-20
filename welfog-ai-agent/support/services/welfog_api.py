@@ -11,6 +11,15 @@ import requests
 WELFOG_TRACK_API_URL = "https://welfogapi.welfog.com/api/onedelivery/welfog_track"
 WELFOG_RETURN_REQUEST_API_URL = "https://welfogapi.welfog.com/api/v2/return-request/{order_id}"
 
+
+def _record_api_elapsed(started: float) -> None:
+    try:
+        from services.chat_flow_telemetry import record_api_time
+
+        record_api_time(time.perf_counter() - float(started))
+    except ImportError:
+        pass
+
 _RETURN_REQUEST_CUSTOMER_FIELDS = (
     "order_id",
     "refund_status",
@@ -33,6 +42,27 @@ _ORDER_FLOW_STEP_ORDER = (
 PH_API_BASE = "https://welfogapi.welfog.com/api/v2/purchase-history"
 PH_DETAILS_API_BASE = "https://welfogapi.welfog.com/api/v2/purchase-history-details"
 INVOICE_API_BASE = "https://supplierservice.welfog.com/get_invoice"
+_LIVE_ORDER_API_TIMEOUT_SEC = 6
+
+
+def _is_transient_network_error(exc: BaseException) -> bool:
+    if isinstance(
+        exc,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            requests.exceptions.ReadTimeout,
+        ),
+    ):
+        return True
+    msg = str(exc).lower()
+    return (
+        "failed to resolve" in msg
+        or "name resolution" in msg
+        or "getaddrinfo failed" in msg
+        or "timed out" in msg
+        or "max retries exceeded" in msg
+    )
 PH_IMG_BASE = "https://d1f02fefkbso7w.cloudfront.net/"
 PH_PER_PAGE = 10
 # In-memory order list per logged-in user (same-process); grows by offset/page until API repeats or ends.
@@ -50,6 +80,70 @@ _WL_CACHE_TTL_SEC = 300
 _CATALOG_SEARCH_URL = "https://welfogapi.welfog.com/api/v2/products/search"
 
 
+def _catalog_search_get(params: dict, *, timeout: int = 12) -> list:
+    """Raw products/search GET — returns data[] or []."""
+    p = {"latitude": "", "longitude": ""}
+    p.update(params or {})
+    try:
+        res = requests.get(_CATALOG_SEARCH_URL, params=p, timeout=timeout)
+        if res.status_code != 200:
+            return []
+        return res.json().get("data") or []
+    except Exception:
+        return []
+
+
+_REST_CATEGORY_BASELINE_SLUGS: frozenset[str] | None = None
+
+
+def _product_slugs_from_rows(rows: list) -> frozenset[str]:
+    out: set[str] = set()
+    for row in (rows or [])[:16]:
+        if not isinstance(row, dict):
+            continue
+        slug = row.get("slug") or row.get("id")
+        if slug is not None:
+            out.add(str(slug))
+    return frozenset(out)
+
+
+def _rest_category_filter_trustworthy(category_id, rows: list) -> bool:
+    """
+    Welfog products/search often ignores category= for non-electronics ids and returns
+    the same default pool. Reject those rows so callers can try name search instead.
+    """
+    global _REST_CATEGORY_BASELINE_SLUGS
+    if not rows:
+        return False
+    slugs = _product_slugs_from_rows(rows)
+    if not slugs:
+        return True
+    if _REST_CATEGORY_BASELINE_SLUGS is None:
+        baseline = _catalog_search_get({"page": 1, "category": "16"})
+        _REST_CATEGORY_BASELINE_SLUGS = _product_slugs_from_rows(baseline or [])
+    cid = str(category_id or "").strip()
+    if _REST_CATEGORY_BASELINE_SLUGS and slugs == _REST_CATEGORY_BASELINE_SLUGS and cid not in ("", "16"):
+        return False
+    return True
+
+
+def _catalog_search_with_category(base_params: dict, category_id) -> list:
+    """
+    Welfog search API: most departments need `category` / `category_id`;
+    legacy `categories` works for some ids (e.g. electronics) only.
+    """
+    if not category_id:
+        return _catalog_search_get(base_params)
+    cid = str(category_id).strip()
+    for key in ("category", "category_id", "categories"):
+        params = dict(base_params)
+        params[key] = cid
+        rows = _catalog_search_get(params)
+        if rows and _rest_category_filter_trustworthy(cid, rows):
+            return rows
+    return []
+
+
 def _parse_price_number(val) -> Optional[float]:
     if val is None:
         return None
@@ -64,9 +158,24 @@ def _parse_price_number(val) -> Optional[float]:
         return None
 
 
-def customer_sale_price(product: dict) -> Optional[float]:
+def _shipping_cost_from_product(product: dict) -> float:
+    if not isinstance(product, dict):
+        return 0.0
+    pools: list[dict] = [product]
+    nested = product.get("data")
+    if isinstance(nested, dict):
+        pools.append(nested)
+    for pool in pools:
+        v = _parse_price_number(pool.get("shipping_cost"))
+        if v is not None and v >= 0:
+            return float(v)
+    return 0.0
+
+
+def customer_landed_price(product: dict) -> Optional[float]:
     """
-    Price the customer pays (main_price / discounted), not MRP (stroked_price, unit_price).
+    Total price the customer pays at checkout: purchase_price + shipping_cost.
+    OpenSearch and REST catalog both expose these fields separately.
     """
     if not isinstance(product, dict):
         return None
@@ -74,6 +183,14 @@ def customer_sale_price(product: dict) -> Optional[float]:
     nested = product.get("data")
     if isinstance(nested, dict):
         pools.append(nested)
+    base: Optional[float] = None
+    shipping = 0.0
+    for pool in pools:
+        purchase = _parse_price_number(pool.get("purchase_price"))
+        if purchase is not None and purchase >= 0:
+            base = float(purchase)
+            shipping = _shipping_cost_from_product(pool)
+            return base + shipping
     sale_keys = (
         "main_price",
         "selling_price",
@@ -83,17 +200,33 @@ def customer_sale_price(product: dict) -> Optional[float]:
         "final_price",
         "price",
     )
-    mrp_keys = ("stroked_price", "unit_price", "base_price", "mrp", "old_price")
     for pool in pools:
         for key in sale_keys:
             v = _parse_price_number(pool.get(key))
             if v is not None and v > 0:
-                return v
+                return float(v) + _shipping_cost_from_product(pool)
+    return None
+
+
+def customer_sale_price(product: dict) -> Optional[float]:
+    """
+    Price the customer pays (purchase + shipping), not MRP (stroked_price, unit_price).
+    """
+    landed = customer_landed_price(product)
+    if landed is not None:
+        return landed
+    if not isinstance(product, dict):
+        return None
+    pools: list[dict] = [product]
+    nested = product.get("data")
+    if isinstance(nested, dict):
+        pools.append(nested)
+    mrp_keys = ("stroked_price", "unit_price", "base_price", "mrp", "old_price")
     for pool in pools:
         for key in mrp_keys:
             v = _parse_price_number(pool.get(key))
             if v is not None and v > 0:
-                return v
+                return float(v)
     return None
 
 
@@ -125,7 +258,7 @@ def sync_product_cards_prices_from_rest_api(
         if color:
             params["color"] = color
         if category_id:
-            params["categories"] = str(category_id)
+            params["category"] = str(category_id)
         res = requests.get(_CATALOG_SEARCH_URL, params=params, timeout=12)
         if res.status_code != 200:
             return cards
@@ -160,6 +293,7 @@ def sync_product_cards_prices_from_rest_api(
 
 
 def fetch_api(endpoint, order_id, user_id=None):
+    _t0 = time.perf_counter()
     try:
         url = f"http://localhost:5000/{endpoint}/{order_id}"
         params = {}
@@ -169,6 +303,8 @@ def fetch_api(endpoint, order_id, user_id=None):
         return res.json() if res.status_code == 200 else None
     except:
         return None
+    finally:
+        _record_api_elapsed(_t0)
 
 
 def _normalize_color(text: str):
@@ -941,15 +1077,15 @@ def fetch_products_from_api(query, category_id=None, color=None, page=1):
     color_browse_only = bool(color and not meaningful_for_color_browse)
 
     try:
-        url = "https://welfogapi.welfog.com/api/v2/products/search"
         products_list = []
 
         def _do_search(extra_params):
             p = {"page": page or 1, "latitude": "", "longitude": ""}
-            p.update(extra_params)
-            r = requests.get(url, params=p, timeout=12)
-            d = r.json() if r.status_code == 200 else {}
-            return d.get("data") or []
+            p.update(extra_params or {})
+            cat = p.pop("categories", None) or p.pop("category", None) or p.pop("category_id", None)
+            if cat is not None:
+                return _catalog_search_with_category(p, cat)
+            return _catalog_search_get(p)
 
         original_query_brands: list = []
         product_brand_match = False
@@ -973,17 +1109,16 @@ def fetch_products_from_api(query, category_id=None, color=None, page=1):
                 uniq.append(it)
             products_list = uniq
         else:
-            params = {"page": page or 1, "latitude": "", "longitude": ""}
+            params = {"page": page or 1}
             if clean_query.strip():
                 params["name"] = clean_query
-            if category_id:
-                params["categories"] = str(category_id)
             if color:
                 params["color"] = color
 
-            res = requests.get(url, params=params, timeout=12)
-            data = res.json() if res.status_code == 200 else {}
-            products_list = data.get("data", [])
+            if category_id:
+                products_list = _catalog_search_with_category(params, category_id)
+            else:
+                products_list = _catalog_search_get(params)
 
             original_query_brands = list(query_brands)
             if query_brands and products_list:
@@ -1211,9 +1346,198 @@ _CATEGORY_BROWSE_FILLER = frozenset(
         "dikhe", "dikhaa", "dekho", "dekh", "batao", "btao", "bata", "btana", "batana",
         "chahiye", "chiye", "category", "categories", "ke", "ki", "ka", "ko", "se",
         "me", "in", "all", "saare", "saari", "sab", "want", "need", "give", "dena",
-        "lao", "la", "de", "do", "wale", "wali", "some", "any",
+        "lao", "la", "de", "do", "wale", "wali", "some", "any", "bhi", "also", "too",
+        "k", "pls", "yar", "yrr", "bhai", "na",
     }
 )
+
+# Common customer phrasing → normalized nav department names (top-level only).
+_NAV_DEPT_PHRASE_ALIASES: tuple[tuple[str, str], ...] = (
+    ("mens fashion", "men fashion"),
+    ("men s fashion", "men fashion"),
+    ("womens fashion", "women fashion"),
+    ("women s fashion", "women fashion"),
+    ("groceries", "home kitchen"),
+    ("grocery", "home kitchen"),
+    ("mobile phones", "electronics"),
+    ("mobile phone", "electronics"),
+    ("mobiles", "electronics"),
+    ("mobile", "electronics"),
+    ("home and kitchen", "home kitchen"),
+    ("home & kitchen", "home kitchen"),
+    ("men grooming", "men s grooming"),
+    ("mens grooming", "men s grooming"),
+)
+
+
+def _expand_category_query_text(text: str) -> str:
+    """Typo / Hinglish aliases before nav lookup — no API calls."""
+    t = _normalize_cat_name(text)
+    if not t:
+        return ""
+    t = re.sub(r"\bmens\b", "men", t)
+    t = re.sub(r"\bwomens\b", "women", t)
+    for src, dst in sorted(_NAV_DEPT_PHRASE_ALIASES, key=lambda x: -len(x[0])):
+        if src in t:
+            t = t.replace(src, dst)
+    return t
+
+
+def _message_has_product_search_filters(text: str) -> bool:
+    """True when the turn targets a specific product (brand, type, color, price…) — not dept browse."""
+    if not (text or "").strip():
+        return False
+    if _message_targets_specific_product(text):
+        return True
+    low = (text or "").lower()
+    words = set(re.findall(r"[a-z0-9]{2,}", low))
+    if words & PHONE_BRANDS:
+        return True
+    try:
+        from services.opensearch_products import (
+            _extract_price_bounds,
+            color_hue_mentioned_in_text,
+            normalize_color_fuzzy,
+        )
+
+        pmax, pmin = _extract_price_bounds(text, low)
+        if pmax is not None or pmin is not None:
+            return True
+        hue = normalize_color_fuzzy(low)
+        if hue and color_hue_mentioned_in_text(hue, low):
+            return True
+    except ImportError:
+        pass
+    if re.search(r"\bsku\b", low):
+        return True
+    return False
+
+
+_CATEGORY_BROWSE_SIGNALS = (
+    "dikhao", "dikha", "dikhe", "dikhaa", "dikha de", "dikha do", "dikhado",
+    "dekho", "dekh", "show", "list", "display", "browse", "explore",
+    "batao", "btao", "bata", "bta", "btana", "batana", "bta de", "bata de", "bta do",
+    "bhi bta", "bhi dikha", "bhi bata", "bhi show", "k bhi",
+    "chahiye", "chiye", "dena", "de do", "dede", "de de",
+    "lao", "la do", "bhejo", "send", "view", "see",
+    "puchh", "pooch", "puch", "bol", "bolo",
+    "product", "products", "item", "items", "samaan", "cheez",
+)
+
+
+def _message_has_browse_signals(text: str) -> bool:
+    tl = f" {(text or '').lower()} "
+    return any(s in tl for s in _CATEGORY_BROWSE_SIGNALS)
+
+
+def message_requests_category_browse(text: str) -> bool:
+    """True when user wants products from a named department (any language/style)."""
+    if not (text or "").strip():
+        return False
+    try:
+        from utils.helpers import _looks_like_browse_all_categories_message
+
+        if _looks_like_browse_all_categories_message(text):
+            return False
+    except ImportError:
+        pass
+    if _message_has_product_search_filters(text):
+        return False
+    if _user_explicitly_browses_category(text):
+        return True
+    if not _message_has_browse_signals(text):
+        return False
+    return bool(resolve_nav_category_id_fast(text))
+
+
+def resolve_nav_category_id_fast(text: str, ctx=None) -> Optional[str]:
+    """
+    Top-level Welfog nav departments only — one cached nav_cat API, no inner_categories fanout.
+  """
+    if not (text or "").strip():
+        return None
+    expanded = _expand_category_query_text(text)
+    explicit = _extract_explicit_category_id(expanded, ctx)
+    if explicit:
+        return explicit
+    nav_map = _get_nav_categories_map(ctx)
+    main_hint = _main_category_hint_from_text(expanded, ctx)
+    if main_hint and (
+        _user_explicitly_browses_category(text) or _message_has_browse_signals(text)
+    ):
+        return str(main_hint)
+    for candidate in _category_lookup_candidates(expanded):
+        if not candidate:
+            continue
+        for name, cid in sorted(nav_map.items(), key=lambda x: len(x[0]), reverse=True):
+            if name and name in candidate:
+                if not main_hint or _category_matches_main(str(cid), main_hint, {}, nav_map):
+                    return str(cid)
+        hit = _category_fuzzy_lookup(
+            candidate, nav_map, main_hint=main_hint, id_meta={}, nav_map=nav_map
+        )
+        if hit:
+            return str(hit)
+    if main_hint:
+        return str(main_hint)
+    return None
+
+
+def _resolve_inner_category_id(text: str, ctx=None) -> Optional[str]:
+    """Subcategory / inner tree — loads inner_categories (slower; cached)."""
+    t = _expand_category_query_text(text)
+    if not t:
+        return None
+    _, id_meta, _ = _get_inner_categories_flat_map(ctx)
+    nav_map = _get_nav_categories_map(ctx)
+    main_hint = _main_category_hint_from_text(t, ctx)
+    mapping = _get_combined_categories_map(ctx)
+    for candidate in _category_lookup_candidates(text):
+        hit = _category_fuzzy_lookup(
+            candidate,
+            mapping,
+            main_hint=main_hint,
+            id_meta=id_meta,
+            nav_map=nav_map,
+        )
+        if hit and not _should_ignore_wrong_covers_category(text, hit):
+            return hit
+    return None
+
+
+def resolve_category_browse_for_catalog(
+    text: str,
+    ctx=None,
+    *,
+    allow_inner_lookup: bool = True,
+) -> Optional[tuple[str, str]]:
+    """
+    Category-only or category-first browse — nav-fast first, inner tree only when needed.
+    Returns (category_id, product_search_query); empty query = whole department.
+    """
+    if not message_requests_category_browse(text):
+        return None
+    if _message_has_product_search_filters(text):
+        return None
+    cid = resolve_nav_category_id_fast(text, ctx)
+    if not cid and allow_inner_lookup and _user_explicitly_browses_category(text):
+        if ctx:
+            ensure_expanded_categories_map_for_ctx(ctx)
+        cid = _resolve_inner_category_id(text, ctx)
+    if not cid:
+        return None
+    if not is_top_level_main_category(cid, ctx) and not _user_explicitly_browses_category(text):
+        return None
+    sq = ""
+    if _message_targets_specific_product(text):
+        from utils.helpers import extract_product_search_query
+
+        sq = (extract_product_search_query(text, text, "") or "").strip()
+        if query_should_use_category_id_only(cid, sq or text, ctx):
+            sq = category_browse_search_name(cid, sq or text, ctx) or sq
+    else:
+        sq = category_browse_search_name(cid, text, ctx)
+    return str(cid), sq
 
 
 def _get_nav_categories_map(ctx=None, force_refresh: bool = False) -> dict:
@@ -1519,20 +1843,62 @@ def _get_inner_categories_flat_map(ctx=None, force_refresh: bool = False):
     flat = {}
     id_meta = {}
     by_main = {}
-    for mid in main_ids:
-        payload = fetch_inner_categories(mid)
-        main_name = id_to_main_name.get(mid, "")
-        f, m, tree = _flatten_inner_categories_payload(payload, mid, main_name)
-        flat.update(f)
-        id_meta.update(m)
-        if tree:
-            by_main[mid] = tree
+    if len(main_ids) <= 1:
+        for mid in main_ids:
+            payload = fetch_inner_categories(mid)
+            main_name = id_to_main_name.get(mid, "")
+            f, m, tree = _flatten_inner_categories_payload(payload, mid, main_name)
+            flat.update(f)
+            id_meta.update(m)
+            if tree:
+                by_main[mid] = tree
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        workers = min(6, max(2, len(main_ids)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(fetch_inner_categories, mid): mid for mid in main_ids
+            }
+            for fut in as_completed(futures):
+                mid = futures[fut]
+                try:
+                    payload = fut.result()
+                except Exception:
+                    payload = None
+                main_name = id_to_main_name.get(mid, "")
+                f, m, tree = _flatten_inner_categories_payload(payload, mid, main_name)
+                flat.update(f)
+                id_meta.update(m)
+                if tree:
+                    by_main[mid] = tree
 
     _innercat_cache["ts"] = now_ts
     _innercat_cache["flat"] = flat
     _innercat_cache["id_meta"] = id_meta
     _innercat_cache["by_main"] = by_main
     return flat, id_meta, by_main
+
+
+def warmup_welfog_category_caches(*, load_inner: bool = True) -> None:
+    """Preload nav + slug (+ optional inner tree) so first /chat category browse stays fast."""
+    import time as _time
+
+    from utils.reasoning_log import log_reasoning
+
+    t0 = _time.perf_counter()
+    _get_nav_categories_map()
+    _get_category_id_to_slug_map()
+    nav_ms = (_time.perf_counter() - t0) * 1000.0
+    inner_ms = 0.0
+    if load_inner:
+        t1 = _time.perf_counter()
+        _get_inner_categories_flat_map()
+        inner_ms = (_time.perf_counter() - t1) * 1000.0
+    log_reasoning(
+        f"Category cache warmup: nav+slug={nav_ms:.0f}ms"
+        + (f", inner={inner_ms:.0f}ms" if load_inner else " (inner skipped)")
+    )
 
 
 def _get_combined_categories_map(ctx=None, force_refresh: bool = False) -> dict:
@@ -1776,6 +2142,8 @@ def _category_fuzzy_lookup(input_text: str, mapping: dict, main_hint: str = None
     words = [w for w in input_text.split() if len(w) >= 4]
     names = list(mapping.keys())
     for w in words:
+        if w in PHONE_BRANDS or w in FASHION_BRANDS:
+            continue
         best = difflib.get_close_matches(w, names, n=5, cutoff=0.82)
         for hit in best:
             cid = str(mapping[hit])
@@ -1801,15 +2169,15 @@ def category_name_for_id(category_id: str, ctx=None) -> str:
     cid = str(category_id or "").strip()
     if not cid:
         return ""
+    for name, mapped in _get_nav_categories_map(ctx).items():
+        if mapped == cid:
+            return name.title() if name.islower() else name
     meta = category_meta_for_id(cid, ctx)
     if meta.get("name"):
         label = meta["name"]
         if meta.get("parent_name"):
             return f"{meta['parent_name']} — {label}"
         return label
-    for name, mapped in _get_nav_categories_map(ctx).items():
-        if mapped == cid:
-            return name.title() if name.islower() else name
     return ""
 
 
@@ -1828,6 +2196,9 @@ def query_should_use_category_id_only(category_id, query: str, ctx=None) -> bool
     stripped = _strip_message_for_category_lookup(q)
     if not stripped:
         return True
+    fast = resolve_nav_category_id_fast(stripped, ctx=ctx)
+    if fast:
+        return str(fast) == str(category_id)
     return get_category_id_from_text(stripped, ctx=ctx) == str(category_id)
 
 
@@ -1998,11 +2369,16 @@ def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]
     if prior:
         return str(prior)
 
+    if _message_has_product_search_filters(text):
+        return None
+
     cid = get_category_id_from_text(text, ctx)
     if not cid:
         return None
 
     if _text_requests_category_product_browse(text, ctx) or _user_explicitly_browses_category(text):
+        if _message_has_product_search_filters(text):
+            return None
         return cid
 
     if _message_targets_specific_product(text):
@@ -2019,33 +2395,7 @@ def resolve_category_product_browse_route(
     User wants products filtered by a Welfog category name (not the full category list).
     Returns (category_id, product_search_query) — empty query means category-only browse.
     """
-    from utils.helpers import _looks_like_browse_all_categories_message, _text_requests_category_product_browse
-
-    if not (text or "").strip():
-        return None
-    if _looks_like_browse_all_categories_message(text):
-        return None
-    if not (_text_requests_category_product_browse(text, ctx) or _user_explicitly_browses_category(text)):
-        return None
-
-    if ctx:
-        ensure_expanded_categories_map_for_ctx(ctx)
-
-    cid = get_category_id_from_text(text, ctx=ctx)
-    if not cid:
-        return None
-
-    sq = ""
-    if _message_targets_specific_product(text):
-        from utils.helpers import extract_product_search_query
-
-        sq = (extract_product_search_query(text, text, "") or "").strip()
-        if query_should_use_category_id_only(cid, sq or text, ctx):
-            sq = category_browse_search_name(cid, sq or text, ctx) or sq
-    else:
-        sq = category_browse_search_name(cid, text, ctx)
-
-    return str(cid), sq
+    return resolve_category_browse_for_catalog(text, ctx, allow_inner_lookup=True)
 
 
 def resolve_search_category_id(category_id: str, ctx=None) -> str:
@@ -2083,8 +2433,10 @@ def fetch_products_by_category_browse(category_id, ctx=None, page=1, color=None)
 
     for try_cid in try_ids:
         products = fetch_products_from_api("", category_id=try_cid, color=color, page=page)
-        if products:
-            log_reasoning(f"Category browse API hit categories={try_cid} ({len(products)} items).")
+        if products and _rest_category_filter_trustworthy(try_cid, products):
+            log_reasoning(
+                f"Category browse API hit category={try_cid} ({len(products)} items)."
+            )
             return products, try_cid
 
     label = category_name_for_id(cid, ctx) or category_name_for_id(search_cid, ctx)
@@ -2107,6 +2459,10 @@ def get_category_id_from_text(text: str, ctx=None):
     Returns category_id (string) if any top-level, inner parent, or subcategory name matches.
     Also accepts explicit ids present in nav / inner_categories (e.g. 1014, 10).
     """
+    fast = resolve_nav_category_id_fast(text, ctx)
+    if fast:
+        return fast
+
     explicit = _extract_explicit_category_id(text, ctx)
     if explicit:
         return explicit
@@ -2115,13 +2471,17 @@ def get_category_id_from_text(text: str, ctx=None):
     if main_hint and _user_explicitly_browses_category(text):
         return main_hint
 
-    t = _normalize_cat_name(text)
+    inner = _resolve_inner_category_id(text, ctx)
+    if inner:
+        return inner
+
+    t = _expand_category_query_text(text)
     if not t:
         return None
 
+    main_hint = _main_category_hint_from_text(t, ctx)
     _, id_meta, _ = _get_inner_categories_flat_map(ctx)
     nav_map = _get_nav_categories_map(ctx)
-    main_hint = _main_category_hint_from_text(text, ctx)
     mapping = _get_combined_categories_map(ctx)
     for candidate in _category_lookup_candidates(text):
         hit = _category_fuzzy_lookup(
@@ -2171,16 +2531,19 @@ def fetch_purchase_history(user_id, page=1):
         {"user_id": uid, "page": page},
     )
     last_err = None
+    timeout = _LIVE_ORDER_API_TIMEOUT_SEC
     for params in param_sets:
         try:
-            res = requests.get(url, params=params, timeout=8)
+            res = requests.get(url, params=params, timeout=timeout)
             if res.status_code == 200:
                 return res.json()
             last_err = res.status_code
         except Exception as e:
             last_err = e
+            if _is_transient_network_error(e):
+                break
             continue
-    print(f"⚠️ purchase-history failed last_err={last_err}", flush=True)
+    print(f"purchase-history failed last_err={last_err}", flush=True)
     return None
 
 
@@ -2894,7 +3257,7 @@ def _track_api_confirms_owner(data: dict) -> bool:
     return owner is not None
 
 
-def check_order_ownership(user_id: str, order_id: str, max_batches: int = 80) -> str:
+def check_order_ownership(user_id: str, order_id: str, max_batches: int = 8) -> str:
     """
     Purchase-history ownership check.
 
@@ -2943,39 +3306,43 @@ def check_order_ownership(user_id: str, order_id: str, max_batches: int = 80) ->
     return "unverified"
 
 
-def order_belongs_to_user(user_id: str, order_id: str, max_batches: int = 80) -> bool:
+def order_belongs_to_user(user_id: str, order_id: str, max_batches: int = 8) -> bool:
     return check_order_ownership(user_id, order_id, max_batches=max_batches) == "owned"
 
 
 def fetch_welfog_order_tracking(order_id: str, user_id=None):
     """Live order status from Welfog OneDelivery track API (POST JSON)."""
-    oid = _normalize_track_order_id(order_id)
-    if not oid:
-        return None
-    payload = {"order_id": oid}
-    uid = str(user_id or "").strip()
-    if _is_logged_in_customer_id(uid):
-        try:
-            payload["user_id"] = int(uid) if uid.isdigit() else uid
-        except ValueError:
-            payload["user_id"] = uid
+    _t0 = time.perf_counter()
     try:
-        res = requests.post(
-            WELFOG_TRACK_API_URL,
-            json=payload,
-            timeout=15,
-            headers={"Content-Type": "application/json", "Accept": "application/json"},
-        )
-        if res.status_code != 200:
+        oid = _normalize_track_order_id(order_id)
+        if not oid:
             return None
-        data = res.json()
-        if isinstance(data, dict) and data.get("result") == "ok":
-            return data
-    except Exception as e:
-        from utils.reasoning_log import log_reasoning
+        payload = {"order_id": oid}
+        uid = str(user_id or "").strip()
+        if _is_logged_in_customer_id(uid):
+            try:
+                payload["user_id"] = int(uid) if uid.isdigit() else uid
+            except ValueError:
+                payload["user_id"] = uid
+        try:
+            res = requests.post(
+                WELFOG_TRACK_API_URL,
+                json=payload,
+                timeout=15,
+                headers={"Content-Type": "application/json", "Accept": "application/json"},
+            )
+            if res.status_code != 200:
+                return None
+            data = res.json()
+            if isinstance(data, dict) and data.get("result") == "ok":
+                return data
+        except Exception as e:
+            from utils.reasoning_log import log_reasoning
 
-        log_reasoning(f"Order track API error: {e}")
-    return None
+            log_reasoning(f"Order track API error: {e}")
+        return None
+    finally:
+        _record_api_elapsed(_t0)
 
 
 def fetch_welfog_order_tracking_for_user(order_id: str, user_id: str):
@@ -3057,7 +3424,7 @@ def fetch_welfog_return_request(order_id: str):
     try:
         res = requests.get(
             url,
-            timeout=15,
+            timeout=_LIVE_ORDER_API_TIMEOUT_SEC,
             headers={"Accept": "application/json"},
         )
         if res.status_code != 200:
@@ -3434,7 +3801,7 @@ def _extract_ph_details_row(raw) -> Optional[dict]:
     return None
 
 
-def fetch_purchase_history_details(order_id: str, user_id=None):
+def fetch_purchase_history_details(order_id: str, user_id=None, *, fast: bool = False):
     """GET purchase-history-details for one order (ownership enforced server-side via user_id)."""
     oid = str(order_id or "").strip()
     uid = str(user_id or "").strip()
@@ -3443,11 +3810,14 @@ def fetch_purchase_history_details(order_id: str, user_id=None):
     url = f"{PH_DETAILS_API_BASE}/{oid}"
     param_sets = (
         {"user_id": uid},
+    ) if fast else (
+        {"user_id": uid},
         {"user_id": int(uid)} if uid.isdigit() else {"user_id": uid},
     )
+    timeout = _LIVE_ORDER_API_TIMEOUT_SEC if fast else 10
     for params in param_sets:
         try:
-            res = requests.get(url, params=params, timeout=10)
+            res = requests.get(url, params=params, timeout=timeout)
             if res.status_code in (401, 403, 404):
                 return None
             if res.status_code != 200:
@@ -3462,25 +3832,34 @@ def fetch_purchase_history_details(order_id: str, user_id=None):
             from utils.reasoning_log import log_reasoning
 
             log_reasoning(f"Order details API error: {e}")
+            if fast or _is_transient_network_error(e):
+                return None
             continue
     return None
 
 
-def fetch_purchase_history_details_for_user(order_id: str, user_id: str):
+def fetch_purchase_history_details_for_user(order_id: str, user_id: str, *, fast: bool = False):
     """
     Returns (row, error_code):
       error_code: None | 'login_required' | 'not_owned' | 'not_found'
     """
-    uid = str(user_id or "").strip()
-    if not _is_logged_in_customer_id(uid):
-        return None, "login_required"
-    row = fetch_purchase_history_details(order_id, user_id=uid)
-    if row:
-        row = _enrich_order_details_row(row, uid)
-        return row, None
-    if check_order_ownership(uid, order_id) == "not_owned":
-        return None, "not_owned"
-    return None, "not_found"
+    _t0 = time.perf_counter()
+    try:
+        uid = str(user_id or "").strip()
+        if not _is_logged_in_customer_id(uid):
+            return None, "login_required"
+        row = fetch_purchase_history_details(order_id, user_id=uid, fast=fast)
+        if row:
+            if not fast:
+                row = _enrich_order_details_row(row, uid)
+            return row, None
+        if fast:
+            return None, "not_found"
+        if check_order_ownership(uid, order_id, max_batches=3) == "not_owned":
+            return None, "not_owned"
+        return None, "not_found"
+    finally:
+        _record_api_elapsed(_t0)
 
 
 def _enrich_order_details_row(row: dict, user_id: str) -> dict:

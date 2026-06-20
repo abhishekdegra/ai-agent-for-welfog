@@ -16,6 +16,25 @@ def should_skip_catalog_for_conversational_turn(
     if not comb:
         return True
     try:
+        from services.conversation_scope import _has_definite_welfog_shopping_signal
+
+        if _has_definite_welfog_shopping_signal(comb):
+            return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import (
+            _is_light_smalltalk_fast,
+            _looks_like_greeting_message,
+        )
+
+        if _looks_like_greeting_message(original_msg or comb):
+            return True
+        if _is_light_smalltalk_fast(original_msg, msg_en):
+            return True
+    except ImportError:
+        pass
+    try:
         from services.conversation_followup import is_non_product_search_phrase
 
         if is_non_product_search_phrase(comb):

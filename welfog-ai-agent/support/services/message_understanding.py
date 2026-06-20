@@ -228,13 +228,19 @@ def apply_ai_route_corrections(
     )
     if isinstance(result, dict):
         try:
+            from services.account_list_semantics import account_list_route_is_locked
             from services.conversation_scope import turn_blocks_product_catalog
             from services.product_catalog_resolver import (
                 apply_product_catalog_to_route,
                 product_catalog_route_is_locked,
             )
 
-            if not turn_blocks_product_catalog(
+            skip_catalog_refresh = bool(
+                result.get("_universal_brain_route")
+                or account_list_route_is_locked(result)
+                or product_catalog_route_is_locked(result)
+            )
+            if not skip_catalog_refresh and not turn_blocks_product_catalog(
                 original_msg, msg_en, conversation_context, ai_route=result
             ):
                 refreshed = apply_product_catalog_to_route(
@@ -305,6 +311,52 @@ def _apply_ai_route_corrections_body(
     )
 
     comb = f"{original_msg} {msg_en}"
+
+    if out.get("_universal_brain_route"):
+        rh_pre = (out.get("route_handler") or "").strip().lower()
+        if rh_pre == "refund_status_api" or (out.get("order_lookup_kind") or "").strip().lower() == "refund_status":
+            out["_routing_corrections_done"] = True
+            log_reasoning("Universal brain: refund API locked — skip safety LLM stack.")
+            return out
+        try:
+            from services.account_list_semantics import account_list_route_is_locked
+
+            if account_list_route_is_locked(out):
+                out["_routing_corrections_done"] = True
+                log_reasoning(
+                    f"Universal brain: account-list locked "
+                    f"({out.get('account_list_kind')}) — skip safety LLM stack."
+                )
+                return out
+        except ImportError:
+            pass
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+
+            if product_catalog_route_is_locked(out):
+                out["_routing_corrections_done"] = True
+                log_reasoning("Universal brain: product catalog locked — skip safety LLM stack.")
+                return out
+        except ImportError:
+            pass
+        if (out.get("intent") or "").strip().lower() == "refund":
+            try:
+                from utils.helpers import _text_is_refund_return_status_lookup
+
+                if _text_is_refund_return_status_lookup(comb, conversation_context) and (
+                    extract_order_id(comb) or re.search(r"\b\d{6,}\b", comb)
+                ):
+                    out["data_channel"] = "live_api"
+                    out["route_handler"] = "refund_status_api"
+                    out["order_lookup_kind"] = "refund_status"
+                    out["needs_order_id"] = True
+                    out["numeric_context"] = "order_id"
+                    out["run_catalog_search"] = False
+                    out["_routing_corrections_done"] = True
+                    log_reasoning("Universal brain: refund + order id → live refund API.")
+                    return out
+            except ImportError:
+                pass
 
     promotions_done = bool(out.get("_turn_promotions_done"))
     try:
@@ -458,11 +510,19 @@ def _apply_ai_route_corrections_body(
     from utils.helpers import _text_is_refund_return_status_lookup
 
     pincode_delivery_locked = False
+    allow_pin_llm = not bool(out.get("_universal_brain_route"))
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+
+        if account_list_route_is_locked(out):
+            allow_pin_llm = False
+    except ImportError:
+        pass
     try:
         from services.location_delivery_resolver import pincode_delivery_route_is_locked
 
         pincode_delivery_locked = pincode_delivery_route_is_locked(
-            out, original_msg, msg_en, conversation_context, allow_llm=True
+            out, original_msg, msg_en, conversation_context, allow_llm=allow_pin_llm
         )
     except ImportError:
         pass

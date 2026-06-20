@@ -4,6 +4,7 @@ Thread-local so concurrent /chat requests stay isolated.
 """
 from __future__ import annotations
 
+import os
 import threading
 import time
 import uuid
@@ -12,6 +13,9 @@ from typing import Any, Optional
 from utils.reasoning_log import chat_log, log_reasoning
 
 _TLS = threading.local()
+
+MAX_LLM_CALLS_PER_TURN = int(os.getenv("CHAT_MAX_LLM_CALLS", "3") or "3")
+MAX_ROUTE_STEPS_PER_TURN = int(os.getenv("CHAT_MAX_ROUTE_STEPS", "16") or "16")
 
 
 def begin_chat_turn() -> str:
@@ -32,7 +36,49 @@ def begin_chat_turn() -> str:
     _TLS.routing_complete = False
     _TLS.brain_route_called = False
     _TLS.expanded_query_cache = None
+    _TLS.user_query = ""
+    _TLS.detected_language = ""
+    _TLS.source_used = ""
+    _TLS.phases: list[tuple[str, float]] = []
+    _TLS.api_time_ms = 0.0
+    _TLS.slowest_ms = 0.0
+    _TLS.slow_function = ""
+    _TLS.llm_budget_exceeded = False
+    _TLS.route_loop_guard = False
     return rid
+
+
+def record_phase(phase: str, duration_ms: float) -> None:
+    """Record wall time for a pipeline segment (ms). Tracks slowest for logs."""
+    name = (phase or "").strip()
+    if not name:
+        return
+    ms = max(0.0, float(duration_ms))
+    phases: list[tuple[str, float]] = getattr(_TLS, "phases", None) or []
+    phases.append((name, ms))
+    _TLS.phases = phases
+    if ms >= float(getattr(_TLS, "slowest_ms", 0.0) or 0.0):
+        _TLS.slowest_ms = ms
+        _TLS.slow_function = name
+
+
+def record_api_time(seconds: float) -> None:
+    _TLS.api_time_ms = float(getattr(_TLS, "api_time_ms", 0.0) or 0.0) + max(
+        0.0, float(seconds)
+    ) * 1000.0
+
+
+def phases_summary() -> str:
+    phases: list[tuple[str, float]] = getattr(_TLS, "phases", None) or []
+    if not phases:
+        return "-"
+    return ",".join(f"{n}:{ms:.0f}ms" for n, ms in phases[-8:])
+
+
+def record_user_query(original_msg: str, detected_language: str = "") -> None:
+    _TLS.user_query = (original_msg or "")[:300]
+    if detected_language:
+        _TLS.detected_language = detected_language.strip()
 
 
 def request_id() -> str:
@@ -49,6 +95,20 @@ def record_route_step(step: str) -> None:
         return
     hist.append(name)
     _TLS.route_history = hist
+    if len(hist) > MAX_ROUTE_STEPS_PER_TURN:
+        _TLS.route_loop_guard = True
+        mark_routing_complete()
+        log_reasoning(
+            f"Route step budget exceeded ({len(hist)}/{MAX_ROUTE_STEPS_PER_TURN}) — lock route."
+        )
+
+
+def route_loop_guard_active() -> bool:
+    return bool(getattr(_TLS, "route_loop_guard", False))
+
+
+def llm_budget_exceeded() -> bool:
+    return bool(getattr(_TLS, "llm_budget_exceeded", False))
 
 
 def route_history_str() -> str:
@@ -76,6 +136,31 @@ def get_cached_brain_route() -> dict | None:
     return dict(r) if isinstance(r, dict) else None
 
 
+def should_defer_micro_classifiers_to_brain() -> bool:
+    """
+    True while the universal brain route has not run this turn.
+    Micro-classifiers (KB-turn, refund, catalog-menu) must not fire before it.
+    """
+    if is_routing_complete():
+        return False
+    if getattr(_TLS, "brain_route_called", False):
+        return False
+    if get_cached_brain_route():
+        return False
+    return True
+
+
+def should_skip_micro_classifier_llm() -> bool:
+    """Skip duplicate micro-LLM classifiers once universal brain already classified the turn."""
+    if is_routing_complete():
+        return True
+    if getattr(_TLS, "brain_route_called", False):
+        return True
+    if get_cached_brain_route():
+        return True
+    return False
+
+
 def guard_duplicate_brain_route(caller: str = "ai_brain_route") -> dict | None:
     """
     Return cached ai_brain_route JSON if this turn already ran the main router.
@@ -98,6 +183,10 @@ def guard_duplicate_brain_route(caller: str = "ai_brain_route") -> dict | None:
 def store_turn_analysis(
     ai_route: dict | None,
     route_decision: Any = None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
 ) -> None:
     """Persist first AI routing result for reuse in the same HTTP request."""
     if isinstance(ai_route, dict):
@@ -121,10 +210,34 @@ def store_turn_analysis(
         source = source or (getattr(route_decision, "handler", None) or "").strip().lower()
         route_handler = (getattr(route_decision, "handler", None) or "").strip().lower()
         reason = reason or (getattr(route_decision, "reason", None) or "")[:300]
+        src_used = (getattr(route_decision, "source", None) or "").strip().lower()
+        if src_used:
+            _TLS.source_used = src_used
+            _TLS.final_source = src_used
     _TLS.route = route_handler or source
     _TLS.route_reason = reason
+    _TLS.entities = extract_turn_entities(
+        ai_route,
+        route_decision,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
     record_route(intent=intent, source=source)
     mark_routing_complete()
+    log_intent_routing(
+        detected_intent=intent,
+        selected_existing_tool=route_handler or source,
+        entities=_TLS.entities,
+        source_used=getattr(_TLS, "source_used", None) or (
+            getattr(route_decision, "source", None) if route_decision is not None else source
+        ),
+        reason=reason,
+    )
+    try:
+        _TLS.tool_called = route_handler or source
+    except Exception:
+        pass
 
 
 def get_stored_ai_route() -> dict | None:
@@ -163,9 +276,27 @@ def record_route(intent: str = "", source: str = "") -> None:
 
 
 def increment_llm_call(provider: str = "") -> None:
-    _TLS.llm_calls = int(getattr(_TLS, "llm_calls", 0) or 0) + 1
+    try:
+        from services.chat_resilience import touch_chat_turn_in_flight
+
+        touch_chat_turn_in_flight()
+    except ImportError:
+        pass
+    current = int(getattr(_TLS, "llm_calls", 0) or 0)
+    if current >= MAX_LLM_CALLS_PER_TURN:
+        _TLS.llm_budget_exceeded = True
+        log_reasoning(
+            f"LLM call budget exceeded ({current}/{MAX_LLM_CALLS_PER_TURN}) — skip further LLM."
+        )
+        return
+    _TLS.llm_calls = current + 1
     if provider:
         _TLS.last_provider = provider
+    if _TLS.llm_calls >= MAX_LLM_CALLS_PER_TURN:
+        _TLS.llm_budget_exceeded = True
+        log_reasoning(
+            f"LLM call budget reached ({_TLS.llm_calls}/{MAX_LLM_CALLS_PER_TURN})."
+        )
 
 
 def llm_calls_count() -> int:
@@ -177,6 +308,213 @@ def response_time_sec() -> float:
     if started is None:
         return 0.0
     return max(0.0, time.perf_counter() - float(started))
+
+
+def extract_turn_entities(
+    ai_route: dict | None = None,
+    route_decision: Any = None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict[str, str]:
+    """Pull order_id, pincode, product_id, search_query from route + message."""
+    entities: dict[str, str] = {}
+    r = ai_route if isinstance(ai_route, dict) else {}
+    if r.get("extracted_pincode"):
+        entities["pincode"] = str(r.get("extracted_pincode") or "").strip()
+    if r.get("extracted_order_id"):
+        entities["order_id"] = str(r.get("extracted_order_id") or "").strip()
+    sq = (r.get("search_query") or "").strip()
+    if sq:
+        entities["search_query"] = sq
+    if route_decision is not None:
+        rsq = (getattr(route_decision, "search_query", None) or "").strip()
+        if rsq and "search_query" not in entities:
+            entities["search_query"] = rsq
+    intent = (r.get("intent") or "").strip().lower()
+    channel = (r.get("data_channel") or "").strip().lower()
+    if intent == "product" and channel == "catalog" and entities.get("search_query"):
+        return {k: v for k, v in entities.items() if v}
+    needs_oid = bool(r.get("needs_order_id"))
+    numeric = (r.get("numeric_context") or "").strip().lower()
+    if not needs_oid and numeric not in ("order_id", "pincode", "product_id"):
+        if entities.get("search_query") or intent in ("general", "out_of_domain"):
+            return {k: v for k, v in entities.items() if v}
+    if not entities.get("order_id") or not entities.get("pincode"):
+        try:
+            from utils.helpers import extract_embedded_query_identifiers
+
+            ids = extract_embedded_query_identifiers(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=r,
+            )
+            if ids.get("order_id") and not entities.get("order_id"):
+                entities["order_id"] = str(ids["order_id"]).strip()
+            if ids.get("pincode") and not entities.get("pincode"):
+                entities["pincode"] = str(ids["pincode"]).strip()
+            if ids.get("product_id"):
+                entities["product_id"] = str(ids["product_id"]).strip()
+        except ImportError:
+            pass
+    return {k: v for k, v in entities.items() if v}
+
+
+def _entities_log_str(entities: dict[str, str]) -> str:
+    if not entities:
+        return "-"
+    parts = [f"{k}={v}" for k, v in sorted(entities.items())]
+    return ",".join(parts)
+
+
+def log_intent_routing(
+    *,
+    detected_intent: str = "",
+    selected_existing_tool: str = "",
+    entities: dict[str, str] | None = None,
+    source_used: str = "",
+    response_time: float | None = None,
+    reason: str = "",
+    extra: str = "",
+) -> None:
+    """Production routing log: intent → existing tool → entities → source."""
+    intent_f = (detected_intent or getattr(_TLS, "intent", "") or "-").strip().lower() or "-"
+    tool_f = (
+        selected_existing_tool
+        or getattr(_TLS, "route", "")
+        or getattr(_TLS, "source", "")
+        or "-"
+    ).strip().lower() or "-"
+    source_f = (source_used or getattr(_TLS, "source", "") or tool_f or "-").strip().lower() or "-"
+    ent = entities if entities is not None else getattr(_TLS, "entities", None) or {}
+    ent_s = _entities_log_str(ent if isinstance(ent, dict) else {})
+    elapsed = response_time if response_time is not None else response_time_sec()
+    reason_f = (reason or getattr(_TLS, "route_reason", "") or "-").strip()
+    if len(reason_f) > 120:
+        reason_f = reason_f[:117] + "..."
+    rid = request_id()
+    msg = (
+        f"[intent-routing] request_id={rid} detected_intent={intent_f} "
+        f"selected_existing_tool={tool_f} entities={ent_s} "
+        f"source_used={source_f} response_time={elapsed:.2f}s "
+        f"reason={reason_f!r}"
+    )
+    if extra:
+        msg += f" {extra}"
+    log_reasoning(msg)
+    chat_log(msg)
+
+
+def record_timeout_point(point: str) -> None:
+    _TLS.timeout_point = (point or "").strip() or "-"
+
+
+def log_pipeline_complete(
+    *,
+    user_query: str = "",
+    detected_language: str = "",
+    confidence: float | None = None,
+    final_source: str = "",
+) -> None:
+    """Full pipeline summary log for production debugging."""
+    rid = request_id()
+    intent_f = (getattr(_TLS, "intent", "") or "-").strip().lower() or "-"
+    route_f = (getattr(_TLS, "route", "") or "-").strip().lower() or "-"
+    tool_f = route_f
+    src_f = (
+        final_source
+        or getattr(_TLS, "source_used", None)
+        or getattr(_TLS, "source", "")
+        or "-"
+    ).strip().lower() or "-"
+    ent_s = _entities_log_str(getattr(_TLS, "entities", None) or {})
+    elapsed = response_time_sec()
+    calls = llm_calls_count()
+    conf = confidence
+    if conf is None:
+        conf = float(getattr(_TLS, "scope_confidence", 0.0) or 0.0)
+    conf_s = f"{conf:.2f}" if conf else "-"
+    q = (user_query or getattr(_TLS, "user_query", "") or "-")[:120]
+    lang_f = (detected_language or getattr(_TLS, "detected_language", "") or "-").strip() or "-"
+    timeout_pt = (getattr(_TLS, "timeout_point", "") or "-").strip() or "-"
+    api_ms = float(getattr(_TLS, "api_time_ms", 0.0) or 0.0)
+    slow_fn = (getattr(_TLS, "slow_function", "") or "-").strip() or "-"
+    phase_s = phases_summary()
+    msg = (
+        f"[pipeline] request_id={rid} query={q!r} language={lang_f} "
+        f"intent={intent_f} confidence={conf_s} selected_route={route_f} "
+        f"tool_used={tool_f} entities={ent_s} source={src_f} "
+        f"llm_call_count={calls} api_time={api_ms / 1000.0:.2f}s "
+        f"total_time={elapsed:.2f}s slow_function={slow_fn} phases={phase_s} "
+        f"timeout_point={timeout_pt}"
+    )
+    log_reasoning(msg)
+    chat_log(msg)
+
+
+def log_order_dispatch(
+    *,
+    message: str = "",
+    detected_intent: str = "",
+    detected_language: str = "",
+    previous_context: str = "",
+    previous_context_used: bool = False,
+    pending_action: str = "",
+    order_id_found: str = "",
+    selected_tool: str = "",
+    api_called: bool = False,
+    api_time_ms: float = 0.0,
+    entities: dict | None = None,
+) -> None:
+    """Production order-flow log: intent → pending action → tool → API."""
+    try:
+        record_route_step("order_live_dispatch")
+        if detected_intent:
+            record_route(intent=detected_intent, source=selected_tool or "order_live")
+        mark_routing_complete()
+    except Exception:
+        pass
+    entity_map: dict[str, str] = dict(entities or {})
+    if order_id_found:
+        entity_map.setdefault("order_id", order_id_found)
+    if pending_action:
+        entity_map.setdefault("pending_action", pending_action)
+    prev_snip = (previous_context or "").strip().replace("\n", " ")[:120]
+    msg_snip = (message or "").strip().replace("\n", " ")[:120]
+    entities_s = ",".join(f"{k}={v}" for k, v in entity_map.items()) or "-"
+    ctx_used = previous_context_used or bool(prev_snip)
+    extra = (
+        f"message={msg_snip or '-'} "
+        f"detected_language={detected_language or '-'} "
+        f"entities={entities_s} "
+        f"previous_context_used={ctx_used} "
+        f"previous_context={prev_snip or '-'} "
+        f"pending_action={pending_action or '-'} "
+        f"order_id_found={order_id_found or '-'} "
+        f"api_called={api_called} api_time_ms={api_time_ms:.0f} "
+        f"llm_call_count={llm_calls_count()}"
+    )
+    log_intent_routing(
+        detected_intent=detected_intent or "-",
+        selected_existing_tool=selected_tool or "-",
+        entities=entity_map,
+        source_used="brain_direct_order" if api_called else "order_pending",
+        response_time=response_time_sec(),
+        reason="Order live dispatch",
+        extra=extra,
+    )
+    log_reasoning(
+        f"[order-flow] detected_intent={detected_intent or '-'} "
+        f"detected_language={detected_language or '-'} "
+        f"entities={entities_s} "
+        f"previous_context_used={ctx_used} "
+        f"selected_tool={selected_tool or '-'} "
+        f"api_time_ms={api_time_ms:.0f} "
+        f"total_time={response_time_sec():.2f}s "
+        f"api_called={api_called} llm_call_count={llm_calls_count()}"
+    )
 
 
 def log_turn_complete(
@@ -213,6 +551,15 @@ def log_turn_complete(
         msg += f" {extra}"
     log_reasoning(msg)
     chat_log(msg)
+    log_intent_routing(
+        detected_intent=intent_f,
+        selected_existing_tool=route_f,
+        entities=getattr(_TLS, "entities", None),
+        source_used=getattr(_TLS, "source_used", None) or source_f,
+        response_time=elapsed,
+        reason=reason_f,
+        extra=f"llm_calls={calls} route_history={hist} skipped_steps={skipped}",
+    )
 
 
 def ai_route_already_decided(ai_route: dict | None) -> bool:

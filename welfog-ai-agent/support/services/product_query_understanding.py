@@ -88,10 +88,10 @@ _FILLER_WORDS = frozenset(
         "he", "ho", "hun", "kya", "ky", "ka", "ke", "ki", "se", "liye", "wala", "wali", "wale",
         "ek", "koi", "kuch", "bas", "sirf", "only", "show", "need", "want", "buy", "lenaa",
         "lena", "pahan", "pahanna", "pehen", "pehenne", "peene", "peena", "khane", "khana",
-        "to", "yrr", "yr", "yrrr", "bro", "bhaiy", "pls", "aur", "and", "or", "the", "a", "an",
+        "to", "yrr", "yr", "yrrr", "yar", "yaar", "bro", "bhaiy", "pls", "aur", "and", "or", "the", "a", "an",
         "hello", "helo", "hey", "sun", "suno", "na", "ab", "wo", "wahi", "pehle", "pasand",
         "kiya", "tha", "laga", "achha", "accha", "achhe", "bahut", "bhi", "badiya", "badhiya",
-        "sa", "saa", "liked", "like", "lagta", "lagti",
+        "sa", "saa", "liked", "like", "lagta", "lagti", "jaldi", "please", "plz", "kindly",
         "color", "colour", "rang", "size", "sizes", "product", "products",
         "girlfriend", "boyfriend", "meri", "mera", "mere", "gf", "bf", "wife", "husband",
         "offtopic", "topic", "kese", "kaise", "ese", "galat", "wrong", "theek", "complaint",
@@ -245,6 +245,49 @@ def clean_product_part_label(text: str, original_msg: str = "") -> str:
     return polish_search_terms(text, original_msg)
 
 
+def resolve_catalog_search_terms_for_message(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    ai_route: dict | None = None,
+) -> str:
+    """
+    Semantic catalog search terms for structural / locked product turns.
+    Uses shared filler tables + focused-query parsing — not ad-hoc keyword regex in routes.
+    Works across Hinglish, English, typos, and long roundabout asks.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+
+    focused = extract_focused_product_query(original_msg, msg_en)
+    if focused and len(focused.strip()) >= 2:
+        return focused.strip()
+
+    polished = clean_product_part_label(
+        polish_search_terms(comb, original_msg),
+        original_msg,
+    )
+    if polished and len(polished.strip()) >= 2:
+        return polished.strip()
+
+    try:
+        from utils.helpers import extract_product_search_query
+
+        route = ai_route if isinstance(ai_route, dict) else {
+            "intent": "product",
+            "data_channel": "catalog",
+            "run_catalog_search": True,
+            "_product_catalog_locked": True,
+        }
+        sq = extract_product_search_query(original_msg, msg_en, ai_route=route)
+        if sq and len(str(sq).strip()) >= 2:
+            return str(sq).strip()
+    except ImportError:
+        pass
+    return ""
+
+
 def dedupe_search_terms(text: str) -> str:
     """Remove repeated tokens and filler (shirt shirt -> shirt)."""
     if not text:
@@ -369,6 +412,9 @@ Return ONLY valid JSON:
   "product_type": "cover|shirt|rice|... or empty",
   "max_price": number or null,
   "min_price": number or null,
+  "rating_min": number or null,
+  "rating_max": number or null,
+  "pro_id": number or null,
   "sku": "SKU code if user pasted one else empty",
   "match_mode": "strict" | "universal",
   "is_shopping": true/false
@@ -386,6 +432,9 @@ RULES:
 - match_mode strict when brand/model in search_terms (iphone cover, redmi cover); universal for generic charger/rice/shirt only.
 - If user only asks about orders/tracking/refund with NO product to buy, is_shopping=false and search_terms="".
 - If unsure of product, put best guess in search_terms (2-4 words max).
+- max_price / min_price → customer purchase price (NOT MRP/unit_price). Use for rs/budget/range only.
+- rating_min / rating_max for star filters (e.g. rating > 2 → rating_min=2, under 3 stars → rating_max=3).
+- pro_id when user gives numeric product id (2615316 is product id) — set pro_id, search_terms="".
 - {language_reply_instruction(reply_lang)}
 JSON only."""
 
@@ -447,7 +496,13 @@ def _message_has_multi_product_intent(msg: str) -> bool:
         return False
 
 
-def sanitize_llm_color(color: str, search_terms: str, original_msg: str) -> Optional[str]:
+def sanitize_llm_color(
+    color: str,
+    search_terms: str,
+    original_msg: str,
+    *,
+    trust_llm: bool = False,
+) -> Optional[str]:
     """Reject LLM colour noise; map Hinglish colour words safely."""
     from services.opensearch_products import normalize_color_fuzzy
 
@@ -462,6 +517,8 @@ def sanitize_llm_color(color: str, search_terms: str, original_msg: str) -> Opti
         resolved = normalize_color_fuzzy(original_msg)
     if resolved and resolved in _CATALOG_COLORS:
         return resolved
+    if trust_llm and c and len(c) <= 28 and re.match(r"^[A-Za-z][A-Za-z\s\-]*$", c):
+        return c if " " in c else c.title()
     if resolved in ("White", "Black") and ("aasmani" in blob or "asmani" in blob):
         return "Sky Blue"
     return resolved if resolved in _CATALOG_COLORS else None
@@ -500,6 +557,19 @@ def merge_llm_into_search_spec(
     if llm.get("sku") and not spec.get("sku"):
         spec["sku"] = llm.get("sku")
     try:
+        if llm.get("pro_id") is not None and not spec.get("pro_id"):
+            spec["pro_id"] = int(llm["pro_id"])
+            spec["title_query"] = ""
+    except (TypeError, ValueError):
+        pass
+    try:
+        if llm.get("rating_min") is not None and spec.get("rating_min") is None:
+            spec["rating_min"] = float(llm["rating_min"])
+        if llm.get("rating_max") is not None and spec.get("rating_max") is None:
+            spec["rating_max"] = float(llm["rating_max"])
+    except (TypeError, ValueError):
+        pass
+    try:
         if llm.get("max_price") is not None and spec.get("purchase_price_max") is None:
             spec["purchase_price_max"] = float(llm["max_price"])
         if llm.get("min_price") is not None and spec.get("purchase_price_min") is None:
@@ -520,61 +590,99 @@ def understand_product_query(
     pro_id=None,
 ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
     """
-    Full pipeline: LLM understand + heuristic parse merged.
-    Returns (opensearch_spec, llm_raw).
+    AI-first OpenSearch spec — one product-search LLM understands filters in any language;
+    heuristics only when the model is unavailable.
     """
-    from services.opensearch_products import build_product_search_spec, normalize_color_fuzzy
+    from services.opensearch_products import build_catalog_search_spec
 
-    focused = extract_focused_product_query(original_msg, msg_en)
+    llm: Optional[dict[str, Any]] = None
+    ai_payload: Optional[dict[str, Any]] = None
 
-    llm = ai_extract_product_search(
-        original_msg, msg_en, "", reply_lang
-    )
-    hint = ""
-    if llm and llm.get("search_terms"):
-        hint = llm["search_terms"]
-        if is_noisy_search_query(hint) and focused:
-            hint = focused
-    elif focused:
-        hint = focused
-    elif not is_noisy_search_query(msg_en):
-        hint = dedupe_search_terms(msg_en)
+    try:
+        from services.product_search_flow import (
+            _merge_product_requests,
+            _request_dict_to_ai_understanding,
+            ai_understand_product_search,
+        )
 
-    llm_color = sanitize_llm_color(
-        str((llm or {}).get("color") or ""),
-        hint,
-        original_msg,
-    )
-    merged_color = color or llm_color
-    if not merged_color:
-        merged_color = normalize_color_fuzzy(f"{original_msg} {msg_en}")
-        merged_color = sanitize_llm_color(merged_color or "", hint, original_msg)
+        llm = ai_understand_product_search(
+            original_msg,
+            conversation_context,
+            reply_lang,
+        )
+        if llm and llm.get("action") != "not_shopping" and llm.get("is_shopping", True):
+            ai_payload = dict(llm)
+            ai_payload["_ai_first"] = True
+            ai_payload["is_shopping"] = True
 
-    spec = build_product_search_spec(
+            requests = llm.get("product_requests")
+            if isinstance(requests, list) and len(requests) >= 2:
+                merged_req = _merge_product_requests(requests)
+                for k, v in _request_dict_to_ai_understanding(merged_req).items():
+                    if v not in (None, "", []):
+                        ai_payload[k] = v
+            elif isinstance(requests, list) and len(requests) == 1:
+                for k, v in _request_dict_to_ai_understanding(requests[0]).items():
+                    if v not in (None, "", []):
+                        ai_payload[k] = v
+    except ImportError:
+        pass
+
+    if not ai_payload:
+        try:
+            ai_payload = ai_extract_product_search(
+                original_msg, msg_en, conversation_context, reply_lang
+            )
+            if ai_payload:
+                ai_payload["_ai_first"] = True
+        except Exception:
+            ai_payload = None
+
+    try:
+        from services.product_filter_pipeline import apply_understanding_sku_pro_id_fixes
+
+        if ai_payload:
+            ai_payload = apply_understanding_sku_pro_id_fixes(
+                ai_payload, original_msg, msg_en
+            ) or ai_payload
+        else:
+            gap = apply_understanding_sku_pro_id_fixes({}, original_msg, msg_en)
+            if gap and (
+                gap.get("search_terms")
+                or gap.get("pro_id")
+                or gap.get("sku")
+                or gap.get("mandatory_match_tokens")
+            ):
+                ai_payload = gap
+                ai_payload["_ai_first"] = True
+    except ImportError:
+        pass
+
+    try:
+        from services.catalog_spec_semantics import scrub_ai_product_understanding
+
+        if ai_payload:
+            ai_payload = scrub_ai_product_understanding(
+                ai_payload, original_msg, msg_en
+            ) or ai_payload
+    except ImportError:
+        pass
+
+    spec = build_catalog_search_spec(
         original_msg,
         msg_en,
+        ai=ai_payload,
         category_id=category_id,
-        color=merged_color,
-        title_hint=hint,
+        color=color or (ai_payload or {}).get("color"),
         pro_id=pro_id,
     )
-    spec = merge_llm_into_search_spec(spec, llm, original_msg)
-    if spec.get("color"):
-        c = sanitize_llm_color(str(spec["color"]), spec.get("title_query") or "", original_msg)
-        if c:
-            spec["color"] = c
-        else:
-            spec.pop("color", None)
-    if llm and llm.get("search_terms"):
-        terms = polish_search_terms(llm["search_terms"], original_msg)
-        if is_noisy_search_query(terms) and focused:
-            terms = focused
-        spec["title_query"] = terms
-    if spec.get("title_query"):
-        spec["title_query"] = clean_product_part_label(spec["title_query"], original_msg)
-    elif focused:
-        spec["title_query"] = focused
-    return spec, llm
+
+    if ai_payload and spec.get("title_query"):
+        spec["title_query"] = clean_product_part_label(
+            spec["title_query"], original_msg
+        )
+
+    return spec, llm or ai_payload
 
 
 def display_label_for_product_search(
@@ -583,10 +691,18 @@ def display_label_for_product_search(
     original_msg: str = "",
 ) -> str:
     """Clean label for chat replies — always like 'basmati wheat', never 'gehu dikhana wheat'."""
+    label = ""
     if llm and llm.get("search_terms"):
-        label = clean_product_part_label(polish_search_terms(llm["search_terms"], original_msg), original_msg)
-    else:
+        st = str(llm["search_terms"]).strip().lower()
+        if st not in ("products", "product", ""):
+            label = clean_product_part_label(
+                polish_search_terms(llm["search_terms"], original_msg), original_msg
+            )
+    if not label:
         label = clean_product_part_label(spec.get("title_query") or "", original_msg)
+    if (not label or label.lower() in ("products", "product")) and spec.get("brand"):
+        tq = clean_product_part_label(spec.get("title_query") or "cover", original_msg)
+        label = f"{spec['brand']} {tq}".strip()
     if not label:
         return "your search"
     extras = []
@@ -615,12 +731,28 @@ def display_label_for_product_search(
     if spec.get("rating_max") is not None:
         extras.append(f"rating under {spec['rating_max']} stars")
     color = (spec.get("color") or "").strip()
-    if color and color.lower() not in label.lower():
-        label = f"{color} {label}"
+    if color:
+        cl = color.lower()
+        label_low = label.lower()
+        color_in_label = cl in label_low
+        if not color_in_label and cl in ("grey", "gray"):
+            color_in_label = "grey" in label_low or "gray" in label_low
+        if not color_in_label:
+            label = f"{color} {label}"
     if spec.get("brand"):
-        bl = str(spec["brand"]).strip().lower()
+        try:
+            from services.product_catalog_resolver import sanitize_catalog_brand
+
+            clean_brand = sanitize_catalog_brand(
+                str(spec.get("brand") or ""),
+                product_name=str(spec.get("title_query") or ""),
+                explicit_from_brain=True,
+            )
+        except ImportError:
+            clean_brand = str(spec.get("brand") or "").strip()
+        bl = clean_brand.strip().lower()
         if bl and bl not in label.lower().split():
-            extras.append(f"{spec['brand']} brand")
+            extras.append(f"{clean_brand} brand")
     if extras:
         return f"{label} ({', '.join(extras)})"
     return label

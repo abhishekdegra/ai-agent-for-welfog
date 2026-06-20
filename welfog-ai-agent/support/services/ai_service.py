@@ -87,19 +87,43 @@ def _llm_provider_chain() -> list[dict]:
     return get_llm_provider_chain()
 
 
-def _llm_routing_provider_chain() -> list[dict]:
-    """Routing: prefer Groq directly (skip admin DB lookup on hot path)."""
-    primary = (os.getenv("PRIMARY_AI_PROVIDER") or "groq").strip().lower()
-    if primary in ("groq", "grok"):
-        try:
-            from services.llm_providers import _try_groq_cloud
+def _llm_classifier_provider_chain() -> list[dict]:
+    """
+    JSON classifiers / routing: env chain (LLM_PROVIDER_ORDER), capped for latency.
+    Set LLM_CLASSIFIER_MAX_PROVIDERS=4 in .env to try all keys; default 2 (groq→openai).
+    """
+    from services.llm_providers import get_configured_provider_chain
 
-            spec = _try_groq_cloud()
-            if spec:
-                return [spec]
-        except Exception:
-            pass
-    return _llm_provider_chain()
+    chain = get_configured_provider_chain()
+    cap_default = (
+        "4"
+        if (os.getenv("STRICT_LLM_FAILSAFE", "") or "").strip().lower()
+        in ("1", "true", "yes", "on")
+        else "2"
+    )
+    cap = max(1, min(4, int(os.getenv("LLM_CLASSIFIER_MAX_PROVIDERS", cap_default) or cap_default)))
+    return chain[:cap] if chain else []
+
+
+def _llm_routing_provider_chain() -> list[dict]:
+    """
+    ai_brain_route — try full env chain (groq→openai→gemini→deepseek by default).
+    LLM_ROUTING_MAX_PROVIDERS caps how many keys to try (default 4 = all configured).
+    """
+    from services.llm_providers import get_configured_provider_chain
+
+    chain = get_configured_provider_chain()
+    cap = max(1, min(4, int(os.getenv("LLM_ROUTING_MAX_PROVIDERS", "4") or "4")))
+    prefer_groq = (os.getenv("LLM_ROUTING_PREFER_GROQ", "1") or "1").strip().lower() not in (
+        "0",
+        "false",
+        "no",
+    )
+    if prefer_groq and chain:
+        groq = [p for p in chain if (p.get("name") or "").strip().lower() == "groq"]
+        rest = [p for p in chain if (p.get("name") or "").strip().lower() != "groq"]
+        chain = groq + rest if groq else list(chain)
+    return chain[:cap] if chain else []
 
 
 def _llm_json_with_provider_fallback(
@@ -168,14 +192,33 @@ Customer-facing knowledge keys (kb_keys when intent needs KB):
 
 JSON SCHEMA (LATEST USER MESSAGE ONLY):
 {{
-  "user_meaning": "One sentence: what the customer wants THIS turn (English, for logs).",
+  "user_meaning": "One clear English sentence: what the customer wants THIS turn (never copy their message verbatim).",
   "reasoning": "Why you chose intent/channel — short English paragraph.",
   "intent": "product" | "order" | "order_history" | "wishlist" | "refund" | "payment" | "seller" | "pincode_check" | "deals" | "categories" | "category_feed" | "general" | "out_of_domain",
   "data_channel": "live_api" | "catalog" | "kb" | "none",
   "run_catalog_search": true/false,
   "meta_kind": "none" | "hostile" | "bot_latency" | "topic_denial" | "wrong_search_complaint" | "conversational" | "assistant_intro",
   "kb_keys": ["keys for KB answers only — empty if live_api/catalog handles it"],
-  "search_query": "2-6 English product keywords ONLY when run_catalog_search=true, else empty",
+  "search_query": "English PRODUCT TYPE only (2-6 words) when run_catalog_search=true — jeans, mobile cover, iphone, pajama. NEVER brand/color/price/time words. Must match product_entities.product_name. Empty when not shopping.",
+  "product_entities": {{
+    "product_name": "English product type to search (mobile cover, jeans, iphone, water bottle) — no brand/color/price",
+    "brand": "Brand if mentioned (Redmi, Nike, Apple) else empty",
+    "color": "Color if mentioned (black, blue) else empty",
+    "size": "Size if mentioned (S, M, L, kids) else empty",
+    "price_min": null,
+    "price_max": null,
+    "rating_min": null,
+    "sku": "Exact SKU preserving hyphens (Xiaomi-SK) or empty",
+    "product_id": "Numeric Welfog product id when user gave pro_id/product id, else empty",
+    "product_intent": "device or accessory or general",
+    "allow_related_fallback": true,
+    "related_search_terms": "English fallback product type if device absent, else empty string",
+    "exclude_title_tokens": ["optional English title words to exclude for this query"],
+    "mandatory_match_tokens": ["optional English title tokens required for this query"]
+  }},
+  "category_browse": "English Welfog department name when user browses a whole category (electronics, men fashion, women fashion, beauty, home kitchen) — empty if not category browse",
+  "category_id": "numeric Welfog top-level category id when known, else empty",
+  "category_only_browse": true when user wants products from a department without naming a specific product/model/SKU,
   "extracted_pincode": "6-digit PIN if pincode_check, else empty",
   "needs_order_id": true/false,
   "is_welfog_related": true/false,
@@ -186,28 +229,65 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain" | "harm_sensitive",
   "scope_reply": "For general_chitchat/out_of_domain/harm_sensitive: 2-5 sentences in customer language (harm=empathetic safety, no KB/legal). Empty when welfog_support.",
   "account_list_kind": "none" | "wishlist_in_chat" | "wishlist_howto" | "purchase_history_in_chat" | "purchase_history_howto",
-  "order_lookup_kind": "none" | "track" | "details" | "invoice" | "refund_status"
+  "order_lookup_kind": "none" | "track" | "details" | "invoice" | "refund_status",
+  "field_focus": "timeline" | "summary" | "payment" | "product" | "delivery" | "status" | "invoice" | "",
+  "route_handler": "order_tracking_api" | "order_details_api" | "refund_status_api" | "order_history_api" | "wishlist_api" | "pincode_delivery_api" | "" 
 }}
 
 CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
-- Any Indian language / Hinglish / typos — infer topic by meaning.
+- Any Indian language / Hinglish / typos / slang — YOU understand meaning. Write user_meaning as one clear English sentence. NEVER echo the customer message word-for-word.
+- Backend routes ONLY from your JSON (intent, data_channel, order_lookup_kind, route_handler, field_focus, kb_keys) — there is NO keyword fallback on customer text. If a field is wrong or missing, the wrong API runs.
+- ORDER SUB-INTENT (critical — customer ANY language/style; YOU decide; backend trusts your JSON only):
+  * details → order_lookup_kind=details, route_handler=order_details_api
+  * track → order_lookup_kind=track, route_handler=order_tracking_api
+  * invoice → order_lookup_kind=invoice, route_handler=order_details_api
+  * refund_status → order_lookup_kind=refund_status, route_handler=refund_status_api
+  ALWAYS set BOTH order_lookup_kind AND route_handler when needs_order_id=true for one order.
+  MANDATORY: when intent=order and needs_order_id=true you MUST set order_lookup_kind (never leave none). data_channel MUST be live_api (never "order"). Put sub-intent in order_lookup_kind — NOT in conversation_scope (never conversation_scope=order_details).
+  details = full order info (items/payment/address/amount). track = shipment/ETA/courier only. Never confuse them.
+  field_focus when order_lookup_kind=details: delivery (shipping address on order), payment, product, summary, status. field_focus=timeline only for track.
+  Typos / Hinglish / voice-to-text: involve/invoce/invois/bill/chalan/maang rha + order id → invoice (NOT track).
 - Full purchase list IN CHAT ("show me my order history", "you show orders", any language) → intent=order_history, account_list_kind=purchase_history_in_chat, data_channel=live_api, needs_order_id=false. NOT faqs.txt how-to steps.
 - HOW/WHERE to open order history in the app only (steps, navigation) → account_list_kind=purchase_history_howto, data_channel=kb, route order_history_howto — NOT purchase-history API.
 - ONE order: set order_lookup_kind — track (ETA/shipment/courier), details (payment/product/summary), invoice (bill/receipt download), refund_status (MY refund/return status for one order). Match intent=order/refund/payment, needs_order_id=true, numeric_context=order_id.
 - Personal refund/return status for ONE order (any language, any wording) → intent=refund, order_lookup_kind=refund_status, data_channel=live_api, needs_order_id=true. NOT general refund policy KB.
 - General refund policy / how to return / refund time / process (no personal order status) → intent=refund or general, data_channel=kb, kb_keys include refund — NOT return-request API.
 - Infer personal refund status vs policy from user_meaning — do NOT match fixed Hindi/English keyword lists in the customer message.
-- ONE order track/shipment timeline → order_lookup_kind=track. Invoice/bill/receipt/GST → invoice (NOT track). Payment/amount/total/product/address on ONE order → order_lookup_kind=details (NOT order_history list, NOT track).
+- ONE order track/shipment timeline → order_lookup_kind=track, field_focus=timeline. Invoice/bill/receipt/GST → invoice (NOT track). Payment/amount/total/product on ONE order → order_lookup_kind=details with matching field_focus (NOT order_history list, NOT track).
+- Shipping/delivery ADDRESS already saved on an existing order (any language: address kya laga / konsa address / pata kya tha / which address on order) → order_lookup_kind=details, field_focus=delivery, route_handler=order_details_api, needs_order_id=true. NOT order_lookup_kind=track, NOT pincode_check (pincode_check is only for whether Welfog delivers to an area before ordering).
 - "Order ID: 12345 invoice/refund/address/amount" → set order_lookup_kind from what they asked (invoice/refund_status/details), NOT track, NOT purchase_history_in_chat.
-- Saved/liked products IN CHAT ("meri wishlist dikhao", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api. NOT pincode or catalog.
+- Saved/liked products IN CHAT ("meri wishlist dikhao", "meri pasand ki cheezein", "saved items", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api, run_catalog_search=false. NOT product catalog search.
 - HOW/WHERE to view wishlist in app (steps, navigation, "wishlist kaise dekhu") → account_list_kind=wishlist_howto, data_channel=kb — NOT pincode_check, NOT product catalog.
 - Saved/liked products → intent=wishlist (NOT order_history). Amazon/Flipkart etc. → out_of_domain.
 - PIN / delivery area / "can you deliver to X" / city name (Jaipur, Kota) / friend lives in an area (ANY language) → pincode_check, data_channel=live_api, needs_order_id=false, order_lookup_kind=none, run_catalog_search=false. This is NOT order tracking — never set intent=order or needs_order_id=true for hypothetical delivery to a place. Clear city → live geocode+API; vague place → ask for 6-digit PIN. Extract PIN when present.
 - Existing order timeline (shipment/courier/status/not received) → order + order_lookup_kind=track, needs_order_id=true. Do not confuse with pincode_check.
-- Product browse/buy → intent=product, data_channel=catalog, run_catalog_search=true, English search_query.
+- Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style) → intent=product, data_channel=catalog, run_catalog_search=true. Fill product_entities with ALL filters the user asked for; search_query = product_entities.product_name (product TYPE only in English).
+- PRODUCT ENTITIES (critical — backend uses these for OpenSearch filters, not raw customer text):
+  * product_name = what to find (jeans, mobile cover, iphone, pajama, water bottle, track pants) — NEVER put brand/color/price/time words (night, black, redmi) in product_name.
+  * brand = manufacturer/company ONLY (Redmi, Infinix, Nike, BoAt) — NEVER product type.
+  * NEVER set brand to product_name or product type (mobile cover, iphone cover, shirt are NOT brands).
+  * If user did not name a brand, leave brand="" — search by product_name/title only.
+  * "iphone cover" without "apple" → product_name=iphone cover, brand="" (NOT Apple).
+  * "under 150 rs" / "150 se kam" / "150 rs ke andar" / "200rs ke andar andar" → price_max=number. ALWAYS set price_max when user gives a rupee budget — keep brand/color filters too.
+  * "above 500" → price_min=500.
+  * product_intent + allow_related_fallback + related_search_terms: REQUIRED on every product_entities — backend has no fixed product keyword lists.
+  * device (phone/handset/laptop device): product_intent=device, allow_related_fallback=true, related_search_terms=closest related Welfog catalog type in English, exclude_title_tokens=accessory words that would pollute THIS device search (you choose per product).
+  * exact accessory/part (cover, charger, cable, jeans, shirt, bottle…): product_intent=accessory or general, allow_related_fallback=false, related_search_terms="".
+  * "redmi mobile cover" → product_name=mobile cover, brand=Redmi.
+  * "black mobile covers" → product_name=mobile cover, color=black.
+  * product id / pro_id + cover → numeric_context=product_id, product_id=that number, product_name=mobile cover (accessory for that product).
+  * SKU "Xiaomi-SK" → sku=Xiaomi-SK (keep hyphen exactly). numeric_context=none for SKU-only turns.
+  * pajama / night wear → product_name=pajama or nightwear — NEVER put "night" in brand.
+  * kids / bachche → size=kids when user shops for children.
+  * Hinglish patterns (MUST fill product_entities — never leave empty on product turns):
+    - "infinix mobile ka cover chahiye" / "dost ko X cover" → product_name=mobile cover, brand=Infinix (or named brand).
+    - "redmi ke covers dikha" / "X ke cover dikhao" → product_name=mobile cover, brand=Redmi (brand from X).
+    - "behan ke liye iphone cover" → product_name=mobile cover, brand=Apple (iphone accessory).
+    - ANY brand user names (BoAt, Noise, Itel, Lava, etc.) → put in product_entities.brand — do not limit to famous brands.
+  * product_entities is REQUIRED when run_catalog_search=true — never empty product_name AND empty brand on a named-product browse.
 - Today's deals / offers / discounts / flash sale (ANY language) → intent=deals, data_channel=live_api, run_catalog_search=false, needs_order_id=false. NOT a product named "deals".
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
-- Products inside ONE named category (beauty, electronics, grocery) → intent=product, catalog search with that category — NOT search_query="categories" or "deals".
+- Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="" unless user also named a product type.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
 - Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ROUTING PLAYBOOK. Use user_meaning in English to pick files — do NOT rely on matching Hindi/English keywords in the customer message. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund+kb (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company → kb company (NOT assistant_intro).
@@ -232,14 +312,20 @@ Return JSON only."""
             {"role": "user", "content": user_payload},
         ]
         log_reasoning(f"Calling LLM routing ({len(system_prompt)} char system prompt)...")
-        route_timeout = max(8, min(18, int(os.getenv("AI_ROUTE_TIMEOUT", "14") or 14)))
+        route_timeout = max(8, min(14, int(os.getenv("AI_ROUTE_TIMEOUT", "12") or 12)))
+        import time as _time
+
+        _t_route = _time.perf_counter()
         out = _llm_json_with_provider_fallback(
             providers,
             messages,
-            max_tokens=420,
+            max_tokens=max(420, int(os.getenv("AI_ROUTE_MAX_TOKENS", "520") or 520)),
             timeout_sec=route_timeout,
-            max_attempts=1,
+            max_attempts=max(1, min(3, int(os.getenv("AI_ROUTE_MAX_ATTEMPTS", "2") or 2))),
         )
+        _route_ms = (_time.perf_counter() - _t_route) * 1000.0
+        prov_names = "→".join((p.get("name") or "?") for p in providers)
+        log_reasoning(f"LLM routing done in {_route_ms:.0f}ms (chain: [{prov_names}])")
         if not out:
             from services.chat_resilience import get_last_llm_failure
 
@@ -254,9 +340,20 @@ Return JSON only."""
             }
         if out:
             try:
-                from services.ai_route_semantics import _normalize_llm_route
+                from services.chat_flow_telemetry import store_brain_route_result
+
+                if isinstance(out, dict):
+                    store_brain_route_result(out)
+            except ImportError:
+                pass
+            try:
+                from services.ai_route_semantics import (
+                    _normalize_llm_route,
+                    repair_brain_json_quality,
+                )
 
                 out = _normalize_llm_route(out)
+                out = repair_brain_json_quality(out, user_msg)
                 um = (out.get("user_meaning") or "").strip()
                 log_reasoning(
                     um

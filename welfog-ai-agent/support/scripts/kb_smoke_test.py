@@ -57,6 +57,14 @@ CASES = [
         "expect_in_answer": ("deliver", "ship", "day", "location"),
     },
     {
+        "q": "welfog pe delivery me kitna time lgta h",
+        "en": "how long does delivery take on welfog",
+        "lang": "hinglish",
+        "expect_files": ("shipping", "faqs"),
+        "expect_in_answer": ("deliver", "day", "ship", "time", "location"),
+        "reject_in_answer": ("refund", "5-7 business", "return policy"),
+    },
+    {
         "q": "What payment methods does Welfog accept?",
         "en": "",
         "lang": "en",
@@ -94,6 +102,9 @@ def main() -> int:
         ok_files = any(any(exp in k for exp in case["expect_files"]) for k in keys[:3])
         plain_ans = _plain(answer)
         ok_ans = any(w in plain_ans for w in case["expect_in_answer"]) if answer else False
+        reject = case.get("reject_in_answer") or ()
+        if reject and any(w in plain_ans for w in reject):
+            ok_ans = False
 
         if not ok_files:
             print(f"    FAIL file routing (expected one of {case['expect_files']})")

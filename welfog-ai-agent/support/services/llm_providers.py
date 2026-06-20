@@ -169,6 +169,28 @@ def build_pinned_provider_chain(model_key: str) -> list[dict[str, Any]]:
     return [pinned]
 
 
+def get_configured_provider_chain() -> list[dict[str, Any]]:
+    """
+    Providers from LLM_PROVIDER_ORDER that have API keys in .env.
+    PRIMARY_AI_PROVIDER (e.g. openai) is tried first when set.
+    """
+    chain = build_auto_provider_chain()
+    primary = _env("PRIMARY_AI_PROVIDER").lower()
+    if not primary or not chain:
+        return chain
+    preferred: list[dict[str, Any]] = []
+    rest: list[dict[str, Any]] = []
+    for spec in chain:
+        name = (spec.get("name") or "").strip().lower()
+        if name == primary or (primary == "grok" and name == "groq"):
+            preferred.append(spec)
+        else:
+            rest.append(spec)
+    if preferred:
+        return preferred + [s for s in rest if s not in preferred]
+    return chain
+
+
 def get_llm_provider_chain() -> list[dict[str, Any]]:
     """Respects admin Auto vs pinned model; falls back to env chain."""
     try:
@@ -179,7 +201,7 @@ def get_llm_provider_chain() -> list[dict[str, Any]]:
             return chain
     except Exception:
         pass
-    return build_auto_provider_chain()
+    return get_configured_provider_chain()
 
 
 def _trim_text_mid(text: str, max_chars: int) -> str:
@@ -232,9 +254,18 @@ def llm_json_with_retry(
     for attempt in range(1, max_attempts + 1):
         try:
             try:
-                from services.chat_flow_telemetry import increment_llm_call
+                from services.chat_flow_telemetry import (
+                    increment_llm_call,
+                    llm_budget_exceeded,
+                )
 
+                if llm_budget_exceeded():
+                    set_last_llm_failure("llm_budget_exceeded")
+                    return None
                 increment_llm_call(provider_name)
+                if llm_budget_exceeded():
+                    set_last_llm_failure("llm_budget_exceeded")
+                    return None
             except ImportError:
                 pass
             session = requests.Session()
@@ -282,9 +313,17 @@ def llm_json_with_retry(
                     continue
                 return None
             if is_json_fail and attempt < max_attempts:
-                req["max_tokens"] = max(120, int(req.get("max_tokens", 300) * 0.7))
-                time.sleep(0.5)
+                prev = int(req.get("max_tokens", 300) or 300)
+                req["max_tokens"] = min(900, max(prev + 180, 420))
+                log_reasoning(
+                    f"{provider_name} JSON validate failed — retry with max_tokens={req['max_tokens']}."
+                )
+                time.sleep(0.35)
                 continue
+            if is_json_fail:
+                log_reasoning(
+                    f"{provider_name} JSON validate failed — switching to next provider."
+                )
             kind = classify_api_error(res.status_code, text)
             if kind != "error":
                 set_last_llm_failure(kind)
@@ -333,9 +372,10 @@ def llm_json_with_provider_fallback(
         tok = max_tokens
         prov_url = (p.get("url") or "").lower()
         if p["name"] in ("groq",) or (p["name"] == "grok" and "groq.com" in prov_url):
-            shrunk = _shrink_payload({"messages": msg_list, "max_tokens": tok}, factor=0.58)
+            shrunk = _shrink_payload({"messages": msg_list, "max_tokens": tok}, factor=0.72)
             msg_list = shrunk["messages"]
-            tok = shrunk["max_tokens"]
+            # Shrink prompt only — keep output budget so Groq JSON mode can finish.
+            tok = max(int(tok), int(shrunk.get("max_tokens") or tok))
         payload = {
             "model": p["model"],
             "messages": msg_list,
@@ -343,7 +383,7 @@ def llm_json_with_provider_fallback(
             "temperature": temperature,
             "max_tokens": tok,
         }
-        attempts = 2 if idx == 0 else 1
+        attempts = max(1, int(max_attempts)) if idx == 0 else max(1, min(2, int(max_attempts)))
         if rate_seen:
             attempts = 1
         out = llm_json_with_retry(
@@ -358,6 +398,8 @@ def llm_json_with_provider_fallback(
             clear_last_llm_failure()
             if idx > 0:
                 log_reasoning(f"LLM fallback success via {p['name']}.")
+            else:
+                log_reasoning(f"LLM routing success via {p['name']}.")
             return out
         from services.chat_resilience import get_last_llm_failure
 
@@ -378,9 +420,9 @@ def llm_json_chat_completion(
     max_attempts: int = 3,
     temperature: float = 0.0,
 ) -> Optional[dict]:
-    """Chat completion with JSON response across the full provider chain."""
+    """Chat completion with JSON response across the env-configured provider chain."""
     return llm_json_with_provider_fallback(
-        get_llm_provider_chain(),
+        get_configured_provider_chain() or get_llm_provider_chain(),
         messages,
         max_tokens=max_tokens,
         timeout_sec=timeout_sec,

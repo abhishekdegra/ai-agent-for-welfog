@@ -199,7 +199,7 @@ def ai_classify_catalog_menu_turn(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -207,7 +207,7 @@ def ai_classify_catalog_menu_turn(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -302,6 +302,25 @@ def resolve_catalog_menu_turn(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return ResolvedCatalogMenuTurn(kind=KIND_NONE)
+
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            brain = _brain_catalog_menu_resolution(ai_route)
+            if brain:
+                _RESOLVE_CACHE.key = (
+                    f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"
+                    f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}"
+                )
+                _RESOLVE_CACHE.result = brain
+                return brain
+            log_reasoning(
+                "Catalog-menu: defer/skip — universal brain route owns classification."
+            )
+            return ResolvedCatalogMenuTurn(kind=KIND_NONE)
+    except ImportError:
+        pass
 
     cache_key = (
         f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"

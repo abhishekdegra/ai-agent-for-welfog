@@ -39,6 +39,8 @@ KB_SEMANTIC_MIN_SCORE = float(os.getenv("KB_SEMANTIC_MIN_SCORE", "0.22") or "0.2
 KB_CONTEXT_MIN_SCORE = float(os.getenv("KB_CONTEXT_MIN_SCORE", "0.18") or "0.18")
 KB_DIRECT_MIN_SCORE = float(os.getenv("KB_DIRECT_MIN_SCORE", "0.28") or "0.28")
 KB_STRONG_MATCH_SCORE = float(os.getenv("KB_STRONG_MATCH_SCORE", "0.32") or "0.32")
+KB_ANSWER_MIN_CONFIDENCE = float(os.getenv("KB_ANSWER_MIN_CONFIDENCE", "0.26") or "0.26")
+KB_RETRIEVAL_STRONG_SCORE = float(os.getenv("KB_RETRIEVAL_STRONG_SCORE", "0.38") or "0.38")
 
 
 def get_kb_vector_status() -> str:
@@ -58,6 +60,31 @@ def _normalize_retrieval_query(query: str) -> str:
     """Normalize user/AI query before embedding (any language)."""
     q = _plain_chunk_for_embed(query or "")
     return q[:900]
+
+
+def _embed_text_for_chunk(chunk: str) -> str:
+    """
+    Text fed to the embedding model — FAQ Q+A prefixed for better semantic match.
+    Display/storage chunk is unchanged; only vectors use this form.
+    """
+    raw = (chunk or "").strip()
+    if not raw:
+        return ""
+    parts = re.split(r"<br\s*/?>", raw, maxsplit=1, flags=re.IGNORECASE)
+    if len(parts) >= 2:
+        q_line = parts[0].strip()
+        a_line = parts[1].strip()
+        if _looks_like_faq_question_line(q_line) and a_line:
+            q_plain = _plain_chunk_for_embed(q_line)
+            a_plain = _plain_chunk_for_embed(a_line)
+            return f"Question: {q_plain}\nAnswer: {a_plain}"[:1200]
+    return _plain_chunk_for_embed(raw)
+
+
+def _chunk_dedup_key(chunk: str) -> str:
+    """Near-duplicate suppression in retrieval results."""
+    plain = _plain_chunk_for_embed(chunk)[:320].lower()
+    return re.sub(r"\W+", " ", plain).strip()
 
 
 def _embeddings_ready() -> bool:
@@ -334,7 +361,7 @@ def load_knowledge_index(runtime_files=None, *, build_vectors: bool = True):
             chunks_by_key[k] = chunks
             if chunks:
                 if build_vectors and not embeddings_disabled():
-                    embed_inputs = [_plain_chunk_for_embed(c) for c in chunks]
+                    embed_inputs = [_embed_text_for_chunk(c) for c in chunks]
                     vecs = encode_texts(embed_inputs)
                     vectors_by_key[k] = vecs if vecs is not None else []
                 else:
@@ -382,7 +409,7 @@ def ensure_kb_vectors():
         rebuilt = {}
         for k, chunks in (kb_chunks_by_key or {}).items():
             if chunks:
-                embed_inputs = [_plain_chunk_for_embed(c) for c in chunks]
+                embed_inputs = [_embed_text_for_chunk(c) for c in chunks]
                 _v = encode_texts(embed_inputs)
                 rebuilt[k] = _v if _v is not None else []
             else:
@@ -404,6 +431,7 @@ def refresh_knowledge_cache(*, build_vectors: bool = True):
     global kb_chunks_by_key, kb_vectors_by_key, all_chunks, all_vectors, all_chunk_sources, _SYSTEM_MESSAGES, _KB_SNAPSHOT, _cache, _kb_vectors_built, _KB_VECTOR_STATUS
     with _KB_REFRESH_LOCK:
         runtime_files = get_runtime_knowledge_files()
+        _kb_vectors_built = False
         kb_chunks_by_key, kb_vectors_by_key, all_chunks, all_vectors, all_chunk_sources = load_knowledge_index(
             runtime_files, build_vectors=build_vectors
         )
@@ -1096,24 +1124,19 @@ def build_kb_retrieval_query(
         parts.append(raw)
 
     merged = " — ".join(p for p in parts if p).strip()
-    try:
-        from services.query_understanding import infer_kb_query_category
-
-        cat = infer_kb_query_category(
-            original_msg,
-            msg_en,
-            ai_route=ai_route,
-            conversation_context=conversation_context,
-        )
-        if cat and cat not in ("general", "order_history"):
-            merged = f"{merged} — topic: {cat}".strip(" —")
-    except ImportError:
-        pass
+    route = ai_route or {}
+    cat = (route.get("intent") or "").strip().lower()
+    kb_keys = route.get("kb_keys") or []
+    if (not cat or cat in ("general", "order_history")) and kb_keys:
+        cat = str(kb_keys[0]).strip().lower()
+    if cat and cat not in ("general", "order_history", "product", "order"):
+        merged = f"{merged} — topic: {cat}".strip(" —")
     try:
         from services.query_understanding import _is_short_or_vague_message, _last_user_snippets
 
         if conversation_context and _is_short_or_vague_message(original_msg or msg_en):
-            prior = _last_user_snippets(conversation_context)
+            prior_snippets = _last_user_snippets(conversation_context)
+            prior = " — ".join(s for s in prior_snippets if s).strip()
             if prior and prior.lower() not in (merged or "").lower():
                 merged = f"{prior} — {merged}".strip(" —") if merged else prior
     except ImportError:
@@ -1211,12 +1234,14 @@ def semantic_kb_search(
     top_n: int = 4,
     min_score: float | None = None,
     customer_only: bool = True,
+    log_retrieval: bool = True,
 ) -> list[dict]:
     """
-    Core semantic retrieval — cosine similarity on embeddings; keyword fallback if embeddings down.
-    Defaults to customer-facing files only (excludes internal API playbooks).
+    Core semantic retrieval — cosine similarity on embeddings only (no keyword matching).
+    Keyword fallback runs only when embeddings are disabled/unavailable.
     """
     ensure_knowledge_cache_fresh()
+    ensure_kb_vectors()
     floor = float(min_score if min_score is not None else KB_SEMANTIC_MIN_SCORE)
     q = _normalize_retrieval_query(query)
     if not q:
@@ -1225,6 +1250,8 @@ def semantic_kb_search(
     scoped_chunks, scoped_vectors, scoped_sources = _scoped_kb_index(keys, customer_only=customer_only)
     if not scoped_chunks:
         return []
+
+    out: list[dict] = []
 
     if _embeddings_ready() and scoped_vectors is not None and len(scoped_vectors) > 0:
         query_vec = encode_texts([q])
@@ -1235,12 +1262,11 @@ def semantic_kb_search(
                 for i in range(len(scoped_chunks))
             ]
             indexed.sort(key=lambda x: x[0], reverse=True)
-            out: list[dict] = []
             seen_norm: set[str] = set()
             for score, src, chunk in indexed:
                 if score < floor:
                     break
-                norm = re.sub(r"\s+", " ", _plain_chunk_for_embed(chunk)[:180].lower()).strip()
+                norm = _chunk_dedup_key(chunk)
                 if norm and norm in seen_norm:
                     continue
                 if norm:
@@ -1248,14 +1274,45 @@ def semantic_kb_search(
                 out.append({"source": src, "chunk": chunk, "score": score, "match_type": "semantic"})
                 if len(out) >= top_n:
                     break
-            if out:
-                return out
 
-    kw = keyword_kb_hit(q, keys=keys or (get_customer_kb_keys() if customer_only else None), min_hits=2)
-    hit = _keyword_hit_as_semantic(kw)
-    if hit and float(hit.get("score") or 0) >= floor:
-        return [hit]
-    return []
+    if not out and embeddings_disabled():
+        kw = keyword_kb_hit(
+            q, keys=keys or (get_customer_kb_keys() if customer_only else None), min_hits=2
+        )
+        hit = _keyword_hit_as_semantic(kw)
+        if hit and float(hit.get("score") or 0) >= floor:
+            out = [hit]
+
+    if log_retrieval and out:
+        matched_src = str(out[0].get("source") or "")
+        log_kb_retrieval(
+            query_intent=matched_src or "general",
+            query_meaning="",
+            retrieval_query=q,
+            matched_file=matched_src,
+            selected_category=matched_src or "general",
+            similarity_score=float(out[0].get("score") or 0),
+            selected_chunks=out,
+        )
+    return out
+
+
+def retrieve_best_kb_chunk(
+    query: str,
+    *,
+    keys: list[str] | None = None,
+    ai_route: dict | None = None,
+    min_score: float | None = None,
+) -> dict | None:
+    """Semantic search + rerank; None when confidence is below answer threshold."""
+    floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
+    search_floor = max(0.12, floor - 0.1)
+    hits = semantic_kb_search(
+        query, keys=keys, top_n=8, min_score=search_floor, log_retrieval=False
+    )
+    return _pick_best_kb_hit_for_query(
+        query, hits, ai_route=ai_route, min_rerank_score=floor
+    )
 
 
 def resolve_kb_keys_for_question(
@@ -1368,19 +1425,6 @@ def resolve_kb_keys_for_question(
     file_rank_floor = min(0.12, KB_CONTEXT_MIN_SCORE)
     cat_l = (category or "general").strip().lower()
     effective_cat = cat_l
-    if effective_cat in ("", "general"):
-        ql = f" {_normalize_retrieval_query(query).lower()} "
-        for stem, fk in (
-            ("refund", "refund"),
-            ("return", "refund"),
-            ("payment", "payment"),
-            ("privacy", "privacy"),
-            ("shipping", "shipping"),
-            ("seller", "seller"),
-        ):
-            if stem in ql and fk in customer_keys:
-                effective_cat = fk
-                break
     for k in search_keys:
         if k not in customer_keys:
             continue
@@ -1414,7 +1458,9 @@ def resolve_kb_keys_for_question(
 
     if keys_from_embed:
         try:
-            hits_preview = top_kb_hits(query, keys=keys_from_embed, min_score=0.14, top_n=3)
+            hits_preview = top_kb_hits(
+                query, keys=keys_from_embed, min_score=0.14, top_n=3, log_retrieval=False
+            )
             log_kb_retrieval(
                 query_intent=category,
                 query_meaning=((ai_route or {}).get("user_meaning") or "").strip(),
@@ -1434,9 +1480,9 @@ def resolve_kb_keys_for_question(
     if valid_suggested:
         return valid_suggested[:max_files]
 
-    kw = keyword_kb_hit(query, keys=customer_keys, min_hits=1)
-    if kw and kw.get("source") in customer_keys:
-        return [kw["source"]]
+    best = retrieve_best_kb_chunk(query, keys=customer_keys, ai_route=ai_route, min_score=0.2)
+    if best and best.get("source") in customer_keys:
+        return [best["source"]]
 
     return customer_keys[: min(2, len(customer_keys))]
 
@@ -1497,10 +1543,11 @@ def _ground_kb_excerpt_for_customer(
             original_msg,
             (
                 f"AUTHORITATIVE KNOWLEDGE from live admin file(s): {src_note}\n"
-                "RULES: Answer ONLY from this text. Match the customer's language/script. "
+                "RULES: Answer ONLY from this text. Match the customer's language/script (Hinglish = Roman Hindi+English). "
                 "Do NOT repeat or restate the user's question — start directly with the answer. "
-                "Give ONLY what was asked — no extra topics. Seller account steps must NOT be confused "
-                "with buyer checkout account. Copy phone/email/addresses exactly.\n\n"
+                "Give ONLY what was asked — 1-3 short sentences, no extra topics, no steps they did not ask for. "
+                "Seller account steps must NOT be confused with buyer checkout account. "
+                "Copy phone/email/addresses exactly.\n\n"
                 f"{excerpt}"
             ),
             conversation_context=conversation_context,
@@ -1599,6 +1646,52 @@ def _kb_chunk_relevance_adjustment(question: str, chunk: str) -> float:
         if "refund" in c and "privacy" not in c:
             adj -= 0.1
 
+    asks_delivery_timeline = any(
+        x in q
+        for x in (
+            "kitna time",
+            "kitne din",
+            "how long",
+            "lgta h",
+            "lagta h",
+            "lagta hai",
+            "kab aayega",
+            "kab milega",
+            "how many day",
+            "time lgta",
+            "time lagta",
+        )
+    ) and any(
+        x in q
+        for x in ("delivery", "deliver", "ship", "order aane", "order aayega", "courier")
+    )
+    if asks_delivery_timeline:
+        if any(
+            x in c
+            for x in (
+                "how long",
+                "delivery time",
+                "delivery times",
+                "typically processes",
+                "3-5 days",
+                "1-3 business",
+                "ship my order",
+                "deliver my order",
+            )
+        ):
+            adj += 0.24
+        if any(
+            x in c
+            for x in (
+                "not available at the time",
+                "attempt redelivery",
+                "redelivery",
+                "leave a notification",
+                "reschedule",
+            )
+        ):
+            adj -= 0.28
+
     if any(x in q for x in ("deliver", "delivery", "shipping", "courier")):
         if any(x in c for x in ("deliver my order", "delivery times", "delivery time", "courier")):
             adj += 0.14
@@ -1658,6 +1751,7 @@ def _pick_best_kb_hit_for_query(
     *,
     ai_route: dict | None = None,
     conflict_check: bool = True,
+    min_rerank_score: float | None = None,
 ) -> dict | None:
     """Rerank embedding hits with relevance adjustments; skip conflicting chunks."""
     best: dict | None = None
@@ -1670,6 +1764,9 @@ def _pick_best_kb_hit_for_query(
         if sc > best_score:
             best_score = sc
             best = {**hit, "score": sc}
+    floor = float(min_rerank_score if min_rerank_score is not None else KB_ANSWER_MIN_CONFIDENCE)
+    if best and best_score < floor:
+        return None
     return best
 
 
@@ -1750,8 +1847,10 @@ def resolve_best_faq_chunk_for_question(
     q = build_kb_retrieval_query(original_msg, msg_en, conversation_context, ai_route=ai_route)
     if not q.strip():
         return None
-    hits = top_kb_hits(q, keys=["faqs"], min_score=0.14, top_n=6)
-    best = _pick_best_kb_hit_for_query(q, hits, ai_route=ai_route)
+    hits = top_kb_hits(q, keys=["faqs"], min_score=0.14, top_n=8)
+    best = _pick_best_kb_hit_for_query(
+        q, hits, ai_route=ai_route, min_rerank_score=KB_ANSWER_MIN_CONFIDENCE
+    )
     if best:
         try:
             from services.query_understanding import infer_kb_query_category
@@ -1819,28 +1918,22 @@ def format_kb_answer_from_brain_keys(
         faq_hit = resolve_best_faq_chunk_for_question(
             original_msg, msg_en, conversation_context
         )
-        if faq_hit and float(faq_hit.get("score") or 0) >= 0.18:
+        if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
             filtered = _faq_answer_text_from_chunk(
                 re.sub(r"<br\s*/?>", "\n", faq_hit.get("chunk") or "")
             )
             filtered = _kb_plain_excerpt(filtered, max_chars=budget)
 
     if not filtered.strip():
-        hit = best_kb_hit(combined, keys=valid, min_score=0.18)
-        if hit and hit.get("chunk"):
+        best = retrieve_best_kb_chunk(
+            combined, keys=valid, min_score=KB_ANSWER_MIN_CONFIDENCE
+        )
+        if best and best.get("chunk"):
             filtered = _faq_answer_text_from_chunk(
-                re.sub(r"<br\s*/?>", "\n", hit.get("chunk") or "")
+                re.sub(r"<br\s*/?>", "\n", best.get("chunk") or "")
             )
             filtered = _kb_plain_excerpt(filtered, max_chars=budget)
 
-    blob = read_concatenated_kb_file_contents(valid)
-    if not filtered.strip():
-        filtered = _filter_kb_blob_for_question(blob, combined)
-    if not filtered.strip() and blob.strip():
-        filtered = _kb_plain_excerpt(
-            _strip_kb_blob_for_display(blob),
-            max_chars=budget,
-        )
     if not filtered.strip():
         return ""
 
@@ -1951,7 +2044,7 @@ def format_dynamic_kb_answer(
         faq_hit = resolve_best_faq_chunk_for_question(
             original_msg, msg_en, conversation_context, ai_route=ai_route
         )
-    if faq_hit and float(faq_hit.get("score") or 0) >= 0.18:
+    if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
         excerpt = _faq_answer_text_from_chunk(
             re.sub(r"<br\s*/?>", "\n", faq_hit.get("chunk") or "")
         )
@@ -1998,46 +2091,34 @@ def format_dynamic_kb_answer(
         )
     except ImportError:
         _kb_cat = "general"
-    log_kb_retrieval(
-        query_intent=_kb_cat,
-        query_meaning=((ai_route or {}).get("user_meaning") or "").strip(),
-        retrieval_query=retrieval_q,
-        matched_file=keys[0] if keys else "",
-        selected_category=_kb_cat,
-        selected_chunks=top_kb_hits(retrieval_q or filter_q, keys=keys, top_n=2),
-    )
-    blob = read_concatenated_kb_file_contents(keys)
     filtered = ""
-    if seller_only and keys:
-        shits = semantic_kb_search(filter_q, keys=keys, top_n=4, min_score=0.18)
-        sbest = _pick_best_kb_hit_for_query(filter_q, shits, ai_route=ai_route, conflict_check=False)
-        if sbest and sbest.get("chunk"):
-            raw_seller = re.sub(r"<br\s*/?>", "\n", sbest.get("chunk") or "")
-            cleaned_seller = polish_faq_reply_for_customer(
-                _strip_kb_policy_heading_prefix(_strip_leading_faq_question(raw_seller)),
-                original_msg,
-            )
-            filtered = _kb_plain_excerpt(
-                cleaned_seller or raw_seller,
-                max_chars=_infer_kb_answer_budget(filter_q)[0],
-            )
+    budget = _infer_kb_answer_budget(filter_q)[0]
     seller_keys = [k for k in keys if k == "seller"] if seller_only else keys
-    if not filtered.strip():
-        filtered = _filter_kb_blob_for_question(
-            read_concatenated_kb_file_contents(seller_keys or keys),
-            filter_q,
+    search_keys = seller_keys or keys
+
+    best_chunk = retrieve_best_kb_chunk(
+        filter_q,
+        keys=search_keys,
+        ai_route=ai_route,
+        min_score=KB_ANSWER_MIN_CONFIDENCE,
+    )
+    if best_chunk and best_chunk.get("chunk"):
+        raw_hit = re.sub(r"<br\s*/?>", "\n", best_chunk.get("chunk") or "")
+        cleaned_hit = polish_faq_reply_for_customer(
+            _strip_kb_policy_heading_prefix(_strip_leading_faq_question(raw_hit)),
+            original_msg,
         )
-    if not filtered.strip() and blob.strip():
-        hit = keyword_kb_hit(filter_q, keys=seller_keys or keys, min_hits=1)
-        if not hit:
-            hit = best_kb_hit(filter_q, keys=seller_keys or keys, min_score=0.16)
-        if hit and hit.get("chunk"):
-            filtered = _kb_plain_excerpt(
-                _faq_answer_text_from_chunk(re.sub(r"<br\s*/?>", "\n", hit["chunk"])),
-                max_chars=_infer_kb_answer_budget(filter_q)[0],
-            )
-        else:
-            filtered = _kb_plain_excerpt(_strip_kb_blob_for_display(blob), max_chars=_infer_kb_answer_budget(filter_q)[0])
+        filtered = _kb_plain_excerpt(cleaned_hit or raw_hit, max_chars=budget)
+        log_kb_retrieval(
+            query_intent=_kb_cat,
+            query_meaning=((ai_route or {}).get("user_meaning") or "").strip(),
+            retrieval_query=retrieval_q,
+            matched_file=str(best_chunk.get("source") or (keys[0] if keys else "")),
+            selected_category=_kb_cat,
+            similarity_score=float(best_chunk.get("score") or 0),
+            selected_chunks=[best_chunk],
+        )
+
     if not filtered.strip():
         return ""
 
@@ -3305,6 +3386,7 @@ def best_kb_hit(query, keys=None, min_score=None):
         top_n=1,
         min_score=floor,
         customer_only=not bool(keys),
+        log_retrieval=False,
     )
     return hits[0] if hits else None
 
@@ -3314,6 +3396,7 @@ def top_kb_hits(
     keys=None,
     min_score: float | None = None,
     top_n: int = 4,
+    log_retrieval: bool = False,
 ) -> list[dict]:
     """Top-N semantic KB chunks for reranking (multilingual queries)."""
     if not all_chunks or not (query or "").strip():
@@ -3325,6 +3408,7 @@ def top_kb_hits(
         top_n=top_n,
         min_score=floor,
         customer_only=not bool(keys),
+        log_retrieval=log_retrieval,
     )
 
 

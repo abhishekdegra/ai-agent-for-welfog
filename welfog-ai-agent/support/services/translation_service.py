@@ -532,36 +532,9 @@ def finalize_customer_reply(text: str, user_msg: str, reply_lang: str = "") -> s
         if rl == "hinglish":
             if DEVANAGARI_RE.search(body):
                 return _romanize_devanagari_text(text)
-            if _looks_english_only_latin(body):
-                # Keep factual KB/contact HTML readable — auto en→hi→roman mangled brand names & policy text.
-                if re.search(r"\b[\w.+-]+@[\w.-]+\.\w+\b", body) or re.search(
-                    r"\b(?:\+91[\s-]*)?[6-9]\d{9}\b", body
-                ):
-                    return text
-                if any(
-                    x in body.lower()
-                    for x in (
-                        "welfog support",
-                        "grievance",
-                        "privacy policy",
-                        "refund",
-                        "official",
-                        "knowledge",
-                        "invoice",
-                        "order history",
-                        "wf-od-root",
-                        "wf-ph-root",
-                        "wf-wl-root",
-                        "wf-oid-root",
-                        "wf-product-root",
-                        "wf-invoice",
-                        "data-wf-live-api",
-                        "live order tracking",
-                        "order details",
-                    )
-                ):
-                    return text
-                return _english_html_to_roman_hinglish(text)
+            # Never block /chat on Google en→hi→roman (30–120s+). Hinglish sysmsg templates
+            # and product/API cards are already customer-readable in Latin script.
+            return text
         return text
     if rl in NATIVE_SCRIPT_LANGS:
         if _bot_text_matches_reply_lang(body, rl):

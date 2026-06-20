@@ -286,7 +286,7 @@ def ai_classify_query_intent(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -296,7 +296,7 @@ def ai_classify_query_intent(
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 

@@ -70,12 +70,33 @@ def infer_customer_semantic_goal(
     ai_route: dict | None = None,
 ) -> str:
     """What the customer wants THIS turn (empty if unclear — trust AI)."""
+    if isinstance(ai_route, dict) and ai_route.get("_universal_brain_route"):
+        try:
+            from services.chat_flow_telemetry import is_routing_complete
+
+            if is_routing_complete():
+                return ""
+        except ImportError:
+            pass
+        scope = (ai_route.get("conversation_scope") or "").strip().lower()
+        intent_ub = (ai_route.get("intent") or "").strip().lower()
+        channel_ub = (ai_route.get("data_channel") or "").strip().lower()
+        if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+            return ""
+        if intent_ub in ("general", "out_of_domain", "product"):
+            if channel_ub in ("catalog", "none", "kb", ""):
+                return ""
+        if channel_ub in ("catalog", "live_api"):
+            return ""
+
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
         product_locked = product_catalog_route_is_locked(ai_route)
     except ImportError:
         product_locked = False
+    if product_locked:
+        return ""
     if not product_locked:
         try:
             from services.location_delivery_resolver import turn_requests_delivery_serviceability
@@ -95,21 +116,44 @@ def infer_customer_semantic_goal(
         from services.conversation_scope import turn_blocks_product_catalog
         from services.product_catalog_resolver import (
             KIND_PRODUCT_SEARCH,
+            product_catalog_route_is_locked,
             resolve_product_search_turn,
         )
 
-        if not turn_blocks_product_catalog(
-            original_msg, msg_en, conversation_context, ai_route=ai_route
-        ):
-            resolved = resolve_product_search_turn(
-                original_msg,
-                msg_en,
-                conversation_context,
-                ai_route=ai_route,
-                allow_llm=True,
-            )
-            if resolved.kind == KIND_PRODUCT_SEARCH:
-                return "product_catalog"
+        if product_catalog_route_is_locked(ai_route):
+            return "product_catalog"
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+            from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+            if should_skip_micro_classifier_llm():
+                if brain_route_indicates_product_catalog(ai_route):
+                    return "product_catalog"
+            elif not turn_blocks_product_catalog(
+                original_msg, msg_en, conversation_context, ai_route=ai_route
+            ):
+                resolved = resolve_product_search_turn(
+                    original_msg,
+                    msg_en,
+                    conversation_context,
+                    ai_route=ai_route,
+                    allow_llm=True,
+                )
+                if resolved.kind == KIND_PRODUCT_SEARCH:
+                    return "product_catalog"
+        except ImportError:
+            if not turn_blocks_product_catalog(
+                original_msg, msg_en, conversation_context, ai_route=ai_route
+            ):
+                resolved = resolve_product_search_turn(
+                    original_msg,
+                    msg_en,
+                    conversation_context,
+                    ai_route=ai_route,
+                    allow_llm=True,
+                )
+                if resolved.kind == KIND_PRODUCT_SEARCH:
+                    return "product_catalog"
     except ImportError:
         pass
 

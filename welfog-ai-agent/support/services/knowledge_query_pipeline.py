@@ -407,17 +407,16 @@ def _semantic_kb_match(
     conversation_context: str = "",
     ai_route: dict | None = None,
 ) -> dict[str, Any] | None:
-    """Embedding + topic-scoped search + keyword fallback across customer KB files."""
+    """Embedding + topic-scoped search across customer KB files (semantic only)."""
     q = (retrieval_query or "").strip()
     if not q:
         return None
 
     from services.kb_service import (
         get_customer_kb_keys,
-        keyword_kb_hit,
         log_kb_retrieval,
+        retrieve_best_kb_chunk,
         top_kb_hits,
-        _keyword_hit_as_semantic,
     )
     from services.query_understanding import infer_kb_query_category, scoped_kb_keys_for_retrieval
 
@@ -431,12 +430,10 @@ def _semantic_kb_match(
     keys = scoped_kb_keys_for_retrieval(category, ai_route=ai_route, user_meaning=q)
     if not keys:
         keys = get_customer_kb_keys()
-    hits = top_kb_hits(q, keys=keys, min_score=floor, top_n=5)
+    hits = top_kb_hits(q, keys=keys, min_score=floor, top_n=6, log_retrieval=False)
     hit = _pick_best_semantic_kb_hit(q, hits, query_category=category)
     if not hit:
-        kw = _keyword_hit_as_semantic(keyword_kb_hit(q, keys=keys, min_hits=2))
-        if kw and float(kw.get("score") or 0) >= floor:
-            hit = kw
+        hit = retrieve_best_kb_chunk(q, keys=keys, ai_route=ai_route, min_score=floor)
     meaning = ((ai_route or {}).get("user_meaning") or "").strip()
     if hit or hits:
         log_kb_retrieval(
@@ -567,6 +564,161 @@ def _pick_best_semantic_kb_hit(
     return top
 
 
+KB_TOPIC_KEYS: dict[str, list[str]] = {
+    "delivery_shipping": ["shipping", "faqs"],
+    "refund_return_policy": ["refund", "faqs", "shipping"],
+    "payment_fees": ["payment", "faqs"],
+    "company_faq": ["company", "faqs"],
+    "seller": ["seller", "support"],
+    "contact_support": ["support", "faqs"],
+    "privacy_terms": ["privacy", "terms", "faqs"],
+    "order_howto": ["faqs", "welfog_api"],
+    "general_faq": ["faqs"],
+    "none": ["faqs"],
+}
+
+
+def ai_classify_kb_turn(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    ai_route: dict | None = None,
+) -> dict[str, Any] | None:
+    """
+    Primary micro-LLM for KB vs live-API — infers meaning in ANY language (no keyword lists).
+    Cached per turn via turn_intent_coordinator.get_kb_turn_ai_classification.
+    """
+    enabled = (os.getenv("ENABLE_KB_TURN_LLM", "1") or "1").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+    if not enabled:
+        return None
+
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            log_reasoning(
+                "KB-turn LLM: defer/skip — universal brain route owns classification."
+            )
+            return None
+    except ImportError:
+        pass
+
+    try:
+        from services.ai_service import (
+            _compact_conversation_context,
+            _llm_json_with_provider_fallback,
+            _llm_classifier_provider_chain,
+            _trim_text_mid,
+        )
+        from services.translation_service import resolve_customer_reply_lang
+    except ImportError:
+        return None
+
+    providers = _llm_classifier_provider_chain()
+    if not providers:
+        return None
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+
+    rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+    compact_ctx = _compact_conversation_context(conversation_context or "", 1400)
+    meaning_hint = ((ai_route or {}).get("user_meaning") or "").strip()
+    user_line = _trim_text_mid(comb, 520)
+
+    system = """You classify the LATEST user message in Welfog e-commerce support chat.
+
+Customers write in ANY language, script, or style (English, Hinglish, Hindi, Tamil, Telugu,
+Bengali, Marathi, Gujarati, Kannada, Malayalam, Urdu, voice-to-text typos). Infer MEANING —
+never match fixed keyword lists or example phrases.
+
+Return ONLY valid JSON:
+{
+  "user_meaning_en": "one English sentence — what they want THIS turn",
+  "is_informational_kb": true/false,
+  "is_refund_or_return": true/false,
+  "needs_live_api": true/false,
+  "kb_topic": "none"|"delivery_shipping"|"refund_return_policy"|"payment_fees"|"company_faq"|"seller"|"contact_support"|"privacy_terms"|"order_howto"|"general_faq",
+  "live_api_kind": "none"|"pincode"|"order_track"|"order_details"|"wishlist"|"order_history"|"refund_status"|"product_search",
+  "confidence": 0.0-1.0
+}
+
+is_informational_kb=true — user wants to READ Welfog FAQ/policy/how-it-works (no personal fetch now):
+• General delivery/shipping TIME or duration (any phrasing) → delivery_shipping
+• Refund/return POLICY or general steps → refund_return_policy, is_refund_or_return=true
+• Payment methods, fees, COD → payment_fees
+• What is Welfog, company info → company_faq
+• Seller registration/login on Welfog → seller
+• Customer care phone/email → contact_support
+• Privacy, terms → privacy_terms
+• How to place order / track in app (steps, not MY list) → order_howto
+
+needs_live_api=true — personal or live data NOW:
+• PIN/serviceability for a named PIN → pincode (NOT delivery_shipping timeline FAQ)
+• Track MY order, order details for MY id → order_track / order_details
+• MY wishlist / MY order history list → wishlist / order_history
+• MY refund status / money not received for MY order → refund_status
+• Find/buy/show products → product_search
+
+is_informational_kb=false: greetings, thanks, jokes, other companies, off-topic.
+
+Critical: general "how long does delivery take" = informational_kb + delivery_shipping.
+Checking if Welfog delivers to pincode 302012 = needs_live_api + pincode."""
+
+    user_payload = f"LATEST USER MESSAGE:\n{user_line}"
+    if meaning_hint:
+        user_payload += f"\nRouter hint (English): {meaning_hint[:200]}"
+    if compact_ctx:
+        user_payload = f"RECENT CONVERSATION:\n{compact_ctx}\n\n{user_payload}"
+
+    try:
+        data = _llm_json_with_provider_fallback(
+            providers,
+            [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_payload[:1600]},
+            ],
+            max_tokens=200,
+            timeout_sec=12,
+            max_attempts=2,
+            temperature=0.1,
+        )
+    except Exception as exc:
+        log_reasoning(f"KB turn LLM classify skipped: {exc}")
+        return None
+
+    if not data:
+        return None
+
+    topic = (data.get("kb_topic") or "none").strip().lower()
+    if topic not in KB_TOPIC_KEYS:
+        topic = "general_faq" if data.get("is_informational_kb") else "none"
+    live = (data.get("live_api_kind") or "none").strip().lower()
+    conf = float(data.get("confidence") or 0.0)
+    um = (data.get("user_meaning_en") or data.get("user_meaning") or "").strip()
+    log_reasoning(
+        f"KB-turn LLM: info={bool(data.get('is_informational_kb'))} "
+        f"live={bool(data.get('needs_live_api'))} topic={topic} conf={conf:.2f} — {um[:90]}"
+    )
+    return {
+        "user_meaning_en": um,
+        "is_informational_kb": bool(data.get("is_informational_kb")),
+        "is_refund_or_return": bool(data.get("is_refund_or_return")),
+        "needs_live_api": bool(data.get("needs_live_api")),
+        "kb_topic": topic,
+        "live_api_kind": live,
+        "confidence": conf,
+    }
+
+
 def ai_classify_informational_kb_turn(
     original_msg: str,
     msg_en: str = "",
@@ -576,7 +728,7 @@ def ai_classify_informational_kb_turn(
 ) -> dict[str, Any] | None:
     """
     Lightweight LLM: is this a read-only Welfog KB question (any language)?
-    Used when embeddings are borderline — no keyword lists.
+    Prefer ai_classify_kb_turn (cached) — this remains for analyze_informational fallback.
     """
     enabled = (os.getenv("ENABLE_KB_INFORMATION_LLM", "1") or "1").strip().lower() in (
         "1",
@@ -605,12 +757,12 @@ def ai_classify_informational_kb_turn(
     try:
         from services.ai_service import (
             _llm_json_with_provider_fallback,
-            _llm_provider_chain,
+            _llm_classifier_provider_chain,
         )
     except ImportError:
         return None
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -680,6 +832,46 @@ def analyze_informational_knowledge_turn(
             original_msg, msg_en, conversation_context, ai_route=ai_route
         )
     )
+
+    try:
+        from services.turn_intent_coordinator import (
+            get_kb_turn_ai_classification,
+            kb_turn_is_informational,
+        )
+
+        kb_cls = get_kb_turn_ai_classification(
+            original_msg, msg_en, conversation_context, ai_route=ai_route
+        )
+        if kb_turn_is_informational(kb_cls):
+            topic = (kb_cls.get("kb_topic") or "general_faq").strip().lower()
+            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+            um = (kb_cls.get("user_meaning_en") or "").strip()
+            if um:
+                out.retrieval_query = build_semantic_retrieval_query(
+                    original_msg,
+                    msg_en,
+                    conversation_context,
+                    ai_route={"user_meaning": um, **(ai_route or {})},
+                )
+            out.is_informational = True
+            out.confidence = float(kb_cls.get("confidence") or 0.0)
+            out.source = "kb_turn_llm"
+            out.user_meaning_en = um
+            out.kb_keys = keys
+            out.handler = "kb_grounded_ai"
+            out.reason = f"KB-turn LLM: {topic} (any language)."
+            faq_early = _try_strong_faq_informational_decision(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route={"user_meaning": um} if um else ai_route,
+                retrieval_query=out.retrieval_query,
+            )
+            if faq_early:
+                return faq_early
+            return out
+    except ImportError:
+        pass
 
     try:
         from utils.helpers import (

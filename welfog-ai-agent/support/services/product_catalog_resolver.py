@@ -19,6 +19,73 @@ KIND_PRODUCT_SEARCH = "product_search"
 KIND_POLICY_KB = "policy_kb"
 KIND_ORDER_SUPPORT = "order_support"
 
+_BOGUS_CATALOG_BRANDS = frozenset(
+    {
+        "mobile cover",
+        "mobile covers",
+        "phone cover",
+        "iphone cover",
+        "back cover",
+        "mobile",
+        "cover",
+        "covers",
+        "case",
+        "cases",
+        "phone",
+        "iphone",
+        "iphones",
+        "shirt",
+        "shirts",
+        "jeans",
+        "pajama",
+        "pajami",
+        "product",
+        "products",
+        "water bottle",
+        "track pants",
+        "lower",
+        "lowers",
+    }
+)
+
+
+def sanitize_catalog_brand(
+    brand: str | None,
+    *,
+    product_name: str = "",
+    explicit_from_brain: bool = False,
+    user_meaning: str = "",
+) -> str:
+    """
+    Drop bogus brands (product types mistaken as brand by LLM).
+    Apple only when user/brain English explicitly mentions Apple.
+    """
+    b = (brand or "").strip()
+    if not b:
+        return ""
+    bl = b.lower()
+    pn = (product_name or "").strip().lower()
+    um_low = (user_meaning or "").lower()
+    if bl in _BOGUS_CATALOG_BRANDS:
+        return ""
+    if pn and bl == pn:
+        return ""
+    if pn and not explicit_from_brain:
+        pn_tokens = set(re.findall(r"[a-z0-9]+", pn))
+        b_tokens = set(re.findall(r"[a-z0-9]+", bl))
+        if b_tokens and b_tokens <= pn_tokens:
+            return ""
+    if bl in ("apple", "iphone"):
+        if pn in ("iphone", "iphones") or (
+            "iphone" in pn and "cover" not in pn and "case" not in pn
+        ):
+            return ""
+        if bl == "apple" and "apple" not in um_low:
+            return ""
+    if bl in ("mobile", "cover", "phone", "case", "shirt", "jeans"):
+        return ""
+    return b
+
 
 @dataclass
 class ResolvedProductSearchTurn:
@@ -142,6 +209,8 @@ def _should_invoke_product_classifier(
     comb: str,
     ai_route: dict | None = None,
     conversation_context: str = "",
+    *,
+    ctx: dict | None = None,
 ) -> bool:
     """
     Run product micro-classifier only when shopping is plausible — not on chitchat/off-topic.
@@ -174,6 +243,16 @@ def _should_invoke_product_classifier(
         return False
     if product_catalog_route_is_locked(ai_route):
         return False
+    try:
+        import re
+        from services.opensearch_products import _extract_sku_from_text, _sku_token_acceptable
+
+        if re.search(r"\bsku\b", comb, re.I):
+            sku = _extract_sku_from_text(comb)
+            if sku and _sku_token_acceptable(sku, explicit_sku_mention=True):
+                return False
+    except ImportError:
+        pass
     if isinstance(ai_route, dict):
         intent = (ai_route.get("intent") or "").strip().lower()
         channel = (ai_route.get("data_channel") or "").strip().lower()
@@ -219,10 +298,37 @@ def ai_classify_product_search_turn(
     reply_lang: str = "",
 ) -> Optional[dict[str, Any]]:
     """Micro-classifier: product_search vs policy_kb vs order_support vs none."""
+    try:
+        from services.chat_flow_telemetry import (
+            get_cached_brain_route,
+            should_skip_micro_classifier_llm,
+        )
+
+        if should_skip_micro_classifier_llm():
+            route = ai_route if isinstance(ai_route, dict) else get_cached_brain_route()
+            locked = _locked_product_turn_from_route(route)
+            if locked and locked.kind == KIND_PRODUCT_SEARCH:
+                log_reasoning(
+                    f"Product-catalog LLM skipped — brain locked sq={locked.search_query!r}."
+                )
+                return {
+                    "turn_kind": KIND_PRODUCT_SEARCH,
+                    "search_query": locked.search_query,
+                    "entities": locked.entities,
+                    "confidence": 1.0,
+                    "user_meaning": locked.user_meaning or (route or {}).get("user_meaning") or "",
+                }
+            log_reasoning(
+                "Product-catalog LLM skipped — universal brain already classified turn."
+            )
+            return None
+    except ImportError:
+        pass
+
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -230,7 +336,7 @@ def ai_classify_product_search_turn(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -316,8 +422,8 @@ JSON only."""
             {"role": "user", "content": user_payload},
         ],
         max_tokens=320,
-        timeout_sec=18,
-        max_attempts=2,
+        timeout_sec=12,
+        max_attempts=1,
     )
     if not data:
         return None
@@ -355,12 +461,17 @@ def _locked_product_turn_from_route(
     locked = product_catalog_route_is_locked(ai_route)
     brain_product = (
         intent == "product"
-        and channel == "catalog"
-        and bool(ai_route.get("run_catalog_search"))
+        and (
+            channel == "catalog"
+            or bool(ai_route.get("run_catalog_search"))
+            or bool(ai_route.get("_universal_brain_route"))
+            or bool(sq)
+        )
         and (
             bool(sq)
-            or bool(ai_route.get("_product_catalog_locked"))
             or bool(entities)
+            or bool(ai_route.get("_product_catalog_locked"))
+            or bool(ai_route.get("run_catalog_search"))
         )
     )
     if not locked and not brain_product:
@@ -424,16 +535,25 @@ def _turn_blocks_ai_product_first(
         return True
     try:
         from utils.helpers import (
+            _text_asks_order_history,
+            _text_asks_wishlist,
             _text_has_pincode_delivery_intent,
             _text_is_order_tracking_intent,
             extract_order_id,
+            message_asks_my_welfog_purchases,
             message_is_past_purchase_list_request,
             message_is_wishlist_like_request,
             turn_is_catalog_product_lookup,
             _text_is_product_id_lookup_context,
         )
 
-        if message_is_past_purchase_list_request(comb) or message_is_wishlist_like_request(comb):
+        if (
+            message_is_past_purchase_list_request(comb)
+            or message_is_wishlist_like_request(comb)
+            or _text_asks_order_history(comb)
+            or message_asks_my_welfog_purchases(comb)
+            or _text_asks_wishlist(comb)
+        ):
             return True
         if _text_has_pincode_delivery_intent(comb, conversation_context):
             return True
@@ -466,7 +586,41 @@ def try_product_ai_first_catalog(
         original_msg, msg_en, conversation_context, ctx
     ):
         return None
-    if not _should_invoke_product_classifier(comb, None, conversation_context):
+
+    try:
+        import re
+        from services.opensearch_products import (
+            _extract_sku_from_text,
+            _sku_token_acceptable,
+        )
+
+        if re.search(r"\bsku\b", comb, re.I):
+            sku_early = _extract_sku_from_text(original_msg) or _extract_sku_from_text(
+                msg_en
+            )
+            if sku_early and _sku_token_acceptable(sku_early, explicit_sku_mention=True):
+                from services.brain_direct_dispatch import try_explicit_sku_catalog_reply
+
+                body = try_explicit_sku_catalog_reply(
+                    original_msg,
+                    msg_en,
+                    user_id=user_id,
+                    lang=reply_lang or "en",
+                    ctx=ctx or {},
+                    reset_context_fn=lambda _c: None,
+                )
+                if body:
+                    return body, {
+                        "intent": "product",
+                        "data_channel": "catalog",
+                        "route_handler": "sku_structural_fast",
+                        "_product_catalog_locked": True,
+                        "_product_entities": {"sku": sku_early},
+                    }
+    except ImportError:
+        pass
+
+    if not _should_invoke_product_classifier(comb, None, conversation_context, ctx=ctx):
         return None
 
     classified = ai_classify_product_search_turn(
@@ -572,6 +726,63 @@ def resolve_product_search_turn(
         _RESOLVE_CACHE.result = locked_turn
         return locked_turn
 
+    if isinstance(ai_route, dict) and ai_route.get("_universal_brain_route"):
+        try:
+            from services.ai_route_semantics import (
+                brain_route_indicates_product_catalog,
+                _catalog_search_query_from_brain_route,
+            )
+
+            if brain_route_indicates_product_catalog(ai_route):
+                sq_brain = _catalog_search_query_from_brain_route(ai_route)
+                entities_brain = dict(ai_route.get("_product_entities") or {})
+                locked_brain = ResolvedProductSearchTurn(
+                    kind=KIND_PRODUCT_SEARCH,
+                    search_query=sq_brain,
+                    entities=entities_brain,
+                    source="ai_brain_route",
+                    confidence="high",
+                    user_meaning=str(ai_route.get("user_meaning") or "")[:200],
+                )
+                log_reasoning(
+                    f"Product resolver — brain JSON only sq={sq_brain!r} (skip micro-classifier LLM)."
+                )
+                cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-300:])}|{allow_llm}"
+                _RESOLVE_CACHE.key = cache_key
+                _RESOLVE_CACHE.result = locked_brain
+                return locked_brain
+        except ImportError:
+            pass
+
+    try:
+        from services.chat_flow_telemetry import (
+            get_cached_brain_route,
+            should_skip_micro_classifier_llm,
+        )
+
+        if allow_llm and should_skip_micro_classifier_llm():
+            brain_route = ai_route if isinstance(ai_route, dict) else get_cached_brain_route()
+            locked_brain = _locked_product_turn_from_route(brain_route)
+            if locked_brain and locked_brain.kind == KIND_PRODUCT_SEARCH:
+                log_reasoning(
+                    f"Product-catalog: brain locked sq={locked_brain.search_query!r} "
+                    "(skip micro-classifier LLM)."
+                )
+                cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-300:])}|{allow_llm}"
+                _RESOLVE_CACHE.key = cache_key
+                _RESOLVE_CACHE.result = locked_brain
+                return locked_brain
+            log_reasoning(
+                "Product-catalog: defer — universal brain route owns classification."
+            )
+            none = ResolvedProductSearchTurn(kind=KIND_NONE)
+            cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-300:])}|{allow_llm}"
+            _RESOLVE_CACHE.key = cache_key
+            _RESOLVE_CACHE.result = none
+            return none
+    except ImportError:
+        pass
+
     if _catalog_menu_turn(
         original_msg, msg_en, ai_route, conversation_context=conversation_context
     ):
@@ -580,6 +791,31 @@ def resolve_product_search_turn(
         original_msg, msg_en, conversation_context, ai_route=ai_route
     ):
         return ResolvedProductSearchTurn(kind=KIND_NONE)
+
+    try:
+        import re
+        from services.opensearch_products import _extract_sku_from_text, _sku_token_acceptable
+
+        if re.search(r"\bsku\b", comb, re.I):
+            sku = _extract_sku_from_text(original_msg) or _extract_sku_from_text(msg_en)
+            if sku and _sku_token_acceptable(sku, explicit_sku_mention=True):
+                out = ResolvedProductSearchTurn(
+                    kind=KIND_PRODUCT_SEARCH,
+                    search_query="",
+                    entities={"sku": sku},
+                    source="explicit_sku_extract",
+                    confidence="high",
+                    user_meaning=f"Product for SKU {sku}",
+                )
+                cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-300:])}|{allow_llm}"
+                _RESOLVE_CACHE.key = cache_key
+                _RESOLVE_CACHE.result = out
+                log_reasoning(
+                    f"Product resolver explicit SKU ({sku!r}) — skip micro-classifier."
+                )
+                return out
+    except ImportError:
+        pass
 
     cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-300:])}|{allow_llm}"
     if getattr(_RESOLVE_CACHE, "key", None) == cache_key:
@@ -743,6 +979,38 @@ def apply_product_catalog_to_route(
 ) -> dict:
     """Force product catalog route when AI resolver says product_search."""
     out = dict(route or {})
+    try:
+        from services.chat_flow_telemetry import get_cached_brain_route
+
+        if not out.get("intent") and isinstance(get_cached_brain_route(), dict):
+            cached = get_cached_brain_route()
+            if cached.get("intent"):
+                out = {**cached, **out}
+    except ImportError:
+        pass
+    if not out.get("_universal_brain_route"):
+        try:
+            from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+            if brain_route_indicates_product_catalog(out):
+                out["_universal_brain_route"] = True
+        except ImportError:
+            pass
+    if out.get("_universal_brain_route"):
+        try:
+            from services.ai_route_semantics import (
+                brain_route_indicates_product_catalog,
+                reconcile_product_catalog_from_brain_meaning,
+            )
+
+            if brain_route_indicates_product_catalog(out):
+                return reconcile_product_catalog_from_brain_meaning(
+                    out,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                )
+        except ImportError:
+            pass
     if product_catalog_route_is_locked(out):
         if not out.get("_product_catalog_locked"):
             out["_product_catalog_locked"] = True
@@ -750,6 +1018,32 @@ def apply_product_catalog_to_route(
     intent_pre = (out.get("intent") or "").strip().lower()
     channel_pre = (out.get("data_channel") or "").strip().lower()
     sq_pre = (out.get("search_query") or "").strip()
+    if out.get("_universal_brain_route") and intent_pre == "product" and channel_pre == "catalog":
+        comb_pc = _combined(original_msg, msg_en)
+        if not sq_pre:
+            sq_pre = (out.get("user_meaning") or "").strip()
+        if not sq_pre and comb_pc:
+            try:
+                from utils.helpers import extract_product_search_query
+
+                sq_pre = extract_product_search_query(
+                    original_msg, msg_en, out.get("search_query"), ai_route=out
+                )
+            except ImportError:
+                sq_pre = ""
+            if not sq_pre:
+                sq_pre = comb_pc
+        if sq_pre:
+            out["search_query"] = sq_pre
+        out["run_catalog_search"] = True
+        out["_product_catalog_locked"] = True
+        out["needs_order_id"] = False
+        out["numeric_context"] = "none"
+        out["meta_kind"] = "none"
+        log_reasoning(
+            f"Product-catalog route (universal brain): sq={sq_pre!r} — skip micro-classifier."
+        )
+        return out
     if (
         intent_pre == "product"
         and channel_pre == "catalog"
@@ -783,6 +1077,16 @@ def apply_product_catalog_to_route(
         _combined(original_msg, msg_en), out, conversation_context
     ):
         return out
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            log_reasoning(
+                "Product-catalog route apply: defer micro-classifier — brain owns turn."
+            )
+            return out
+    except ImportError:
+        pass
     resolved = resolve_product_search_turn(
         original_msg,
         msg_en,
@@ -837,6 +1141,35 @@ def product_catalog_route_decision(
     from services.answer_router import AnswerRouteDecision
     from utils.helpers import extract_product_search_query
 
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(route_data):
+            sq_locked = (route_data.get("search_query") or "").strip()
+            if not sq_locked:
+                try:
+                    from services.ai_route_semantics import _catalog_search_query_from_brain_route
+
+                    sq_locked = _catalog_search_query_from_brain_route(route_data)
+                except ImportError:
+                    sq_locked = ""
+            log_reasoning(
+                f"AI route → product catalog API (brain locked sq={sq_locked!r}) — beats KB."
+            )
+            return (
+                AnswerRouteDecision(
+                    source="ai_product",
+                    intent="product",
+                    handler="product_ai_flow",
+                    search_query=sq_locked,
+                    is_welfog_related=True,
+                    reason=reasoning or "Brain locked product catalog.",
+                ),
+                route_data,
+            )
+    except ImportError:
+        pass
+
     if not turn_requests_product_catalog(
         original_msg,
         msg_en,
@@ -887,6 +1220,28 @@ def product_catalog_route_decision(
     return decision, route_data
 
 
+def _ai_entity_token_list(value: Any) -> list[str]:
+    """Normalize brain token list fields (string or JSON array)."""
+    if isinstance(value, list):
+        return [str(x).strip() for x in value if str(x).strip()]
+    if isinstance(value, str) and value.strip():
+        return [t.strip() for t in re.split(r"[,;|]", value) if t.strip()]
+    return []
+
+
+def _ai_entity_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "y"):
+        return True
+    if s in ("false", "0", "no", "n"):
+        return False
+    return default
+
+
 def entities_to_understanding(
     entities: dict | None,
     *,
@@ -897,11 +1252,24 @@ def entities_to_understanding(
     e = dict(entities or {})
     out: dict[str, Any] = {"action": "search_products", "is_shopping": True}
 
-    product_name = (e.get("product_name") or search_query or "").strip()
+    product_name = (e.get("product_name") or "").strip()
+    if not product_name and search_query:
+        try:
+            from services.product_filter_pipeline import brain_search_query_is_noisy
+
+            if not brain_search_query_is_noisy(search_query):
+                product_name = search_query.strip()
+        except ImportError:
+            product_name = search_query.strip()
     if product_name:
         out["search_terms"] = product_name
 
-    brand = (e.get("brand") or "").strip()
+    brand = sanitize_catalog_brand(
+        (e.get("brand") or "").strip(),
+        product_name=product_name,
+        explicit_from_brain=bool((e.get("brand") or "").strip()),
+        user_meaning="",
+    )
     if brand:
         out["brand"] = brand
         aliases: list[str] = []
@@ -912,12 +1280,24 @@ def entities_to_understanding(
         compact = re.sub(r"[^a-z0-9]", "", bl)
         if compact and compact not in aliases:
             aliases.append(compact)
-        msg_blob = f"{original_msg or ''} {search_query or ''}".lower()
-        for m in re.finditer(r"\b([a-z]{3,12})\s+ke\b", msg_blob):
-            tok = m.group(1).strip().lower()
-            if tok and tok not in aliases and tok != bl:
-                aliases.append(tok)
         out["brand_aliases"] = aliases
+
+    intent = (e.get("product_intent") or "").strip().lower()
+    allow_related = _ai_entity_bool(e.get("allow_related_fallback"), default=True)
+    related_terms = (e.get("related_search_terms") or "").strip()
+    exclude_toks = _ai_entity_token_list(e.get("exclude_title_tokens"))
+    mandatory_toks = _ai_entity_token_list(e.get("mandatory_match_tokens"))
+
+    if intent == "device":
+        out["device_browse"] = True
+    if not allow_related:
+        out["specific_accessory"] = True
+    if related_terms:
+        out["related_search_terms"] = related_terms
+    if exclude_toks:
+        out["exclude_title_tokens"] = exclude_toks
+    if mandatory_toks:
+        out["mandatory_match_tokens"] = mandatory_toks
 
     for src, dst in (
         ("color", "color"),
@@ -939,6 +1319,12 @@ def entities_to_understanding(
     if out.get("sku"):
         out["strict_sku_match"] = False
         out["search_terms"] = ""
+        out.pop("brand", None)
+        out.pop("brand_aliases", None)
+        out.pop("color", None)
+        out.pop("model", None)
+        out.pop("product_type", None)
+        out.pop("mandatory_match_tokens", None)
 
     for src, dst in (
         ("price_min", "min_price"),
@@ -964,6 +1350,9 @@ def entities_to_understanding(
         return None
     out["_ai_first"] = True
     out["is_shopping"] = True
+    out["action"] = "search_products"
+    if out.get("pro_id"):
+        out["strict_no_relax"] = True
     return out
 
 

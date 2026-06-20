@@ -51,6 +51,31 @@ def _warmup_ai_on_startup() -> None:
         encode_texts(["welfog startup warmup"])
         get_greetings_vecs()
         ensure_kb_vectors()
+        print("[startup] Warming catalog + order fast-path modules...", flush=True)
+        from services.brain_direct_dispatch import try_structural_product_catalog_reply
+
+        try_structural_product_catalog_reply  # noqa: B018 — force import chain at startup
+        from services.product_search_flow import run_product_search_ai_flow
+
+        run_product_search_ai_flow  # noqa: B018
+        from services.order_details_flow import (  # noqa: F401
+            message_wants_order_details_or_invoice,
+        )
+        from utils import helpers  # noqa: F401
+        try:
+            from services.welfog_api import warmup_welfog_category_caches
+
+            warmup_welfog_category_caches()
+            print("[startup] category cache warmup done", flush=True)
+        except Exception as cat_exc:
+            print(f"[startup] category cache warmup skip: {cat_exc}", flush=True)
+        try:
+            from services.ai_service import ai_brain_route
+
+            ai_brain_route("show electronics products", "", "en")
+            print("[startup] routing LLM warmup done", flush=True)
+        except Exception as route_exc:
+            print(f"[startup] routing LLM warmup skip: {route_exc}", flush=True)
         print("[startup] AI embeddings + KB vector index ready", flush=True)
     except Exception as exc:
         print(f"[startup] embedding warmup failed (lazy load on first use): {exc}", flush=True)

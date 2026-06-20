@@ -16,7 +16,50 @@ _IN_RESOLVE = threading.local()
 
 
 def _combined(original_msg: str, msg_en: str = "") -> str:
-    return f"{original_msg or ''} {msg_en or ''}".strip()
+    o = (original_msg or "").strip()
+    e = (msg_en or "").strip()
+    if not o:
+        return e
+    if not e or e.lower() == o.lower():
+        return o
+    return f"{o} {e}".strip()
+
+
+def _chitchat_lane_skips_transactional_guards(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    Greetings / casual openers — skip KB-turn, refund, pincode, thread LLM stack.
+    Uses semantic helpers only (not phrase-list routing).
+    """
+    try:
+        from utils.helpers import (
+            _is_light_smalltalk_fast,
+            _is_short_pure_greeting,
+            _looks_like_greeting_message,
+            message_is_bot_availability_chitchat,
+            message_is_casual_farewell_or_closing,
+            message_is_user_feedback_or_closing,
+        )
+
+        comb = _combined(original_msg, msg_en)
+        if not comb:
+            return False
+        # Ultra-light openers first — avoid deep helper graphs on "hi" / "thanks".
+        if _is_short_pure_greeting(comb) or _is_light_smalltalk_fast(original_msg, msg_en):
+            return True
+        if message_is_bot_availability_chitchat(comb):
+            return True
+        if message_is_user_feedback_or_closing(comb) or message_is_casual_farewell_or_closing(comb):
+            return True
+        if _looks_like_greeting_message(original_msg or comb):
+            return True
+        return False
+    except ImportError:
+        pass
+    return False
 
 
 def _brain_scope_decision(ai_route: dict | None):
@@ -103,6 +146,13 @@ def _should_invoke_chitchat_classifier(
         if turn_is_pincode_delivery_fast_path(
             original_msg, msg_en, conversation_context
         ):
+            return False
+    except ImportError:
+        pass
+    try:
+        from services.refund_intent_fast_path import turn_has_refund_topic
+
+        if turn_has_refund_topic(original_msg, msg_en):
             return False
     except ImportError:
         pass
@@ -286,6 +336,80 @@ def turn_is_chitchat_not_shopping(
     return dec.scope == SCOPE_CHITCHAT
 
 
+def _try_chitchat_scope_only_routing(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+) -> Optional[tuple[Any, dict]]:
+    """One scope LLM — chitchat / out_of_domain / welfog_support (no KB-turn / thread stack)."""
+    from services.answer_router import AnswerRouteDecision
+    from services.conversation_scope import (
+        SCOPE_CHITCHAT,
+        SCOPE_OUT,
+        SCOPE_WELFOG,
+        ai_classify_scope_and_reply,
+        log_scope_routing_telemetry,
+    )
+
+    dec = ai_classify_scope_and_reply(
+        original_msg, msg_en, conversation_context, reply_lang
+    )
+    if not dec:
+        return None
+    if dec.scope == SCOPE_WELFOG:
+        return None
+
+    out: dict = {
+        "user_meaning": dec.user_meaning or "",
+        "reasoning": f"Conversational lane — {dec.scope}",
+        "intent": "general" if dec.scope == SCOPE_CHITCHAT else "out_of_domain",
+        "data_channel": "none",
+        "meta_kind": "conversational",
+        "conversation_scope": dec.scope,
+        "is_welfog_related": dec.scope == SCOPE_CHITCHAT,
+        "needs_order_id": False,
+        "run_catalog_search": False,
+        "numeric_context": "none",
+    }
+    if dec.reply:
+        out["scope_reply"] = dec.reply
+
+    if dec.scope == SCOPE_CHITCHAT:
+        handler = "warm_feedback"
+        intent = "general"
+        source = "chitchat_ai"
+    elif dec.scope == "harm_sensitive":
+        out["intent"] = "out_of_domain"
+        out["is_welfog_related"] = False
+        handler = "off_topic"
+        intent = "out_of_domain"
+        source = "reject"
+    else:
+        out["intent"] = "out_of_domain"
+        out["is_welfog_related"] = False
+        handler = "off_topic"
+        intent = "out_of_domain"
+        source = "reject"
+
+    log_scope_routing_telemetry(
+        scope=dec.scope,
+        route=handler,
+        confidence=dec.confidence,
+        source=dec.source or "scope_llm_fast_lane",
+    )
+    return (
+        AnswerRouteDecision(
+            source=source,
+            intent=intent,
+            handler=handler,
+            is_welfog_related=out.get("is_welfog_related", True),
+            reason=f"Conversational fast lane ({dec.scope}) — {(dec.user_meaning or '')[:80]}",
+        ),
+        out,
+    )
+
+
 def try_chitchat_routing_decision(
     route_data: dict | None,
     original_msg: str,
@@ -307,12 +431,25 @@ def try_chitchat_routing_decision(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
+    if _chitchat_lane_skips_transactional_guards(
+        original_msg, msg_en, conversation_context
+    ):
+        return _try_chitchat_scope_only_routing(
+            original_msg, msg_en, conversation_context, reply_lang
+        )
     try:
         from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
 
         if turn_is_pincode_delivery_fast_path(
             original_msg, msg_en, conversation_context
         ):
+            return None
+    except ImportError:
+        pass
+    try:
+        from services.refund_intent_fast_path import turn_has_refund_topic
+
+        if turn_has_refund_topic(original_msg, msg_en):
             return None
     except ImportError:
         pass
@@ -454,31 +591,84 @@ def try_chitchat_ai_preflight(
     reply_lang: str = "",
 ) -> Optional[tuple[Any, dict]]:
     """
-    Short casual turns — scope LLM before heavy brain route (AI-only, no keyword gate).
+    Deprecated pre-brain path — micro-LLM stack removed; brain route classifies once.
     """
-    from services.conversation_scope import _has_definite_welfog_shopping_signal
-
-    comb = _combined(original_msg, msg_en)
-    if not comb or len(comb) > 180:
-        return None
-    if _has_definite_welfog_shopping_signal(comb):
-        return None
     try:
-        from services.pincode_delivery_fast_path import turn_is_pincode_delivery_fast_path
+        from services.chat_flow_telemetry import should_defer_micro_classifiers_to_brain
 
-        if turn_is_pincode_delivery_fast_path(
-            original_msg, msg_en, conversation_context
-        ):
+        if should_defer_micro_classifiers_to_brain():
             return None
     except ImportError:
         pass
-    low = comb.lower()
-    if re.search(
-        r"\b(?:chahiye|chiye|dikha|dikhao|milega|milegi|mil jayeg|milta|buy|need|want|order|track|refund|"
-        r"pincode|pincod|pin\s*cod|delivery|deliver|service|availab|wishlist|invoice|payment)\b",
-        low,
+    return None
+
+
+def try_conversational_turn_fast_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+) -> Optional[tuple[str, dict]]:
+    """
+    Structural chitchat only (greeting/thanks/bye) — zero LLM.
+    Semantic chitchat is handled by universal ai_brain_route + brain_direct_dispatch.
+    Returns (html_body, ai_route_snapshot) or None to continue the Welfog pipeline.
+    """
+    from services.translation_service import finalize_customer_reply, resolve_customer_reply_lang
+    from utils.helpers import fast_warm_reply_html
+
+    comb = _combined(original_msg, msg_en)
+    if not comb or len(comb) > 200:
+        return None
+
+    # Actionable routes (API/KB/account-list) are handled by ai_brain_route upstream.
+    try:
+        from services.chat_flow_telemetry import get_cached_brain_route
+        from services.account_list_semantics import account_list_route_is_locked
+
+        brain = get_cached_brain_route()
+        if account_list_route_is_locked(brain):
+            return None
+        if isinstance(brain, dict):
+            ch = (brain.get("data_channel") or "").strip().lower()
+            intent = (brain.get("intent") or "").strip().lower()
+            if ch in ("live_api", "catalog", "kb") and intent not in ("general", ""):
+                return None
+            if intent in ("order_history", "wishlist", "order", "refund", "product"):
+                return None
+    except ImportError:
+        pass
+
+    # Obvious transactional turns — never run greeting/KB/shopping guard graphs here.
+    if re.search(r"\b[0-9]{6,20}\b", comb) and re.search(
+        r"\b(order|invoice|refund|track|delivery|shipment)\b", comb, re.I
     ):
         return None
-    return try_chitchat_routing_decision(
-        None, original_msg, msg_en, conversation_context, reply_lang
-    )
+
+    if _chitchat_lane_skips_transactional_guards(
+        original_msg, msg_en, conversation_context
+    ):
+        rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+        tmpl = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
+        if not tmpl:
+            return None
+        body = finalize_customer_reply(tmpl, original_msg or msg_en, rl)
+        if not body:
+            return None
+        route_data = {
+            "intent": "general",
+            "conversation_scope": "general_chitchat",
+            "data_channel": "none",
+            "meta_kind": "conversational",
+            "is_welfog_related": True,
+            "run_catalog_search": False,
+            "needs_order_id": False,
+            "user_meaning": "Casual greeting or closing",
+            "route_handler": "warm_feedback",
+        }
+        log_reasoning(
+            "Conversational structural fast path — template reply (zero LLM)."
+        )
+        return body, route_data
+
+    return None

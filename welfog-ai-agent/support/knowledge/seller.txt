@@ -1,6 +1,6 @@
 Seller account on Welfog (supplier / vendor)
-
-How to create a seller account:
+How to create a seller account
+:
 1) Open the Welfog seller portal or app seller registration page (official Welfog website — Seller / Become a seller).
 2) Register with your mobile number and verify OTP.
 3) Complete business details: shop name, GST (if applicable), bank account for payouts, pickup/warehouse address.

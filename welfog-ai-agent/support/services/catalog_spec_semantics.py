@@ -35,9 +35,53 @@ def ai_set_rating_filter(ai: Optional[dict]) -> bool:
     return ai.get("rating_min") is not None or ai.get("rating_max") is not None
 
 
+def _is_sku_named_label(named: str) -> bool:
+    """True when the token before 'is sku' is a warehouse/catalog code, not a product title."""
+    tok = (named or "").strip(" \"'")
+    if len(tok) < 4:
+        return False
+    try:
+        from services.opensearch_products import (
+            _looks_like_warehouse_sku,
+            _sku_token_acceptable,
+        )
+
+        return bool(
+            _looks_like_warehouse_sku(tok)
+            or _sku_token_acceptable(tok, explicit_sku_mention=True)
+        )
+    except ImportError:
+        return bool(re.search(r"[\-_]", tok) and re.search(r"\d", tok))
+
+
+def resolve_is_sku_label_turn(text: str) -> tuple[str, str]:
+    """
+  For '{name} is sku' turns — return ('sku', code) or ('title', name) or ('', '').
+    """
+    m = re.search(
+        r"^(.+?)\s+is\s+sku(?:\s+ka)?\b",
+        (text or "").strip(),
+        re.IGNORECASE,
+    )
+    if not m:
+        return "", ""
+    named = m.group(1).strip(" \"'")
+    if _is_sku_named_label(named):
+        return "sku", named
+    return "title", named
+
+
+def user_labels_product_title_as_sku(text: str) -> bool:
+    """'Samsung S22 Back Cover is sku ka product' — product title, not a warehouse code."""
+    mode, _ = resolve_is_sku_label_turn(text or "")
+    return mode == "title"
+
+
 def user_mentions_sku_this_turn(text: str) -> bool:
     """SKU filter when user said SKU/code or pasted a warehouse-style code (not prose words)."""
     low = (text or "").lower()
+    if user_labels_product_title_as_sku(text or ""):
+        return False
     if re.search(r"\bsku\b", low):
         return True
     if re.search(r"\b(?:product|item|warehouse)\s+code\b", low):
@@ -82,10 +126,28 @@ def scrub_ai_product_understanding(
         return out
 
     sku = str(out.get("sku") or "").strip()
+    label_mode, label_named = resolve_is_sku_label_turn(comb)
+    if label_mode == "sku":
+        out["sku"] = sku or label_named
+        out["search_terms"] = ""
+        out.pop("brand", None)
+        out.pop("brand_aliases", None)
+        out.pop("color", None)
+        out.pop("model", None)
+        out.pop("product_type", None)
+        out.pop("mandatory_match_tokens", None)
+        sku = str(out.get("sku") or "").strip()
+    elif label_mode == "title":
+        out.pop("sku", None)
+        out["search_terms"] = label_named
+        sku = ""
     if sku:
         if not user_mentions_sku_this_turn(comb):
             out.pop("sku", None)
-        elif not _looks_like_warehouse_sku(sku) or not _is_valid_sku_token(sku):
+        elif not (
+            _looks_like_warehouse_sku(sku)
+            or _is_valid_sku_token(sku, explicit_sku_mention=True)
+        ):
             out.pop("sku", None)
 
     if not user_mentions_rating_this_turn(comb):
@@ -366,5 +428,7 @@ def reconcile_ai_first_catalog_spec(
     except ImportError:
         pass
 
+    if isinstance(ai_understanding, dict) and ai_understanding.get("_ai_first"):
+        spec["_ai_single_pass"] = True
     spec.pop("_catalog_ai", None)
     return spec

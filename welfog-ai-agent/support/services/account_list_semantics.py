@@ -394,6 +394,44 @@ def ai_route_requests_wishlist_howto(
     return True
 
 
+def reconcile_wishlist_from_brain_meaning(route: dict | None) -> dict:
+    """
+    Trust brain user_meaning / account_list_kind when catalog drifted to product search.
+    Uses English brain fields only — not customer-text keyword routing.
+    """
+    out = dict(route or {})
+    kind = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
+    if kind in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
+        return _apply_kind_to_route(out, kind, "brain_account_list_kind")
+
+    blob = _meaning_blob(out)
+    meaning_kind = _kind_from_meaning_blob(blob)
+    if meaning_kind in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
+        return _apply_kind_to_route(out, meaning_kind, "brain_meaning_wishlist")
+
+    intent = (out.get("intent") or "").strip().lower()
+    if intent == "wishlist":
+        k = (
+            KIND_WISHLIST_HOWTO
+            if _route_signals_wishlist_howto(out)
+            else KIND_WISHLIST_IN_CHAT
+        )
+        return _apply_kind_to_route(out, k, "brain_intent_wishlist")
+
+    ch = (out.get("data_channel") or "").strip().lower()
+    if ch == "catalog" or out.get("run_catalog_search"):
+        saved = any(m in blob for m in _SAVED_LIKED_MEANING)
+        bought = any(m in blob for m in _PURCHASE_LIST_MEANING)
+        if saved and not bought:
+            k = (
+                KIND_WISHLIST_HOWTO
+                if _route_signals_wishlist_howto(out)
+                else KIND_WISHLIST_IN_CHAT
+            )
+            return _apply_kind_to_route(out, k, "fix_catalog_wishlist_drift")
+    return out
+
+
 def account_list_route_is_locked(route: dict | None) -> bool:
     """Groq account_list_kind / how-to handler — must not be overridden by catalog or pincode."""
     if not route:
@@ -403,6 +441,52 @@ def account_list_route_is_locked(route: dict | None) -> bool:
         return True
     rh = (route.get("route_handler") or "").strip().lower()
     return rh in ("wishlist_howto_kb", "order_history_howto_kb")
+
+
+def account_list_action_from_brain_route(route: dict | None) -> dict:
+    """Reuse ai_brain_route account_list_kind — no second micro-LLM."""
+    empty = {
+        "action": ACTION_NONE,
+        "topic": "none",
+        "kind": KIND_NONE,
+        "confidence": 0.0,
+        "source": "",
+        "user_meaning": "",
+    }
+    if not isinstance(route, dict):
+        return empty
+    kind = _norm_account_list_kind(
+        coerce_route_str(route.get("account_list_kind"), KIND_NONE)
+    )
+    if kind == KIND_NONE:
+        intent = (route.get("intent") or "").strip().lower()
+        _wishlist_intents = frozenset({
+            "wishlist",
+            "saved_items",
+            "saved_items_list",
+            "liked_items",
+            "saved_list",
+            "favorites",
+            "favourites",
+        })
+        _purchase_intents = frozenset({
+            "order_history",
+            "purchases",
+            "purchase_list",
+            "orders_list",
+            "my_purchases",
+            "bought_items",
+            "past_purchases",
+        })
+        if intent in _wishlist_intents:
+            kind = KIND_WISHLIST_IN_CHAT
+        elif intent in _purchase_intents:
+            kind = KIND_PURCHASE_IN_CHAT
+    if kind == KIND_NONE:
+        return empty
+    action, topic = _kind_to_action_topic(kind)
+    um = (route.get("user_meaning") or route.get("reasoning") or "").strip()
+    return _action_result(kind, 0.92, "ai_brain_route", um or f"Account list — {kind}")
 
 
 def infer_account_list_semantic_goal_from_route(
@@ -475,6 +559,21 @@ def _turn_might_need_account_list_classifier(route: dict, comb: str) -> bool:
     """True when message likely asks for MY saved items vs MY purchases (any wording)."""
     if not (comb or "").strip():
         return False
+    try:
+        from utils.helpers import (
+            _text_wants_order_history_list_in_chat,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
+        )
+
+        if message_is_wishlist_like_request(comb):
+            return True
+        if message_is_past_purchase_list_request(comb) or _text_wants_order_history_list_in_chat(
+            comb, ""
+        ):
+            return True
+    except ImportError:
+        pass
     intent = (route.get("intent") or "").strip().lower()
     if intent in ("wishlist", "order_history"):
         return True
@@ -502,7 +601,7 @@ def _turn_might_need_account_list_classifier(route: dict, comb: str) -> bool:
         return True
     tl = f" {comb.lower()} "
     possessive = bool(
-        re.search(r"\b(?:meri|mere|mera|mujhe|my|apni|apna|apne)\b", tl)
+        re.search(r"\b(?:meri|mere|mera|meroi|meral|mujhe|my|apni|apna|apne)\b", tl)
     )
     list_ask = bool(
         re.search(
@@ -532,7 +631,7 @@ def ai_classify_account_list_turn(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -542,7 +641,7 @@ def ai_classify_account_list_turn(
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -772,6 +871,12 @@ def resolve_account_list_action(
         _ACTION_RESOLVE_CACHE.result = {"key": cache_key, "value": result}
         return result
 
+    kw = _keyword_resolve_account_list_action(comb, conversation_context, ai_route)
+    kw_kind = _norm_account_list_kind(kw.get("kind") or KIND_NONE)
+    kw_conf = float(kw.get("confidence") or 0.0)
+    if kw_kind != KIND_NONE and kw_conf >= 0.72:
+        return _finish(kw)
+
     if ai_route:
         kind = _norm_account_list_kind(
             coerce_route_str(ai_route.get("account_list_kind"), KIND_NONE)
@@ -787,20 +892,31 @@ def resolve_account_list_action(
             )
 
     intent = ((ai_route or {}).get("intent") or "").strip().lower()
+    universal_brain = bool((ai_route or {}).get("_universal_brain_route"))
     topic_turn = intent in ("wishlist", "order_history") or _turn_might_need_account_list_classifier(
         ai_route or {}, comb
     )
     if not topic_turn and not comb.strip():
         return _finish(_empty_account_list_action())
 
-    if allow_llm and comb.strip() and topic_turn:
+    if universal_brain and kw_kind != KIND_NONE:
+        return _finish(kw)
+
+    if allow_llm and comb.strip() and topic_turn and not universal_brain:
         from services.semantic_intent import llm_semantic_route_available
 
         llm_ok = llm_semantic_route_available(ai_route or {})
         if llm_ok or intent in ("wishlist", "order_history"):
-            classified = ai_classify_account_list_turn(
-                original_msg, msg_en, conversation_context, reply_lang
-            )
+            try:
+                from services.turn_intent_coordinator import get_account_list_ai_classification
+
+                classified = get_account_list_ai_classification(
+                    original_msg, msg_en, conversation_context, reply_lang
+                )
+            except ImportError:
+                classified = ai_classify_account_list_turn(
+                    original_msg, msg_en, conversation_context, reply_lang
+                )
             if classified:
                 ck = _norm_account_list_kind(classified.get("account_list_kind") or KIND_NONE)
                 conf = float(classified.get("confidence") or 0.0)
@@ -857,6 +973,8 @@ def _apply_kind_to_route(out: dict, kind: str, source: str) -> dict:
     out["needs_order_id"] = False
     out["numeric_context"] = "none"
     out["search_query"] = ""
+    out["run_catalog_search"] = False
+    out.pop("_product_catalog_locked", None)
     out["continue_previous_topic"] = False
     out.pop("_semantic_override", None)
 
@@ -1022,11 +1140,6 @@ def _brain_followup_topic(ai_route: dict | None) -> str:
         return "wishlist"
     if kind == KIND_PURCHASE_IN_CHAT:
         return "order_history"
-    inferred = _kind_from_meaning_blob(_meaning_blob(ai_route))
-    if inferred == KIND_WISHLIST_IN_CHAT:
-        return "wishlist"
-    if inferred == KIND_PURCHASE_IN_CHAT:
-        return "order_history"
     return ""
 
 
@@ -1046,7 +1159,7 @@ def ai_classify_account_list_followup_turn(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
@@ -1058,7 +1171,7 @@ def ai_classify_account_list_followup_turn(
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -1576,6 +1689,8 @@ def promote_account_list_on_route(
     msg_en: str = "",
     conversation_context: str = "",
     reply_lang: str = "",
+    *,
+    allow_llm: bool = True,
 ) -> dict:
     """
     Align intent with account_list_kind / user_meaning / micro-classifier.
@@ -1584,6 +1699,44 @@ def promote_account_list_on_route(
     out = dict(route or {})
     comb = _combined(original_msg, msg_en)
     intent_pre = (out.get("intent") or "").strip().lower()
+
+    out = reconcile_wishlist_from_brain_meaning(out)
+    if account_list_route_is_locked(out):
+        kind = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
+        if kind != KIND_NONE:
+            return _apply_kind_to_route(out, kind, "brain_wishlist_reconcile")
+
+    if out.get("_universal_brain_route"):
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+
+            ch_pre = (out.get("data_channel") or "").strip().lower()
+            rh_pre = (out.get("route_handler") or "").strip().lower()
+            olk = (out.get("order_lookup_kind") or "").strip().lower()
+            if account_list_route_is_locked(out):
+                kind = _norm_account_list_kind(
+                    coerce_route_str(out.get("account_list_kind"), KIND_NONE)
+                )
+                if kind != KIND_NONE:
+                    return _apply_kind_to_route(out, kind, "account_list_locked")
+            if product_catalog_route_is_locked(out) or (
+                intent_pre == "product" and ch_pre == "catalog"
+            ):
+                return out
+            if rh_pre == "refund_status_api" or olk == "refund_status":
+                return out
+            if olk in ("invoice", "details", "track", "tracking", "refund_status"):
+                return out
+            if rh_pre in (
+                "order_details_api",
+                "order_tracking_api",
+                "refund_status_api",
+            ):
+                return out
+            if account_list_route_is_locked(out):
+                return out
+        except ImportError:
+            pass
 
     if _route_blocks_account_list_promotion(out, original_msg, msg_en, conversation_context):
         log_reasoning("Account-list promotion skipped — pincode/delivery serviceability route locked.")
@@ -1595,6 +1748,7 @@ def promote_account_list_on_route(
         conversation_context,
         ai_route=out,
         reply_lang=reply_lang,
+        allow_llm=allow_llm and not out.get("_universal_brain_route"),
     )
     if follow_topic == "wishlist":
         return _apply_kind_to_route(out, KIND_WISHLIST_IN_CHAT, "howto_followup")
@@ -1602,24 +1756,40 @@ def promote_account_list_on_route(
         return _apply_kind_to_route(out, KIND_PURCHASE_IN_CHAT, "howto_followup")
 
     existing = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
+    try:
+        from utils.helpers import (
+            _text_wants_order_history_list_in_chat,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
+        )
+
+        keyword_account_turn = (
+            message_is_wishlist_like_request(comb)
+            or message_is_past_purchase_list_request(comb)
+            or _text_wants_order_history_list_in_chat(comb, conversation_context)
+        )
+    except ImportError:
+        keyword_account_turn = False
     account_list_turn = bool(
         comb
         and (
             intent_pre in ("wishlist", "order_history", "general")
             or existing != KIND_NONE
+            or keyword_account_turn
             or _turn_might_need_account_list_classifier(out, comb)
         )
     )
     if account_list_turn:
         route_for_resolve = dict(out)
         route_for_resolve["account_list_kind"] = KIND_NONE
+        llm_ok = allow_llm and not out.get("llm_unavailable") and not out.get("_universal_brain_route")
         resolved = resolve_account_list_action(
             original_msg,
             msg_en,
             conversation_context,
             route_for_resolve,
             reply_lang,
-            allow_llm=not out.get("llm_unavailable"),
+            allow_llm=llm_ok,
         )
         kind = _norm_account_list_kind(resolved.get("kind") or KIND_NONE)
         if kind != KIND_NONE:

@@ -20,7 +20,8 @@ from services.welfog_api import (
 from utils.reasoning_log import chat_log, log_reasoning
 
 _INVOICE_RE = re.compile(
-    r"(?:\binvoice\b|\binvoic\w*\b|\bbill\b|\breceipt\b|\bgst\b|tax\s+invoice|"
+    r"(?:\binvoice\b|\binvoic\w*\b|\binvolv\w*\b|\binvoce\b|\binvois\b|\brecipt\b|\bchalan\b|\bchallan\b|"
+    r"\bbill\b|\breceipt\b|\bgst\b|tax\s+invoice|"
     r"download\s+bill|bill\s+download|invoice\s+download|download\s+invoice|"
     r"चालान|बिल|இன்வாய்ஸ்|பில்)",
     re.IGNORECASE,
@@ -96,6 +97,15 @@ _ORDER_DETAILS_EXPLICIT_PHRASES = (
     "order data",
     "order ki detail",
     "order ke detail",
+    "order ki details",
+    "order ke details",
+    "details chahiye",
+    "detail chahiye",
+    "saari details",
+    "sari details",
+    "poori details",
+    "all details",
+    "full details",
     "order_details",
     "ஆர்டர் விவர",
 )
@@ -115,9 +125,10 @@ _LOOSE_DETAIL_ACTION_MARKERS = (
 )
 
 _PAYMENT_FOCUS_RE = re.compile(
-    r"(?:payment\s+status|paid\s+or\s+not|payment\s+done|paisa|paid|unpaid|cod|"
+    r"(?:payment\s+status|paid\s+or\s+not|payment\s+done|paisa|\bpaid\b|unpaid|\bcod\b|"
     r"upi|razorpay|payment\s+mode|kitna\s+pay|payment\s+ka|"
     r"\bamount\b|total\s+amount|grand\s+total|kitna\s+tha|kitne\s+ka|kitne\s+rs|"
+    r"kitni\s+thi|kitna\s+tha|kitne\s+the|\bprice\b|\bdaam\b|\bcost\b|"
     r"how\s+much\s+(?:did\s+i\s+)?pay|order\s+amount)",
     re.IGNORECASE,
 )
@@ -139,7 +150,7 @@ _DELIVERY_FOCUS_RE = re.compile(
 _DETAILS_LOOSE_RE = re.compile(
     r"(?:\borders?\b).{0,40}(?:detail|info|summary|breakdown|data|status\s+of)|"
     r"(?:order\s+detail|order\s+info|order\s+summary|payment\s+for\s+order|"
-    r"details\s+of\s+order|order\s+ka\s+status)",
+    r"details\s+of\s+order)",
     re.IGNORECASE,
 )
 
@@ -344,6 +355,10 @@ def _resolve_brain_goal_with_message_override(
     if _user_rejects_invoice_wants_details(comb, conversation_context):
         if brain_goal == "order_invoice":
             return "order_details"
+    if _text_wants_order_details_not_tracking(comb, conversation_context):
+        return "order_details"
+    if _text_wants_order_invoice(comb, conversation_context):
+        return "order_invoice"
     fast = _fast_order_lookup_goal(comb, "", conversation_context)
     if fast in ("order_invoice", "order_details"):
         return fast
@@ -358,45 +373,22 @@ def _resolve_brain_goal_with_message_override(
 def _goal_from_brain_route(ai_route: dict | None) -> str:
     if not isinstance(ai_route, dict):
         return ""
-    intent = str(ai_route.get("intent") or "").strip().lower()
-    if intent == "invoice":
-        return "order_invoice"
-    olk = str(ai_route.get("order_lookup_kind") or "").strip().lower()
-    if olk in ("invoice", "order_invoice"):
-        return "order_invoice"
-    if olk in ("details", "order_details"):
-        return "order_details"
-    if olk in ("track", "tracking", "track_single_order"):
-        return "track_single_order"
-    um = str(ai_route.get("user_meaning") or "").lower()
-    if any(x in um for x in ("invoice", "bill", "receipt", "gst", "tax invoice")):
-        return "order_invoice"
-    if any(
-        x in um
-        for x in (
-            "order detail",
-            "order details",
-            "payment status",
-            "product in order",
-            "what did i order",
-            "delivery address",
-            "shipping address",
-            "address",
-            "amount",
-            "total",
-            "grand total",
-            "how much",
-        )
-    ):
-        return "order_details"
-    if any(x in um for x in ("refund status", "return status", "refund for", "return for")):
+    try:
+        from services.ai_route_semantics import brain_route_to_live_goal
+        from services.semantic_intent import llm_semantic_route_available
+
+        if not llm_semantic_route_available(ai_route):
+            return ""
+        live = brain_route_to_live_goal(ai_route)
+        back_map = {
+            "order_invoice": "order_invoice",
+            "order_details": "order_details",
+            "track": "track_single_order",
+            "refund_status": "refund_status",
+        }
+        return back_map.get(live, "")
+    except ImportError:
         return ""
-    if any(
-        x in um
-        for x in ("track", "tracking", "eta", "where is", "kab aayega", "shipment", "courier")
-    ):
-        return "track_single_order"
-    return ""
 
 
 def _single_order_from_locked_ai_route(
@@ -432,17 +424,25 @@ def _single_order_from_locked_ai_route(
                 goal, comb, conversation_context
             )
         elif rh == "order_tracking_api" or olk in ("track", "tracking"):
-            fast = _fast_order_lookup_goal(comb, "", conversation_context, ai_route)
-            if fast in ("order_invoice", "order_details"):
-                goal = fast
-            elif fast == "track_single_order":
-                goal = fast
-            elif _text_wants_order_invoice(comb, conversation_context):
-                goal = "order_invoice"
-            elif _text_wants_order_details_not_tracking(comb, conversation_context):
-                goal = "order_details"
-            else:
+            if olk in ("track", "tracking"):
                 goal = "track_single_order"
+            else:
+                try:
+                    from services.order_live_intent_fast_path import (
+                        _keyword_intent_fallback_enabled,
+                    )
+
+                    keyword_ok = _keyword_intent_fallback_enabled()
+                except ImportError:
+                    keyword_ok = False
+                if keyword_ok:
+                    fast = _fast_order_lookup_goal(comb, "", conversation_context, ai_route)
+                    if fast in ("order_invoice", "order_details", "track_single_order"):
+                        goal = fast
+                    elif _text_wants_order_invoice(comb, conversation_context):
+                        goal = "order_invoice"
+                    elif _text_wants_order_details_not_tracking(comb, conversation_context):
+                        goal = "order_details"
         elif rh == "refund_status_api" or olk == "refund_status":
             return None
         elif intent == "refund":
@@ -644,6 +644,57 @@ def _should_run_single_order_ai(
                 return False
             intent = (ai_route.get("intent") or "").strip().lower()
             ch = (ai_route.get("data_channel") or "").strip().lower()
+            if intent in ("wishlist", "order_history"):
+                return False
+            if intent == "product" and ch == "catalog":
+                try:
+                    from services.product_catalog_resolver import product_catalog_route_is_locked
+
+                    if product_catalog_route_is_locked(ai_route):
+                        return False
+                except ImportError:
+                    pass
+            if ai_route.get("_universal_brain_route"):
+                try:
+                    from services.account_list_semantics import (
+                        KIND_PURCHASE_IN_CHAT,
+                        KIND_WISHLIST_IN_CHAT,
+                        _norm_account_list_kind,
+                    )
+
+                    alk = _norm_account_list_kind(ai_route.get("account_list_kind") or "")
+                    if alk in (KIND_WISHLIST_IN_CHAT, KIND_PURCHASE_IN_CHAT):
+                        return False
+                except ImportError:
+                    pass
+                intent_ub = (ai_route.get("intent") or "").strip().lower()
+                ch_ub = (ai_route.get("data_channel") or "").strip().lower()
+                if ch_ub == "live_api" and intent_ub in (
+                    "order",
+                    "refund",
+                    "payment",
+                    "invoice",
+                    "order_bill_request",
+                    "order_bill",
+                    "bill",
+                    "receipt",
+                ):
+                    return False
+                olk_ub = (ai_route.get("order_lookup_kind") or "").strip().lower()
+                rh_ub = (ai_route.get("route_handler") or "").strip().lower()
+                if olk_ub in (
+                    "refund_status",
+                    "invoice",
+                    "details",
+                    "order_details",
+                    "track",
+                    "tracking",
+                ) or rh_ub in (
+                    "refund_status_api",
+                    "order_details_api",
+                    "order_tracking_api",
+                ):
+                    return False
             if intent in ("general", "refund", "payment", "seller") and ch == "kb":
                 if not ai_route.get("needs_order_id"):
                     return False
@@ -657,17 +708,24 @@ def _should_run_single_order_ai(
 
 
 def _groq_single_order_json(system_prompt: str, user_payload: str) -> Optional[dict]:
-    from services.llm_providers import llm_json_chat_completion
+    from services.ai_service import (
+        _llm_classifier_provider_chain,
+        _llm_json_with_provider_fallback,
+    )
 
     try:
-        return llm_json_chat_completion(
+        providers = _llm_classifier_provider_chain()
+        if not providers:
+            return None
+        return _llm_json_with_provider_fallback(
+            providers,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload},
             ],
             max_tokens=320,
-            timeout_sec=14,
-            max_attempts=2,
+            timeout_sec=12,
+            max_attempts=1,
         )
     except Exception as e:
         log_reasoning(f"Single-order AI understand error: {e}")
@@ -1323,7 +1381,7 @@ def understand_single_order_request(
     Primary classifier for one-order flows. Cached per request thread to avoid duplicate LLM calls.
     Returns goal: '' | order_invoice | order_details | track_single_order
     """
-    comb = _combined(original_msg, msg_en)
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
     cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-500:])}"
     if (
         not force_refresh
@@ -1331,6 +1389,78 @@ def understand_single_order_request(
         and isinstance(getattr(_SINGLE_ORDER_CACHE, "result", None), dict)
     ):
         return _SINGLE_ORDER_CACHE.result
+
+    if comb:
+        try:
+            from services.conversation_scope import _has_definite_welfog_shopping_signal
+            from utils.helpers import extract_order_id
+
+            if _has_definite_welfog_shopping_signal(comb) and not extract_order_id(
+                comb, conversation_context
+            ):
+                shop_skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "definite_shopping_signal",
+                    "reasoning": "Catalog shopping turn — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = shop_skip
+                return shop_skip
+        except ImportError:
+            pass
+        try:
+            from utils.helpers import (
+                _message_looks_like_shopping_query,
+                message_is_wishlist_like_request,
+                message_is_past_purchase_list_request,
+            )
+
+            if (
+                _message_looks_like_shopping_query(comb)
+                or message_is_wishlist_like_request(comb)
+                or message_is_past_purchase_list_request(comb)
+            ):
+                shop_skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "shopping_or_account_list",
+                    "reasoning": "Product browse / wishlist / order list — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = shop_skip
+                return shop_skip
+        except ImportError:
+            pass
+
+    if isinstance(ai_route, dict):
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+
+            if product_catalog_route_is_locked(ai_route):
+                skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "product_catalog_locked",
+                    "reasoning": "Product catalog search — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = skip
+                return skip
+        except ImportError:
+            pass
 
     if getattr(_UNDERSTAND_GUARD, "active", False):
         return {
@@ -1385,6 +1515,90 @@ def understand_single_order_request(
             return empty
 
         try:
+            from utils.helpers import classify_bare_numeric_turn
+
+            if re.fullmatch(r"[1-9]\d{5}\s*\??", comb.strip()):
+                if classify_bare_numeric_turn(
+                    comb, conversation_context, ai_route=ai_route
+                ) == "pincode":
+                    not_order = {
+                        "goal": "",
+                        "action": "not_order_topic",
+                        "field_focus": "summary",
+                        "order_id": "",
+                        "confidence": "high",
+                        "source": "bare_pincode_context",
+                        "reasoning": "Bare PIN after delivery check — not order id.",
+                        "is_welfog_related": True,
+                    }
+                    _SINGLE_ORDER_CACHE.key = cache_key
+                    _SINGLE_ORDER_CACHE.result = not_order
+                    log_reasoning(
+                        "Single-order AI skipped — bare PIN in pincode thread."
+                    )
+                    return not_order
+        except ImportError:
+            pass
+
+        try:
+            from services.catalog_turn_semantics import should_skip_catalog_for_conversational_turn
+
+            if should_skip_catalog_for_conversational_turn(
+                original_msg, msg_en, conversation_context
+            ):
+                conv_skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "conversational_turn",
+                    "reasoning": "Greeting/chitchat — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = conv_skip
+                return conv_skip
+        except ImportError:
+            pass
+
+        if isinstance(ai_route, dict):
+            scope = (ai_route.get("conversation_scope") or "").strip().lower()
+            intent_ar = (ai_route.get("intent") or "").strip().lower()
+            meta = (ai_route.get("meta_kind") or "").strip().lower()
+            if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+                conv_skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "brain_scope",
+                    "reasoning": f"Brain scope={scope} — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = conv_skip
+                return conv_skip
+            if intent_ar in ("general", "out_of_domain") or meta in (
+                "conversational",
+                "assistant_intro",
+            ):
+                conv_skip = {
+                    "goal": "",
+                    "action": "not_order_topic",
+                    "field_focus": "summary",
+                    "order_id": "",
+                    "confidence": "high",
+                    "source": "brain_intent",
+                    "reasoning": "Brain general/chitchat — not single-order lookup.",
+                    "is_welfog_related": True,
+                }
+                _SINGLE_ORDER_CACHE.key = cache_key
+                _SINGLE_ORDER_CACHE.result = conv_skip
+                return conv_skip
+
+        try:
             from services.refund_status_semantics import current_turn_wants_personal_refund_status
 
             if current_turn_wants_personal_refund_status(
@@ -1412,6 +1626,31 @@ def understand_single_order_request(
                 return refund_skip
         except ImportError:
             pass
+
+        light = _lightweight_details_or_invoice_signal(comb)
+        if light in ("order_invoice", "order_details"):
+            try:
+                from utils.helpers import extract_order_id
+
+                oid = extract_order_id(comb, conversation_context) or ""
+            except ImportError:
+                oid = ""
+            light_result = {
+                "goal": light,
+                "action": light,
+                "field_focus": "invoice" if light == "order_invoice" else detect_order_details_focus(comb, action=light),
+                "order_id": oid,
+                "confidence": "high",
+                "source": "lightweight_heuristic",
+                "reasoning": "Invoice/details markers — skip single-order LLM.",
+                "is_welfog_related": True,
+            }
+            _SINGLE_ORDER_CACHE.key = cache_key
+            _SINGLE_ORDER_CACHE.result = light_result
+            log_reasoning(
+                f"[order-intent] goal={light} source=lightweight_heuristic oid={oid or '-'}"
+            )
+            return light_result
 
         brain_goal = _goal_from_brain_route(ai_route)
         route_locked = _single_order_from_locked_ai_route(
@@ -1533,6 +1772,33 @@ def _lightweight_details_or_invoice_signal(text: str) -> str:
 def _lightweight_details_or_invoice_signal_impl(text: str) -> str:
     if not (text or "").strip():
         return ""
+    try:
+        from utils.helpers import (
+            _leaf_non_tracking_order_id_intent,
+            _text_is_order_tracking_intent_leaf,
+            _text_is_pincode_serviceability_question_light,
+        )
+
+        if _text_is_pincode_serviceability_question_light(text):
+            return ""
+        if _leaf_non_tracking_order_id_intent(text):
+            if _text_wants_order_invoice(text, ""):
+                return "order_invoice"
+            try:
+                from services.refund_status_semantics import _message_has_refund_topic
+                from utils.helpers import _text_is_refund_return_status_lookup
+
+                if _message_has_refund_topic(text) or _text_is_refund_return_status_lookup(
+                    text, ""
+                ):
+                    return ""
+            except ImportError:
+                pass
+            return "order_details"
+        if _text_is_order_tracking_intent_leaf(text):
+            return ""
+    except ImportError:
+        pass
     if _user_rejects_invoice_wants_details(text, ""):
         if re.search(r"\borders?\b", f" {text.lower()} ") or re.search(
             r"\b\d{4,20}\b", text
@@ -1604,6 +1870,79 @@ def message_wants_order_details_or_invoice(
     ai_route: dict | None = None,
 ) -> str:
     """'' | 'order_invoice' | 'order_details' — blocks live tracking shortcuts."""
+    comb = _combined(original_msg, msg_en)
+    try:
+        from utils.helpers import message_is_general_delivery_policy_question
+
+        if message_is_general_delivery_policy_question(comb):
+            return ""
+    except ImportError:
+        pass
+    try:
+        from services.catalog_turn_semantics import should_skip_catalog_for_conversational_turn
+
+        if should_skip_catalog_for_conversational_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            return ""
+    except ImportError:
+        pass
+    comb = _combined(original_msg, msg_en)
+    light = _lightweight_details_or_invoice_signal(comb)
+    if light in ("order_invoice", "order_details"):
+        return light
+    if _text_wants_order_invoice(comb, conversation_context) or _conversation_hints_invoice_followup(
+        comb, conversation_context
+    ):
+        return "order_invoice"
+    if _text_wants_order_details_not_tracking(comb, conversation_context):
+        return "order_details"
+    if isinstance(ai_route, dict):
+        try:
+            from services.ai_route_semantics import resolve_order_live_goal_for_turn
+
+            live = resolve_order_live_goal_for_turn(
+                ai_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
+            )
+            if live == "order_invoice":
+                return "order_invoice"
+            if live in ("order_details", "payment"):
+                return "order_details"
+        except ImportError:
+            pass
+        scope = (ai_route.get("conversation_scope") or "").strip().lower()
+        if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+            return ""
+        intent = (ai_route.get("intent") or "").strip().lower()
+        meta = (ai_route.get("meta_kind") or "").strip().lower()
+        channel = (ai_route.get("data_channel") or "").strip().lower()
+        if channel == "catalog" or intent == "product":
+            return ""
+        if channel == "kb" and not ai_route.get("needs_order_id") and intent not in (
+            "order",
+            "payment",
+            "refund",
+        ):
+            return ""
+        if intent in (
+            "general",
+            "out_of_domain",
+            "product",
+            "order_history",
+            "wishlist",
+            "seller",
+            "deals",
+            "categories",
+        ) or meta in ("conversational", "assistant_intro"):
+            return ""
+    fast = _fast_order_lookup_goal(
+        original_msg, msg_en, conversation_context, ai_route=ai_route
+    )
+    if fast in ("order_invoice", "order_details"):
+        return fast
     sub = understand_single_order_request(
         original_msg, msg_en, conversation_context, ai_route=ai_route
     )
@@ -1761,6 +2100,13 @@ def _text_wants_order_invoice(text: str, conversation_context: str = "") -> bool
 def _text_wants_order_details_not_tracking(text: str, conversation_context: str = "") -> bool:
     if not (text or "").strip():
         return False
+    try:
+        from services.catalog_turn_semantics import should_skip_catalog_for_conversational_turn
+
+        if should_skip_catalog_for_conversational_turn(text, text.lower(), conversation_context):
+            return False
+    except ImportError:
+        pass
     try:
         from services.refund_status_semantics import current_turn_wants_personal_refund_status
 
@@ -2270,6 +2616,24 @@ def promote_order_details_on_route(
 ) -> dict:
     """Align Groq route with personal order details/invoice (before refund-status promotion)."""
     out = dict(route or {})
+    if out.get("_universal_brain_route"):
+        try:
+            from services.ai_route_semantics import (
+                correct_order_details_vs_tracking_from_ai_meaning,
+                lock_order_live_api_from_brain,
+            )
+
+            out = correct_order_details_vs_tracking_from_ai_meaning(out)
+        except ImportError:
+            pass
+        olk_ub = (out.get("order_lookup_kind") or "").strip().lower()
+        if olk_ub in ("details", "invoice", "track", "refund_status"):
+            try:
+                from services.ai_route_semantics import lock_order_live_api_from_brain
+
+                return lock_order_live_api_from_brain(out)
+            except ImportError:
+                return out
     comb = _combined(original_msg, msg_en)
 
     try:

@@ -214,7 +214,7 @@ def ai_pincode_conversational_reply(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import (
@@ -288,7 +288,7 @@ JSON only."""
         user_payload += f"\nRECENT CONVERSATION:\n{compact_ctx}\n"
     user_payload += f"\nLATEST USER MESSAGE:\n{user_line}"
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return ""
 
@@ -503,9 +503,12 @@ def run_delivery_location_check(
     conversation_context: str = "",
     reply_lang: str = "en",
     ai_route: dict | None = None,
+    *,
+    allow_llm: bool = True,
 ) -> OrderFlowResult:
     """
     AI-first: city name → geocode → PIN → live API, or direct PIN, or ask_pin.
+    When brain already locked pincode intent, pass allow_llm=False to skip micro-classifiers.
     """
     from services.location_delivery_resolver import (
         ResolvedDeliveryLocation,
@@ -520,7 +523,7 @@ def run_delivery_location_check(
         msg_en,
         conversation_context,
         ai_route=ai_route,
-        allow_llm=True,
+        allow_llm=allow_llm,
     ):
         return OrderFlowResult(handled=False)
 
@@ -535,7 +538,7 @@ def run_delivery_location_check(
         conversation_context,
         ai_route=ai_route,
         reply_lang=rl,
-        allow_llm=True,
+        allow_llm=allow_llm,
     )
     loc: ResolvedDeliveryLocation = resolve_delivery_check_target(
         original_msg,
@@ -543,7 +546,7 @@ def run_delivery_location_check(
         conversation_context,
         ai_route=ai_route,
         reply_lang=rl,
-        allow_llm=True,
+        allow_llm=allow_llm,
     )
     if loc.kind == "ask_pin":
         if not should_ask_user_for_pincode(

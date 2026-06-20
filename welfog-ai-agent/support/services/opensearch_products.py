@@ -1,12 +1,23 @@
 """OpenSearch product search — filters by size, color, brand, price, SKU, pro_id, pagination."""
 import os
 import re
+import threading
 from html import escape as html_escape
 from typing import Any, Optional
 
 import requests
 
 from services.welfog_api import _normalize_color, fetch_products_from_api
+
+_OS_REQUEST_TLS = threading.local()
+
+
+def reset_opensearch_request_count() -> None:
+    _OS_REQUEST_TLS.count = 0
+
+
+def get_opensearch_request_count() -> int:
+    return int(getattr(_OS_REQUEST_TLS, "count", 0) or 0)
 
 IMAGE_BASE_URL = "https://d1f02fefkbso7w.cloudfront.net/"
 PAGE_SIZE = 8
@@ -241,7 +252,8 @@ _CONFLICTING_COLOR_HINTS = {
 }
 _UNDER_PRICE_MARKERS = re.compile(
     r"(?:\bunder\b|\bbelow\b|less\s+than|\bupto\b|up\s+to|\bwithin\b|\bmax\b|"
-    r"\bse\s+kam\b|\bse\s+niche\b|\bke\s+neeche\b|\bke\s+niche\b|kam\s+price|kam\s+me|"
+    r"\bse\s+kam\b|\bse\s+niche\b|\bke\s+neeche\b|\bke\s+niche\b|\bke\s+andar\b|"
+    r"\bandar\s+andar\b|kam\s+price|kam\s+me|"
     r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*(?:budget|range)\b|"
     r"\bi\s+have\s+(?:only\s+)?(?:rs|₹|inr|\d)|\bbudget\s+of\b|"
     r"இன்\s*கீழ்|கீழ்|க்கு\s*கீழ்|"
@@ -439,6 +451,11 @@ def _looks_like_warehouse_sku(tok: str) -> bool:
             return True
     if "_" in t and re.search(r"[A-Za-z0-9]", t):
         return True
+    if "-" in t and len(t) >= 5:
+        parts = [p for p in t.split("-") if p]
+        if len(parts) >= 2 and any(len(p) >= 2 for p in parts):
+            if any(c.isupper() for c in t) or any(re.search(r"\d", p) for p in parts):
+                return True
     return False
 
 
@@ -492,12 +509,66 @@ def _normalize_explicit_sku_capture(raw_tok: str) -> str:
     tok = re.sub(r"\s+", " ", (raw_tok or "").strip())
     if not tok:
         return ""
+    tok = re.sub(r"^(?:de|do)\s+", "", tok, flags=re.I)
     tok = re.split(
         r"\s+(?:yeh|ye|this)\s+(?:sku|product)\b",
         tok,
         maxsplit=1,
         flags=re.I,
     )[0].strip()
+    tok = _strip_sku_leading_fillers(tok)
+    refined = _best_warehouse_sku_span(tok)
+    return refined or tok
+
+
+_SKU_LEADING_FILLERS = frozenset(
+    {
+        "jara", "zara", "bata", "btana", "btao", "btado", "batao", "bataiye", "batao",
+        "dikha", "dikhao", "dikha do", "de", "do", "show", "find", "please", "plz",
+        "bhai", "yar", "yrr", "na", "hi", "haan", "bol", "bolo", "bta", "bata",
+        "btana", "btao", "thoda", "abhi", "mujhe", "mere", "ko", "ka", "ki", "ke",
+    }
+)
+
+
+def _strip_sku_leading_fillers(text: str) -> str:
+    words = re.split(r"\s+", (text or "").strip())
+    while words and words[0].lower() in _SKU_LEADING_FILLERS:
+        words.pop(0)
+    return " ".join(words).strip()
+
+
+def _best_warehouse_sku_span(text: str) -> str:
+    """
+    Pick the warehouse SKU span from noisy captures like
+    'jara INFINIX HOT 10 PLAY-EGL-SP' → 'INFINIX HOT 10 PLAY-EGL-SP'.
+    """
+    parts = re.split(r"\s+", (text or "").strip())
+    if not parts:
+        return ""
+    best = ""
+    for i in range(len(parts)):
+        candidate = " ".join(parts[i:])
+        if not candidate:
+            continue
+        if _looks_like_spaced_catalog_sku(candidate):
+            return candidate
+        if _sku_token_acceptable(candidate, explicit_sku_mention=True):
+            if len(candidate) > len(best):
+                best = candidate
+    return best
+
+
+def _refine_extracted_sku(raw: str) -> str:
+    """Final cleanup on an extracted SKU token."""
+    tok = _normalize_explicit_sku_capture(raw)
+    if not tok:
+        return ""
+    if _sku_token_acceptable(tok, explicit_sku_mention=True):
+        return tok
+    refined = _best_warehouse_sku_span(tok)
+    if refined and _sku_token_acceptable(refined, explicit_sku_mention=True):
+        return refined
     return tok
 
 
@@ -568,7 +639,23 @@ def _extract_sku_from_text(raw: str) -> Optional[str]:
             candidates.append((85, tok))
 
     for m in re.finditer(
-        r"\bsku\s+ka\s+product\b[^\n]{0,50}?(?:dikha\w*|show|find|de|bata\w*)\s+(.+?)\s*$",
+        r"\b(?:is\s+)?sku\s+ka\s+(?:bta\w*\s+de|bata\w*\s+de|dikha\w*|show|find|de)\s+(.+?)\s*$",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = _normalize_explicit_sku_capture(m.group(1))
+        if _sku_token_acceptable(tok, explicit_sku_mention=True):
+            candidates.append((97, tok))
+    for m in re.finditer(
+        r"\b(?:is\s+)?sku\s+ka\s+product\s+(?:bta\w*|bata\w*|btana|dikha\w*|de|show|find)\s+(.+?)\s*$",
+        raw,
+        re.IGNORECASE,
+    ):
+        tok = _normalize_explicit_sku_capture(m.group(1))
+        if _sku_token_acceptable(tok, explicit_sku_mention=True):
+            candidates.append((98, tok))
+    for m in re.finditer(
+        r"\bsku\s+ka\s+product\b[^\n]{0,50}?(?:bta\w*|btana|dikha\w*|show|find|de|bata\w*)\s+(.+?)\s*$",
         raw,
         re.IGNORECASE,
     ):
@@ -587,7 +674,7 @@ def _extract_sku_from_text(raw: str) -> Optional[str]:
     if not candidates:
         return None
     candidates.sort(key=lambda x: (-x[0], -len(x[1])))
-    return candidates[0][1]
+    return _refine_extracted_sku(candidates[0][1])
 
 
 def _turn_mentions_rating_filter(text: str) -> bool:
@@ -606,7 +693,11 @@ def _user_mentions_price_this_turn(text: str) -> bool:
     for pat in _BUDGET_AMOUNT_PATTERNS:
         if re.search(pat, low, re.I):
             return True
-    if re.search(r"\b(\d{2,7})\s*se\s+kam\b", low):
+    if re.search(r"\b(\d{1,7})\s*se\s+kam\b", low):
+        return True
+    if re.search(r"\b(\d{1,7})\s*rs?\s*ke\s+andar\b", low, re.I):
+        return True
+    if re.search(r"\bke\s+andar\b", low) and re.search(r"\d", low):
         return True
     if re.search(r"\b(?:range|hissab|hisaab|hisab)\s+ke\s+andar\b", low):
         return True
@@ -737,12 +828,17 @@ def _extract_price_bounds(raw: str, low: str) -> tuple[Optional[float], Optional
         if m and m.lastindex and str(m.group(1)).isdigit():
             price_min = float(m.group(1))
             break
-    m_kam = re.search(r"(\d{2,7})\s*se\s+kam", low_s)
+    m_kam = re.search(r"(\d{1,7})\s*se\s+kam", low_s)
     if m_kam:
         price_max = float(m_kam.group(1))
-    m_neeche = re.search(r"(\d{2,7})\s*ke\s+neeche", low_s)
+    m_neeche = re.search(r"(\d{1,7})\s*ke\s+neeche", low_s)
     if m_neeche:
         price_max = float(m_neeche.group(1))
+    m_andar = re.search(r"(\d{1,7})\s*rs?\s*ke\s+andar", low_s, re.I)
+    if m_andar:
+        price_max = float(m_andar.group(1))
+    elif re.search(r"\bke\s+andar\b", low_s) and nums and price_max is None:
+        price_max = nums[0]
     if re.search(r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*range\b", low_s):
         if price_max is None and nums:
             price_max = nums[0]
@@ -780,6 +876,18 @@ def _extract_price_bounds(raw: str, low: str) -> tuple[Optional[float], Optional
     if not m_between:
         m_between = re.search(
             r"\b(\d{2,7})\s+se\s+(\d{2,7})\s*(?:rs|₹|rupees?|inr|tk|tak)?\b",
+            low_s,
+            re.I,
+        )
+    if not m_between:
+        m_between = re.search(
+            r"\bprice\s+range\s+(\d{2,7})\s*(?:-|–|to)\s+(\d{2,7})\b",
+            low_s,
+            re.I,
+        )
+    if not m_between:
+        m_between = re.search(
+            r"\b(\d{2,7})\s*(?:-|–)\s*(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\b",
             low_s,
             re.I,
         )
@@ -923,6 +1031,11 @@ def build_product_search_spec(
     merged = reconcile_catalog_spec_with_user_turn(
         merged, original_msg, msg_en, ctx=None, ai_route=None
     )
+    if merged.get("pro_id"):
+        merged["title_query"] = ""
+        merged.pop("brand", None)
+        merged.pop("brand_aliases", None)
+        merged["title_match_strict"] = False
     return sanitize_product_search_spec(merged)
 
 
@@ -981,6 +1094,9 @@ def has_structured_product_filters(spec: dict[str, Any]) -> bool:
             spec.get("pro_id"),
             spec.get("brand"),
             spec.get("size"),
+            spec.get("category_id"),
+            spec.get("rating_min") is not None,
+            spec.get("rating_max") is not None,
             spec.get("unit_price_max") is not None,
             spec.get("unit_price_min") is not None,
             spec.get("purchase_price_max") is not None,
@@ -1330,12 +1446,18 @@ def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
         elif re.search(r"[a-z][A-Z]", str(color)):
             spec.pop("sku", None)
     if spec.get("category_id") and not (spec.get("title_query") or "").strip():
-        try:
-            from services.welfog_api import strip_category_browse_conflicts_from_spec
+        needs_strip = bool(
+            spec.get("sku")
+            or spec.get("brand")
+            or spec.get("brand_aliases")
+        )
+        if needs_strip or not spec.get("_category_only_browse"):
+            try:
+                from services.welfog_api import strip_category_browse_conflicts_from_spec
 
-            spec = strip_category_browse_conflicts_from_spec(spec)
-        except ImportError:
-            pass
+                spec = strip_category_browse_conflicts_from_spec(spec)
+            except ImportError:
+                pass
     color = spec.get("color")
     if color and spec.get("title_query"):
         stripped = _strip_color_from_title_query(str(spec["title_query"]), str(color))
@@ -1364,6 +1486,8 @@ def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
     tq = (spec.get("title_query") or "").strip().lower()
     if tq in _FILTER_STOP or tq in ("your", "search", "kesa", "kaise", "hello"):
         spec["title_query"] = ""
+    if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
+        spec["_landed_price_filter"] = True
     return spec
 
 
@@ -1619,13 +1743,28 @@ def filter_products_by_requested_sku(products: list[dict], sku: str) -> list[dic
 
 
 def _card_purchase_price(p: dict) -> Optional[float]:
-    raw = p.get("price") or p.get("purchase_price")
+    try:
+        from services.welfog_api import customer_landed_price
+
+        landed = customer_landed_price(p)
+        if landed is not None:
+            return landed
+    except ImportError:
+        pass
+    raw = p.get("purchase_price")
+    if raw is None:
+        raw = p.get("price")
     if raw is None:
         return None
     try:
-        return float(str(raw).replace(",", "").replace("₹", "").strip())
+        base = float(str(raw).replace(",", "").replace("₹", "").strip())
     except (TypeError, ValueError):
         return None
+    try:
+        ship = float(str(p.get("shipping_cost") or 0).replace(",", "").strip())
+    except (TypeError, ValueError):
+        ship = 0.0
+    return base + max(0.0, ship)
 
 
 def filter_products_by_purchase_price(products: list[dict], spec: dict[str, Any]) -> list[dict]:
@@ -1763,7 +1902,10 @@ def is_price_or_rating_browse_turn(text: str) -> bool:
 
 
 def _scrub_bogus_brand_from_spec(spec: dict[str, Any], original_msg: str = "") -> None:
-    if spec.get("_catalog_ai"):
+    if spec.get("_catalog_ai") or spec.get("_ai_single_pass"):
+        if not (spec.get("brand") or "").strip():
+            spec.pop("brand_aliases", None)
+            spec.pop("brand_name_match_only", None)
         return
     aliases = spec.get("brand_aliases")
     if aliases:
@@ -1922,7 +2064,10 @@ def reconcile_catalog_spec_with_user_turn(
     except ImportError:
         pass
     scrub_filter_only_catalog_title(spec, comb)
+    single_pass = spec.pop("_ai_single_pass", None)
     spec.pop("_catalog_ai", None)
+    if single_pass:
+        spec["_ai_single_pass"] = True
     return spec
 
 
@@ -1960,13 +2105,14 @@ def apply_catalog_post_filters(
             if title_q:
                 products = filter_products_by_title_relevance(products, title_q, strict=strict)
 
-    aliases = spec.get("brand_aliases") or []
-    if mode in ("strict", "os_filters_only") and (spec.get("brand") or aliases):
+    req_brand = (spec.get("_requested_brand") or spec.get("brand") or "").strip()
+    req_aliases = spec.get("_requested_brand_aliases") or spec.get("brand_aliases") or []
+    if mode in ("strict", "os_filters_only") and (req_brand or req_aliases):
         strict_brand = bool(spec.get("title_match_strict")) and not spec.get("brand_name_match_only")
         products = filter_products_by_requested_brand(
             products,
-            spec.get("brand"),
-            brand_aliases=aliases if isinstance(aliases, list) else None,
+            req_brand or None,
+            brand_aliases=req_aliases if isinstance(req_aliases, list) else None,
             strict_title=strict_brand,
         )
 
@@ -2165,6 +2311,22 @@ def extract_structured_catalog_filters(
     return out
 
 
+def _stamp_requested_brand(spec: dict[str, Any]) -> None:
+    """Preserve user-requested brand for post-filter even when OS relax drops brand field."""
+    brand = (spec.get("brand") or "").strip()
+    if not brand:
+        return
+    spec["_requested_brand"] = brand
+    aliases = [
+        str(a).strip()
+        for a in (spec.get("brand_aliases") or [])
+        if a and str(a).strip()
+    ]
+    if brand.lower() not in [a.lower() for a in aliases]:
+        aliases.insert(0, brand)
+    spec["_requested_brand_aliases"] = aliases[:8]
+
+
 def finalize_catalog_search_spec(
     spec: dict[str, Any],
     original_msg: str = "",
@@ -2173,7 +2335,7 @@ def finalize_catalog_search_spec(
     """Colour + brand + title_query aligned with what the user actually asked."""
     # Per-part catalog search passes only that part as original_msg — do not widen blob.
     blob = f"{original_msg or ''} {msg_en or ''}".strip()
-    trust_ai = bool(spec.get("_catalog_ai"))
+    trust_ai = bool(spec.get("_catalog_ai") or spec.get("_ai_single_pass"))
     user_title = ""
     if blob:
         if not trust_ai:
@@ -2246,6 +2408,8 @@ def finalize_catalog_search_spec(
             spec["title_query"] = _scrub_color_meta_from_title(merged_title)
         elif tq:
             spec["title_query"] = tq
+    if spec.get("brand"):
+        _stamp_requested_brand(spec)
     return spec
 
 
@@ -2283,6 +2447,7 @@ def build_catalog_search_spec(
             or ai.get("_ai_first")
             or (ai.get("search_terms") or "").strip()
             or ai.get("product_requests")
+            or ai.get("category_browse")
             or ai.get("sku")
             or ai.get("pro_id")
             or ai.get("rating_min") is not None
@@ -2336,6 +2501,8 @@ def build_catalog_search_spec(
         try:
             from services.catalog_spec_from_ai import merge_ai_into_catalog_spec
 
+            if ai.get("_ai_first"):
+                spec["_ai_single_pass"] = True
             spec = merge_ai_into_catalog_spec(spec, ai, original_msg=original_msg)
             if not spec.get("color") and heuristic_color:
                 spec["color"] = heuristic_color
@@ -2353,6 +2520,12 @@ def build_catalog_search_spec(
         spec["pro_id"] = pro_id
     if category_id and not spec.get("category_id"):
         spec["category_id"] = category_id
+    if ai_has_shopping and spec.get("purchase_price_max") is None and spec.get("purchase_price_min") is None:
+        pmax, pmin = _extract_price_bounds(original_msg or "", (msg_en or "").lower())
+        if pmax is not None:
+            spec["purchase_price_max"] = pmax
+        if pmin is not None:
+            spec["purchase_price_min"] = pmin
     spec["_filter_user_msg"] = original_msg or ""
     spec = sanitize_product_search_spec(spec)
     _normalize_generic_title_query(spec, original_msg)
@@ -2369,6 +2542,10 @@ def build_catalog_search_spec(
         ai_route=ai_route,
         ai_understanding=ai if ai_has_shopping else None,
     )
+    if ai_has_shopping and isinstance(ai, dict) and ai.get("_ai_first"):
+        spec["_ai_single_pass"] = True
+    if isinstance(ai_route, dict) and ai_route.get("_ai_single_pass"):
+        spec["_ai_single_pass"] = True
     try:
         from services.product_filter_pipeline import finalize_catalog_spec_for_api
 
@@ -2377,6 +2554,7 @@ def build_catalog_search_spec(
             original_msg,
             msg_en,
             ai_understanding=ai if ai_has_shopping else None,
+            ctx=ctx,
         )
     except ImportError:
         pass
@@ -2788,9 +2966,10 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
     if spec.get("unit_price_max") is not None:
         filters.append({"range": {"unit_price": {"lte": spec["unit_price_max"]}}})
     if not spec.get("_os_price_filter_disabled"):
-        if spec.get("purchase_price_min") is not None:
+        has_landed = bool(spec.get("_landed_price_filter"))
+        if spec.get("purchase_price_min") is not None and not has_landed:
             filters.append({"range": {"purchase_price": {"gte": spec["purchase_price_min"]}}})
-        if spec.get("purchase_price_max") is not None:
+        if spec.get("purchase_price_max") is not None and not has_landed:
             filters.append({"range": {"purchase_price": {"lte": spec["purchase_price_max"]}}})
     if spec.get("rating_min") is not None:
         filters.append({"range": {"rating": {"gte": spec["rating_min"]}}})
@@ -2856,6 +3035,8 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
         from services.welfog_api import format_customer_price_display
 
         price = format_customer_price_display(src, sysmsg("na_price"))
+        purchase_price = src.get("purchase_price")
+        shipping_cost = src.get("shipping_cost")
         thumb = (src.get("thumbnail_img") or "").lstrip("/")
         slug = (src.get("slug") or "").strip()
         link = (
@@ -2867,6 +3048,8 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
             {
                 "name": name,
                 "price": price,
+                "purchase_price": purchase_price,
+                "shipping_cost": shipping_cost,
                 "image": f"{IMAGE_BASE_URL}{thumb}" if thumb else "",
                 "link": link,
                 "pro_id": src.get("pro_id"),
@@ -2882,12 +3065,20 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
     return cards
 
 
-def _opensearch_request(body: dict) -> tuple[list, int]:
+def _opensearch_request(body: dict, *, timeout_sec: float = 8) -> tuple[list, int]:
     cfg = _env_opensearch_config()
     if not cfg:
         return [], 0
     try:
-        res = requests.post(cfg["url"], json=body, auth=cfg["auth"], timeout=14)
+        _OS_REQUEST_TLS.count = int(getattr(_OS_REQUEST_TLS, "count", 0) or 0) + 1
+        from utils.reasoning_log import log_reasoning
+
+        log_reasoning(f"OpenSearch HTTP request #{_OS_REQUEST_TLS.count}")
+    except Exception:
+        pass
+    try:
+        limit = max(3.0, min(10.0, float(timeout_sec or 8)))
+        res = requests.post(cfg["url"], json=body, auth=cfg["auth"], timeout=limit)
         if res.status_code != 200:
             return [], 0
         data = res.json()
@@ -2906,15 +3097,17 @@ def _search_opensearch_page(
     page: int = 1,
     page_size: int = PAGE_SIZE,
     post_filter_mode: str = "strict",
+    skip_price_sync: bool = False,
 ) -> tuple[list[dict], int, bool]:
     page = max(1, int(page))
     page_size = min(max(1, int(page_size)), MAX_PAGE_SIZE)
     offset = (page - 1) * page_size
     body = _build_opensearch_body(spec, size=page_size, offset=offset)
-    hits, os_total = _opensearch_request(body)
+    os_timeout = 5.0 if spec.get("_category_only_browse") else 8.0
+    hits, os_total = _opensearch_request(body, timeout_sec=os_timeout)
     cards = opensearch_hits_to_product_cards(hits)
     cards = apply_catalog_post_filters(cards, spec, post_filter_mode=post_filter_mode)
-    if cards:
+    if cards and not skip_price_sync and not spec.get("_ai_single_pass"):
         from services.welfog_api import sync_product_cards_prices_from_rest_api
 
         q = (spec.get("title_query") or "").strip()
@@ -2964,6 +3157,17 @@ def search_opensearch_products(
     )
 
 
+def _is_category_only_browse_spec(spec: dict[str, Any]) -> bool:
+    """Category department browse — no product title / SKU / pro_id filter."""
+    if not spec or not spec.get("category_id"):
+        return False
+    if (spec.get("title_query") or "").strip():
+        return False
+    if spec.get("pro_id") or spec.get("sku"):
+        return False
+    return True
+
+
 def search_opensearch_catalog(
     spec: dict[str, Any],
     *,
@@ -2984,8 +3188,158 @@ def search_opensearch_catalog(
     log_reasoning(
         f"OpenSearch catalog: title={spec.get('title_query')!r} color={spec.get('color')!r} "
         f"size={spec.get('size')!r} brand={spec.get('brand')!r} sku={spec.get('sku')!r} pro_id={spec.get('pro_id')} "
-        f"price_max={spec.get('purchase_price_max')!r} price_min={spec.get('purchase_price_min')!r}"
+        f"category_id={spec.get('category_id')!r} "
+        f"price_max={spec.get('purchase_price_max')!r} price_min={spec.get('purchase_price_min')!r} "
+        f"rating_min={spec.get('rating_min')!r}"
     )
+
+    if spec.get("pro_id"):
+        pro_spec = dict(spec)
+        pro_spec["title_query"] = ""
+        pro_spec.pop("brand", None)
+        pro_spec.pop("brand_aliases", None)
+        pro_spec["title_match_strict"] = False
+        cards, n, more = _search_opensearch_page(
+            pro_spec, page=page, page_size=page_size, post_filter_mode="light"
+        )
+        if cards:
+            log_reasoning(f"OpenSearch pro_id={spec.get('pro_id')}: {len(cards)} product(s).")
+            try:
+                from services.product_intent_parser import log_opensearch_query
+
+                log_opensearch_query(pro_spec, len(cards))
+            except ImportError:
+                pass
+            return cards, pro_spec, len(cards), more
+
+    if spec.get("category_id") and not (spec.get("title_query") or "").strip():
+        pf = "light"
+        cards, n, more = _search_opensearch_page(
+            spec, page=page, page_size=page_size, post_filter_mode=pf
+        )
+        if cards:
+            log_reasoning(
+                f"OpenSearch category_id={spec.get('category_id')}: {len(cards)} product(s)."
+            )
+            return cards, spec, len(cards), more
+        try:
+            from services.welfog_api import _rest_category_filter_trustworthy, fetch_products_from_api
+
+            rest_rows = fetch_products_from_api(
+                "", category_id=int(spec["category_id"]), page=page
+            )
+            if rest_rows and _rest_category_filter_trustworthy(spec["category_id"], rest_rows):
+                log_reasoning(
+                    f"Category browse catalog fallback category_id={spec['category_id']} "
+                    f"({len(rest_rows)} items — OS index empty for this category)."
+                )
+                has_more = len(rest_rows) >= page_size
+                return rest_rows, spec, len(rest_rows), has_more
+            if rest_rows:
+                log_reasoning(
+                    f"Category browse REST ignored category_id={spec['category_id']} "
+                    f"(default pool returned — skipped)."
+                )
+        except Exception:
+            pass
+
+    if spec.get("sku"):
+        sku_spec = dict(spec)
+        sku_spec["title_query"] = ""
+        sku_spec.pop("brand", None)
+        sku_spec.pop("brand_aliases", None)
+        sku_spec.pop("color", None)
+        sku_spec.pop("mandatory_match_tokens", None)
+        sku_spec["title_match_strict"] = False
+        cards, n, more = _search_opensearch_page(
+            sku_spec,
+            page=page,
+            page_size=page_size,
+            post_filter_mode="light",
+            skip_price_sync=True,
+        )
+        if cards:
+            log_reasoning(f"OpenSearch SKU={spec.get('sku')!r}: {len(cards)} product(s).")
+            try:
+                from services.product_intent_parser import log_opensearch_query
+
+                log_opensearch_query(sku_spec, len(cards))
+            except ImportError:
+                pass
+            return cards, sku_spec, len(cards), more
+        log_reasoning(f"OpenSearch SKU={spec.get('sku')!r}: 0 hits (SKU-only lookup).")
+        try:
+            from services.product_intent_parser import log_opensearch_query
+
+            log_opensearch_query(sku_spec, 0)
+        except ImportError:
+            pass
+        return [], sku_spec, 0, False
+
+    if spec.get("_ai_single_pass"):
+        pf = _post_filter_mode_for_spec(spec)
+        cards, n, more = _search_opensearch_page(
+            spec,
+            page=page,
+            page_size=page_size,
+            post_filter_mode=pf,
+            skip_price_sync=True,
+        )
+        if not cards and (spec.get("brand") or spec.get("brand_aliases")):
+            relaxed = dict(spec)
+            brand = (relaxed.pop("brand", None) or "").strip()
+            relaxed.pop("brand_aliases", None)
+            relaxed.pop("brand_name_match_only", None)
+            relaxed["title_match_strict"] = False
+            relaxed.pop("mandatory_match_tokens", None)
+            tq = (relaxed.get("title_query") or "").strip()
+            if brand and brand.lower() not in tq.lower():
+                relaxed["title_query"] = f"{tq} {brand}".strip() if tq else brand
+            if spec.get("_requested_brand"):
+                relaxed["_requested_brand"] = spec["_requested_brand"]
+                relaxed["_requested_brand_aliases"] = spec.get("_requested_brand_aliases")
+            cards, n, more = _search_opensearch_page(
+                relaxed,
+                page=page,
+                page_size=page_size,
+                post_filter_mode="light",
+                skip_price_sync=True,
+            )
+            if cards:
+                spec = relaxed
+                log_reasoning(
+                    f"OpenSearch AI single-pass brand-relax: {n} product(s) "
+                    f"(title search without brand field filter)."
+                )
+        elif cards:
+            log_reasoning(
+                f"OpenSearch AI single-pass: {n} product(s) "
+                f"(no tiered relax — filters from AI only)."
+            )
+        else:
+            log_reasoning(
+                f"OpenSearch AI single-pass: {n} product(s) "
+                f"(no tiered relax — filters from AI only)."
+            )
+        if cards:
+            req_brand = (spec.get("_requested_brand") or spec.get("brand") or "").strip()
+            req_aliases = spec.get("_requested_brand_aliases") or spec.get("brand_aliases")
+            if req_brand or req_aliases:
+                cards = filter_products_by_requested_brand(
+                    cards,
+                    req_brand or None,
+                    brand_aliases=req_aliases if isinstance(req_aliases, list) else None,
+                )
+            cards = filter_products_by_purchase_price(cards, spec)
+            cards = filter_products_by_rating_range(cards, spec)
+            n = len(cards)
+        try:
+            from services.product_intent_parser import log_opensearch_query
+
+            log_opensearch_query(spec, n)
+        except ImportError:
+            pass
+        return cards, spec, n, more
 
     pf = _post_filter_mode_for_spec(spec)
     cards, n, more = _search_opensearch_page(
@@ -3344,11 +3698,42 @@ def catalog_search_live(
     from utils.reasoning_log import log_reasoning
 
     spec = sanitize_product_search_spec(dict(spec or {}))
+    import time as _time
+
+    try:
+        reset_opensearch_request_count()
+    except Exception:
+        pass
+    _os_t0 = _time.perf_counter()
     products, spec, total, has_more = search_opensearch_catalog(
         spec, page=page, page_size=page_size
     )
+    try:
+        from services.chat_flow_telemetry import record_api_time, record_phase
+
+        _os_el = _time.perf_counter() - _os_t0
+        record_api_time(_os_el)
+        record_phase("opensearch", _os_el * 1000.0)
+        log_reasoning(
+            f"OpenSearch catalog done: {get_opensearch_request_count()} HTTP request(s), "
+            f"{len(products)} product(s)."
+        )
+    except ImportError:
+        pass
     if products:
         return products, spec, total, has_more
+
+    if spec.get("_ai_single_pass"):
+        if _is_category_only_browse_spec(spec):
+            cat_rest = _category_browse_rest_fallback(
+                spec, page=page, page_size=page_size, ctx=ctx
+            )
+            if cat_rest[0]:
+                return cat_rest
+        log_reasoning(
+            "Catalog AI single-pass: 0 OS hits — fast not-found (skip slow REST on locked path)."
+        )
+        return [], spec, 0, False
 
     if spec.get("strict_no_relax") and spec.get("pro_id"):
         return [], spec, 0, False

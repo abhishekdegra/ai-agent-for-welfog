@@ -302,6 +302,8 @@ JSON SCHEMA:
   "size": "size filter only — e.g. 10, Free Size, M, XL — empty if not asked. NEVER put size in search_terms.",
   "exclude_title_tokens": ["phrases to EXCLUDE from titles, e.g. lg velvet when user wants velvet material cover"],
   "pro_id": "numeric catalog product id if user gave one, else null",
+  "category_browse": "English category name when user browses a whole category (electronics, fashion, grocery, home, beauty) — empty if not category browse",
+  "category_only_browse": true when user wants category products without naming a specific product type,
   "match_mode": "strict" | "universal",
   "max_price": number or null,
   "min_price": number or null,
@@ -316,7 +318,9 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - NEVER put conversational words in sku (chahiye, dikhao, batana, please, milega, shaadi, mast, …) — sku is ONLY a warehouse code with digits or explicit "SKU ABC123" from the user.
 - ALL FILTERS: Put every constraint the user meant into the correct JSON field (top-level or per product_requests[]). Long message with price + colour + product + rating → fill all fields. Multiple products with different filters → separate product_requests[] rows each with their own color/max_price/rating_min/etc.
 - NEW TURN WINS: If the user changes product type or colour, do NOT carry old budget/price from chat unless they say same/wahi/pehle wala/usi range. Colour-only follow-up → update color, keep search_terms from context.
-- COLOUR (any language): Map to catalog color field — Black, White, Green, Red, Blue, Yellow, Pink, Purple, Orange, Brown, Grey, Navy, Maroon, Beige, Silver, Gold, Sky Blue, Multicolor. Hindi/Hinglish examples by meaning: kala/black, safed/white, hara/green, laal/red, neela/blue, peela/yellow, grey/gray. Colour ONLY in "color" / per-item color — NEVER in search_terms, sku, mandatory_match_tokens, or brand_aliases.
+- PRO_ID: numeric product id in message → pro_id field set, search_terms="" brand="" sku="" — never search words like dikhao/dikhoa/id.
+- CATEGORY BROWSE: "electronics ke products", "fashion dikhao" → category_browse=electronics/fashion, category_only_browse=true, search_terms="" unless user also named a product type.
+- COLOUR (any language/script): Map semantically to catalog color — Black, White, Green, Grey, Sky Blue, etc. CSS names (DarkSlateGray), Hindi (kala, neeli), Tamil/Telugu, typos — YOU decide the catalog colour; never hardcode phrase lists in search_terms.
 - COLOUR + PRODUCT: "green color ke covers", "black cover dikhao", "neeli shirt chahiye" → search_terms=cover/shirt (English product type), color=Green/Black/Blue. Never search_terms="color cover dikhao" or whole sentence.
 - COLOUR FOLLOW-UP: If assistant just showed a product type and user only changes colour ("ab black", "dusra rang green", "same cover blue") → reuse product_type/search_terms from conversation; update color only.
 - SIZE (critical — separate from product name): "size=10", "size 10", "10 size", "free size" → size field ONLY (e.g. "10", "Free Size", "M"). search_terms = product type ONLY: cover, shirt, case — NEVER "size 10 product cover dikhao" as one title. Example: "size=10 ka product cover dikhao" → size="10", search_terms="cover", product_type="cover". Example: "free size wali shirt" → size="Free Size", search_terms="shirt". NEVER put size number or word "size" in search_terms, sku, or mandatory_match_tokens.
@@ -335,8 +339,8 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - colour → search_terms without colour word (black shirt → search_terms shirt, color Black).
 - Exclude wrong brands: set brand_aliases to the requested brand only — do not leave empty if user said OnePlus.
 - velvet cover (material) → mandatory [velvet, cover], exclude_title_tokens [lg velvet, velvet phone].
-- OpenSearch uses: title_query, color, brand, brand_aliases, sku, pro_id, purchase_price min/max (customer pays — NOT unit_price/MRP), size, category.
-- max_price / min_price in JSON → purchase_price_max / purchase_price_min (sale price on cards) — ONLY when user asked for rupees/budget, NEVER for star/rating thresholds.
+- OpenSearch uses: title_query, color, brand, brand_aliases, sku, pro_id, purchase_price min/max (customer pays purchase_price + shipping_cost on cards — NOT unit_price/MRP), size, category.
+- max_price / min_price in JSON → purchase_price_max / purchase_price_min (landed price = purchase + shipping) — ONLY when user asked for rupees/budget, NEVER for star/rating thresholds.
 - rating_min / rating_max in JSON for star filters — NEVER put star numbers in min_price/max_price.
 - PRICE-ONLY browse (critical): "under 500 rs", "500 se kam wale item", "under 190" → max_price/min_price ONLY; search_terms="" brand="" — do NOT add Samsung/mobile/cover from old chat unless user said wahi/same/pehle wala product.
 - BUDGET + PRODUCT (critical): "I have 150 rs show mobile covers", "190 rs budget mobile cover in this range" → search_terms=mobile cover (English product type), max_price=150 or 190, brand="" unless user named brand THIS message.
@@ -344,6 +348,7 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - RATING filter: set rating_min / rating_max ONLY when the LATEST message explicitly mentions stars/rating — otherwise null. NEVER default rating_min=0.01 or rating_max=5. "4 star wale" → rating_min=4; "under 3 rating" → rating_max=3. Colour/price-only messages → rating fields MUST be null.
 - PRICE filter: set max_price/min_price ONLY when the LATEST message mentions rs/rupees/budget/under/over price — otherwise null. NEVER copy 150/200 from old chat unless user repeats budget this message.
 - PRO_ID: numeric product id in message → pro_id field set, search_terms="" brand="" sku="" — never search words like dikhao/dikhoa/id.
+- CATEGORY BROWSE: whole-category asks → category_browse=English category name, category_only_browse=true, search_terms="" unless user also named a product type.
 - not_shopping: orders, tracking, policies, purchase history / past orders list / "products I bought" / "is id se purchase" — is_shopping=false, action=not_shopping.
 - {language_reply_instruction(reply_lang)}
 JSON only."""
@@ -1314,6 +1319,260 @@ def _run_multi_product_catalog_search(
     return ProductFlowResult(handled=True, reply_html=response_text, intent="product")
 
 
+def _run_locked_catalog_search_fast(
+    original_msg: str,
+    msg_en: str,
+    user_id: str,
+    *,
+    ctx: Optional[dict] = None,
+    reply_lang: str = "en",
+    search_query: str = "",
+    conversation_context: str = "",
+    ai_understanding: Optional[dict] = None,
+    ai_route: Optional[dict] = None,
+) -> ProductFlowResult:
+    """
+    Brain/structural locked product browse — proper filter spec, then OpenSearch.
+    Never treat brain search_query (with price/rating text) as raw title_query.
+    """
+    from services.kb_service import sysmsg
+    from services.opensearch_products import (
+        build_product_rail_with_pagination,
+        catalog_search_live,
+        product_search_show_view_more,
+    )
+    from services.product_filter_pipeline import (
+        _build_catalog_spec_from_locked_entities,
+        _build_related_accessory_understanding,
+        _enrich_brain_entities_structural,
+        _structural_gap_ai_from_message,
+        apply_catalog_result_filters,
+        brain_search_query_is_noisy,
+        log_product_search_pipeline,
+    )
+    from services.product_query_understanding import (
+        display_label_for_product_search,
+        spec_uses_strict_filter_not_found,
+    )
+    from services.welfog_api import build_welfog_product_browse_url
+
+    sq = (
+        (search_query or "").strip()
+        or ((ai_route or {}).get("search_query") or "").strip()
+        or ((ai_understanding or {}).get("search_terms") or "").strip()
+    )
+    try:
+        from services.ai_route_semantics import _catalog_search_query_from_brain_route
+
+        sq_brain = _catalog_search_query_from_brain_route(ai_route)
+        if sq_brain:
+            sq = sq_brain
+    except ImportError:
+        pass
+    locked_u = dict(ai_understanding or {})
+    entities = dict((ai_route or {}).get("_product_entities") or {})
+    entities = _enrich_brain_entities_structural(
+        entities, original_msg, msg_en, brain_route=ai_route
+    )
+    if entities and ai_route is not None:
+        ai_route = dict(ai_route)
+        ai_route["_product_entities"] = entities
+
+    try:
+        from services.product_catalog_resolver import entities_to_understanding
+
+        eu = entities_to_understanding(
+            entities, search_query=sq, original_msg=original_msg
+        )
+        if eu:
+            locked_u = eu
+    except ImportError:
+        pass
+
+    if sq and not brain_search_query_is_noisy(sq) and not locked_u.get("search_terms"):
+        locked_u["search_terms"] = sq
+    if locked_u:
+        locked_u["_ai_first"] = True
+
+    pre_fallback_u = dict(locked_u)
+
+    gap = _structural_gap_ai_from_message(
+        original_msg,
+        msg_en,
+        locked_understanding=locked_u,
+        brain_search_query=sq,
+    )
+    os_spec, pq_llm = _build_catalog_spec_from_locked_entities(
+        original_msg,
+        msg_en,
+        gap=gap,
+        ctx=ctx,
+        ai_route=ai_route,
+        locked_understanding=gap,
+        brain_search_query=sq,
+    )
+    os_spec["_ai_single_pass"] = True
+    log_reasoning(
+        "Catalog brain-locked entity spec — skip duplicate product NLU LLM."
+    )
+    log_reasoning(
+        f"Catalog locked path: title={os_spec.get('title_query')!r} "
+        f"brand={os_spec.get('brand')!r} color={os_spec.get('color')!r} "
+        f"price_max={os_spec.get('purchase_price_max')!r} "
+        f"rating_min={os_spec.get('rating_min')!r} pro_id={os_spec.get('pro_id')!r} "
+        f"sku={os_spec.get('sku')!r} category_id={os_spec.get('category_id')!r}"
+    )
+
+    ctx = ctx if ctx is not None else {}
+    products, os_spec, os_total, os_has_more = catalog_search_live(
+        os_spec,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        page=1,
+        ctx=ctx,
+    )
+    raw_count = len(products)
+    products = apply_catalog_result_filters(products, os_spec)
+    removed_reason = ""
+    if not products and raw_count == 0:
+        req_brand = (os_spec.get("_requested_brand") or os_spec.get("brand") or "").strip()
+        if req_brand:
+            retry_spec = dict(os_spec)
+            retry_spec.pop("brand", None)
+            retry_spec.pop("brand_aliases", None)
+            retry_spec.pop("brand_name_match_only", None)
+            retry_spec["title_match_strict"] = False
+            tq = (retry_spec.get("title_query") or "").strip()
+            if req_brand.lower() not in tq.lower():
+                retry_spec["title_query"] = f"{tq} {req_brand}".strip() if tq else req_brand
+            retry_products, retry_spec, retry_total, retry_more = catalog_search_live(
+                retry_spec,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                page=1,
+                ctx=ctx,
+            )
+            retry_products = apply_catalog_result_filters(retry_products, retry_spec)
+            if retry_products:
+                log_reasoning(
+                    f"Catalog post-filter brand-relax: {len(retry_products)} hit(s) "
+                    f"with title brand match (field filter dropped)."
+                )
+                products = retry_products
+                os_spec = retry_spec
+                os_total = retry_total
+                os_has_more = retry_more
+    elif not products and raw_count > 0:
+        removed_reason = "post_filter_mismatch"
+
+    if not products and locked_u.get("device_browse") and not locked_u.get("specific_accessory"):
+        fb_u = _build_related_accessory_understanding(locked_u, entities)
+        if fb_u:
+            fb_gap = _structural_gap_ai_from_message(
+                original_msg,
+                msg_en,
+                locked_understanding=fb_u,
+                brain_search_query=fb_u.get("search_terms") or "",
+            )
+            fb_spec, _fb_pq = _build_catalog_spec_from_locked_entities(
+                original_msg,
+                msg_en,
+                gap=fb_gap,
+                ctx=ctx,
+                ai_route=ai_route,
+                locked_understanding=fb_gap,
+                brain_search_query=fb_u.get("search_terms") or "",
+            )
+            fb_spec["_related_fallback"] = True
+            fb_spec["_ai_single_pass"] = True
+            log_reasoning(
+                "Catalog device browse: 0 phones — retry related accessories "
+                f"(title={fb_spec.get('title_query')!r})."
+            )
+            fb_products, fb_spec, fb_total, fb_more = catalog_search_live(
+                fb_spec,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                page=1,
+                ctx=ctx,
+            )
+            fb_products = apply_catalog_result_filters(fb_products, fb_spec)
+            if fb_products:
+                products = fb_products
+                os_spec = fb_spec
+                os_total = fb_total
+                os_has_more = fb_more
+                locked_u = fb_u
+                removed_reason = ""
+
+    route_entities = None
+    if ai_route and isinstance(ai_route.get("_product_entities"), dict):
+        route_entities = ai_route.get("_product_entities")
+    log_product_search_pipeline(
+        original_msg=original_msg,
+        msg_en=msg_en,
+        ai_understanding=pq_llm or locked_u,
+        spec=os_spec,
+        products=products,
+        reply_lang=reply_lang or "en",
+        product_entities=route_entities,
+        total_results=os_total,
+        removed_reason=removed_reason,
+    )
+
+    display_query = display_label_for_product_search(os_spec, pq_llm or locked_u, original_msg)
+
+    if not products:
+        if spec_uses_strict_filter_not_found(os_spec):
+            body = _localized_sysmsg(
+                "products_filtered_not_found",
+                original_msg,
+                reply_lang=reply_lang,
+                query=display_query,
+            ) or sysmsg("products_filtered_not_found", query=display_query)
+        else:
+            body = _localized_sysmsg(
+                "product_not_found", original_msg, reply_lang=reply_lang, query=display_query
+            ) or sysmsg("product_not_found", query=display_query)
+        return ProductFlowResult(handled=True, reply_html=body, intent="product", os_spec=os_spec)
+
+    if os_spec.get("_related_fallback"):
+        device_label = display_label_for_product_search(
+            os_spec, pq_llm or pre_fallback_u, original_msg
+        )
+        if not device_label or device_label.lower() in ("products", "product", "your search"):
+            device_label = (
+                (pre_fallback_u.get("search_terms") or sq or "this item").strip()
+            )
+        response_text = _localized_sysmsg(
+            "products_related_fallback",
+            original_msg,
+            reply_lang=reply_lang,
+            query=device_label,
+            related=display_query,
+        ) or sysmsg(
+            "products_related_fallback",
+            query=device_label,
+            related=display_query,
+        )
+    else:
+        response_text = sysmsg("products_title_query", query=display_query)
+    browse_url = build_welfog_product_browse_url(os_spec, ctx=ctx)
+    response_text += build_product_rail_with_pagination(
+        products,
+        sysmsg,
+        has_more=product_search_show_view_more(products, os_has_more),
+        next_page=2,
+        browse_more_url=browse_url,
+    )
+    return ProductFlowResult(
+        handled=True,
+        reply_html=response_text,
+        intent="product",
+        os_spec=os_spec,
+    )
+
+
 def _run_catalog_search(
     original_msg: str,
     msg_en: str,
@@ -1378,11 +1637,31 @@ def _run_catalog_search(
         except ImportError:
             sku_lookup = None
 
+    catalog_single_pass = bool(
+        (ai_route or {}).get("_ai_single_pass")
+        or (ai_understanding or {}).get("_ai_first")
+    )
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        catalog_single_pass = catalog_single_pass or product_catalog_route_is_locked(ai_route)
+    except ImportError:
+        pass
+
+    locked_browse_sq = (
+        catalog_single_pass
+        and (
+            (search_query or "").strip()
+            or ((ai_route or {}).get("search_query") or "").strip()
+            or ((ai_understanding or {}).get("search_terms") or "").strip()
+        )
+    )
+
     selected_cat = (ctx.get("data") or {}).get("selected_category_id")
     if sku_lookup:
         selected_cat = None
         ctx.setdefault("data", {})["lookup_sku"] = str(sku_lookup).strip()
-    elif not selected_cat:
+    elif not selected_cat and not catalog_single_pass:
         selected_cat = resolve_category_id_for_product_search(f"{original_msg} {msg_en}", ctx=ctx)
         if selected_cat:
             ctx.setdefault("data", {})["selected_category_id"] = selected_cat
@@ -1427,9 +1706,9 @@ def _run_catalog_search(
         if ai_understanding.get("brand"):
             ctx.setdefault("data", {})["_pending_brand"] = ai_understanding.get("brand")
 
-    lookup_pro_id = (ctx.get("data") or {}).get("lookup_pro_id") or extract_product_id(
-        f"{original_msg} {msg_en}"
-    )
+    lookup_pro_id = (ctx.get("data") or {}).get("lookup_pro_id")
+    if not lookup_pro_id and not locked_browse_sq:
+        lookup_pro_id = extract_product_id(f"{original_msg} {msg_en}")
     if not lookup_pro_id and ai_understanding:
         ai_pid = ai_understanding.get("pro_id")
         if ai_pid is not None and str(ai_pid).strip().isdigit():
@@ -1478,85 +1757,103 @@ def _run_catalog_search(
             os_spec={"pro_id": int(lookup_pro_id)},
         )
 
-    os_spec = build_catalog_search_spec(
-        original_msg,
-        msg_en,
-        ai=ai_understanding,
-        category_id=selected_cat,
-        color=selected_color,
-        pro_id=int(lookup_pro_id) if lookup_pro_id else None,
-        ctx=ctx,
-        ai_route=ai_route,
-    )
-    try:
-        from services.opensearch_products import reconcile_catalog_spec_with_user_turn
+    if catalog_single_pass and ai_understanding:
+        from services.product_filter_pipeline import build_catalog_spec_for_product_turn
 
-        os_spec = reconcile_catalog_spec_with_user_turn(
-            os_spec,
+        sq_fast = (search_query or (ai_route or {}).get("search_query") or "").strip()
+        os_spec, pq_llm = build_catalog_spec_for_product_turn(
             original_msg,
             msg_en,
+            conversation_context=conversation_context,
+            reply_lang=lang,
             ctx=ctx,
             ai_route=ai_route,
-            ai_understanding=ai_understanding,
+            locked_understanding=ai_understanding,
+            brain_search_query=sq_fast,
+            allow_product_nlu_llm=False,
         )
-    except ImportError:
-        pass
-    try:
-        from services.opensearch_products import _normalize_generic_title_query, sanitize_product_search_spec
-
-        _normalize_generic_title_query(os_spec, original_msg)
-        sanitize_product_search_spec(os_spec)
-    except ImportError:
-        pass
-    if not ai_understanding:
-        from services.product_query_understanding import extract_focused_product_query
-
-        focused = extract_focused_product_query(original_msg, msg_en)
-        os_spec, pq_llm = understand_product_query(
-            original_msg,
-            msg_en,
-            conversation_context,
-            lang,
-            category_id=selected_cat,
-            color=selected_color,
-            pro_id=int(lookup_pro_id) if lookup_pro_id else None,
-        )
+        title_match = (os_spec.get("title_query") or "").strip()
+        log_reasoning(f"Catalog ultra-fast path: OpenSearch sq={title_match!r}")
+    else:
         os_spec = build_catalog_search_spec(
             original_msg,
             msg_en,
-            ai=pq_llm,
+            ai=ai_understanding,
             category_id=selected_cat,
-            color=os_spec.get("color") or selected_color,
+            color=selected_color,
             pro_id=int(lookup_pro_id) if lookup_pro_id else None,
             ctx=ctx,
             ai_route=ai_route,
         )
-        if focused and not (os_spec.get("title_query") or "").strip():
-            os_spec["title_query"] = focused
         try:
             from services.opensearch_products import reconcile_catalog_spec_with_user_turn
 
             os_spec = reconcile_catalog_spec_with_user_turn(
-                os_spec, original_msg, msg_en, ctx=ctx, ai_route=ai_route
+                os_spec,
+                original_msg,
+                msg_en,
+                ctx=ctx,
+                ai_route=ai_route,
+                ai_understanding=ai_understanding,
             )
         except ImportError:
             pass
+        try:
+            from services.opensearch_products import _normalize_generic_title_query, sanitize_product_search_spec
 
-    title_match = os_spec.get("title_query") or title_match or ""
+            _normalize_generic_title_query(os_spec, original_msg)
+            sanitize_product_search_spec(os_spec)
+        except ImportError:
+            pass
+        if not ai_understanding:
+            from services.product_query_understanding import extract_focused_product_query
 
-    if selected_cat:
-        from services.welfog_api import category_browse_search_name, query_should_use_category_id_only, strip_category_browse_conflicts_from_spec
+            focused = extract_focused_product_query(original_msg, msg_en)
+            os_spec, pq_llm = understand_product_query(
+                original_msg,
+                msg_en,
+                conversation_context,
+                lang,
+                category_id=selected_cat,
+                color=selected_color,
+                pro_id=int(lookup_pro_id) if lookup_pro_id else None,
+            )
+            os_spec = build_catalog_search_spec(
+                original_msg,
+                msg_en,
+                ai=pq_llm,
+                category_id=selected_cat,
+                color=os_spec.get("color") or selected_color,
+                pro_id=int(lookup_pro_id) if lookup_pro_id else None,
+                ctx=ctx,
+                ai_route=ai_route,
+            )
+            if focused and not (os_spec.get("title_query") or "").strip():
+                os_spec["title_query"] = focused
+            try:
+                from services.opensearch_products import reconcile_catalog_spec_with_user_turn
 
-        combined_q = title_match or comb
-        if query_should_use_category_id_only(selected_cat, combined_q, ctx):
-            os_spec["title_query"] = ""
-            title_match = ""
-            os_spec = strip_category_browse_conflicts_from_spec(os_spec, ctx=ctx)
-        else:
-            stripped_name = category_browse_search_name(selected_cat, combined_q, ctx)
-            if stripped_name != combined_q:
-                os_spec["title_query"] = stripped_name
-                title_match = stripped_name
+                os_spec = reconcile_catalog_spec_with_user_turn(
+                    os_spec, original_msg, msg_en, ctx=ctx, ai_route=ai_route
+                )
+            except ImportError:
+                pass
+
+        title_match = os_spec.get("title_query") or title_match or ""
+
+        if selected_cat:
+            from services.welfog_api import category_browse_search_name, query_should_use_category_id_only, strip_category_browse_conflicts_from_spec
+
+            combined_q = title_match or comb
+            if query_should_use_category_id_only(selected_cat, combined_q, ctx):
+                os_spec["title_query"] = ""
+                title_match = ""
+                os_spec = strip_category_browse_conflicts_from_spec(os_spec, ctx=ctx)
+            else:
+                stripped_name = category_browse_search_name(selected_cat, combined_q, ctx)
+                if stripped_name != combined_q:
+                    os_spec["title_query"] = stripped_name
+                    title_match = stripped_name
 
     if is_opensearch_configured():
         products, os_spec, os_total, os_has_more = catalog_search_live(
@@ -1617,23 +1914,28 @@ def _run_catalog_search(
 
         ctx["data"]["product_browse_url"] = build_welfog_product_browse_url(os_spec, ctx=ctx)
 
-    if os_spec.get("color") and products:
-        from services.opensearch_products import filter_products_by_requested_color
+    if not os_spec.get("_ai_single_pass"):
+        if os_spec.get("color") and products:
+            from services.opensearch_products import filter_products_by_requested_color
 
-        color_filtered = filter_products_by_requested_color(products, os_spec["color"])
-        if color_filtered:
-            products = color_filtered
-        elif spec_uses_strict_filter_not_found(os_spec or {}):
-            products = []
+            color_filtered = filter_products_by_requested_color(products, os_spec["color"])
+            if color_filtered:
+                products = color_filtered
+            elif spec_uses_strict_filter_not_found(os_spec or {}):
+                products = []
 
-    if products and os_spec:
-        from services.opensearch_products import apply_catalog_post_filters, _post_filter_mode_for_spec
+        if products and os_spec:
+            from services.opensearch_products import apply_catalog_post_filters, _post_filter_mode_for_spec
 
-        products = apply_catalog_post_filters(
-            products,
-            os_spec,
-            post_filter_mode=_post_filter_mode_for_spec(os_spec),
-        )
+            products = apply_catalog_post_filters(
+                products,
+                os_spec,
+                post_filter_mode=_post_filter_mode_for_spec(os_spec),
+            )
+    else:
+        from services.product_filter_pipeline import apply_catalog_result_filters
+
+        products = apply_catalog_result_filters(products, os_spec)
 
     ctx.setdefault("data", {})
     ctx["data"]["last_os_spec"] = {
@@ -1681,9 +1983,16 @@ def _run_catalog_search(
         return ProductFlowResult(handled=True, reply_html=body, intent="product", os_spec=os_spec or {})
 
     filter_label = display_label_for_product_search(os_spec or {}, pq_llm or ai_understanding, original_msg)
-    display_query = filter_label or title_match or clean_product_part_label(
-        extract_product_search_query(original_msg, msg_en, ""), original_msg
-    )
+    title_from_spec = (title_match or (os_spec.get("title_query") or "").strip())
+    if catalog_single_pass and title_from_spec:
+        display_query = filter_label or title_from_spec
+    else:
+        display_query = filter_label or title_from_spec or clean_product_part_label(
+            extract_product_search_query(
+                original_msg, msg_en, title_from_spec, ai_route=ai_route
+            ),
+            original_msg,
+        )
     if is_noisy_search_query(display_query):
         display_query = filter_label or title_match or "products"
 
@@ -1733,6 +2042,79 @@ def run_product_search_ai_flow(
 ) -> ProductFlowResult:
     comb = f"{original_msg} {msg_en}"
     from utils.helpers import extract_product_id
+
+    # Brain/direct locked catalog — skip gates, classifiers, and duplicate order-intent LLMs.
+    try:
+        from services.product_catalog_resolver import (
+            product_catalog_route_is_locked,
+            understanding_from_locked_product_route,
+        )
+
+        if product_catalog_route_is_locked(ai_route):
+            work_route = dict(ai_route) if isinstance(ai_route, dict) else {}
+            try:
+                from services.ai_route_semantics import _brain_product_entities_from_route
+                from services.product_filter_pipeline import _enrich_brain_entities_structural
+
+                ent = _brain_product_entities_from_route(
+                    work_route, original_msg=original_msg, msg_en=msg_en
+                )
+                ent = _enrich_brain_entities_structural(
+                    ent, original_msg, msg_en, brain_route=work_route
+                )
+                if ent:
+                    work_route["_product_entities"] = ent
+                    pn = (ent.get("product_name") or "").strip()
+                    if pn and pn.lower() not in ("products", "product"):
+                        work_route["search_query"] = pn
+                ai_route = work_route
+            except ImportError:
+                pass
+
+            route_sq_brain = (
+                (search_query or "").strip()
+                or ((ai_route or {}).get("search_query") or "").strip()
+            )
+            locked_u = understanding_from_locked_product_route(
+                ai_route,
+                route_sq_brain,
+                original_msg=original_msg,
+                msg_en=msg_en,
+            )
+            if not locked_u and route_sq_brain and route_sq_brain.lower() not in (
+                "products",
+                "product",
+            ):
+                locked_u = {
+                    "action": "search_products",
+                    "is_shopping": True,
+                    "search_terms": route_sq_brain,
+                    "_ai_first": True,
+                }
+            if not locked_u:
+                locked_u = {
+                    "action": "search_products",
+                    "is_shopping": True,
+                    "_ai_first": True,
+                }
+            log_reasoning(
+                "Product brain-locked fast path — skip gates/classifiers → OpenSearch."
+            )
+            if isinstance(ai_route, dict):
+                ai_route.setdefault("_ai_single_pass", True)
+            return _run_locked_catalog_search_fast(
+                original_msg,
+                msg_en,
+                user_id,
+                ctx=ctx,
+                reply_lang=reply_lang,
+                search_query=route_sq_brain,
+                conversation_context=conversation_context,
+                ai_understanding=locked_u,
+                ai_route=ai_route,
+            )
+    except ImportError:
+        pass
 
     pid_early = (ctx.get("data") or {}).get("lookup_pro_id") if ctx else None
     if not pid_early:
@@ -1858,9 +2240,16 @@ def run_product_search_ai_flow(
 
     route_sq = (search_query or (ai_route or {}).get("search_query") or "").strip()
     understanding = None
+    catalog_locked = False
     try:
-        from services.product_catalog_resolver import understanding_from_locked_product_route
+        from services.product_catalog_resolver import (
+            entities_to_understanding,
+            log_product_catalog_routing,
+            product_catalog_route_is_locked,
+            understanding_from_locked_product_route,
+        )
 
+        catalog_locked = product_catalog_route_is_locked(ai_route)
         locked_u = understanding_from_locked_product_route(
             ai_route,
             route_sq,
@@ -1869,9 +2258,9 @@ def run_product_search_ai_flow(
         )
         if locked_u:
             log_reasoning(
-                "Product search fast path — locked router (skip NLU/duplicate LLM)."
+                "Product search fast path — AI entities locked (one OpenSearch pass)."
             )
-            return _run_catalog_search(
+            return _run_locked_catalog_search_fast(
                 original_msg,
                 msg_en,
                 user_id,
@@ -1882,54 +2271,93 @@ def run_product_search_ai_flow(
                 ai_understanding=locked_u,
                 ai_route=ai_route,
             )
-    except ImportError:
-        pass
-
-    try:
-        from services.product_catalog_resolver import (
-            entities_to_understanding,
-            log_product_catalog_routing,
-            product_catalog_route_is_locked,
-            resolve_product_search_turn,
-        )
-
-        catalog_locked = product_catalog_route_is_locked(ai_route)
-        resolved = resolve_product_search_turn(
-            original_msg,
-            msg_en,
-            conversation_context,
-            ai_route=ai_route,
-            allow_llm=not catalog_locked,
-        )
-        if resolved.kind == "product_search":
-            route_entities = (ai_route or {}).get("_product_entities") or resolved.entities
-            if resolved.search_query and not route_sq:
-                route_sq = resolved.search_query
+        if catalog_locked and isinstance(ai_route, dict):
+            route_entities = ai_route.get("_product_entities") or {}
             if route_entities:
                 understanding = entities_to_understanding(
                     route_entities,
-                    search_query=resolved.search_query or route_sq,
+                    search_query=route_sq,
+                    original_msg=original_msg,
                 )
-                if understanding and resolved.search_query and not understanding.get(
-                    "search_terms"
-                ):
-                    understanding["search_terms"] = resolved.search_query
-            log_product_catalog_routing(
-                detected_intent="product_search",
-                product_entities=route_entities,
-                selected_route="product_ai_flow",
-                filters=route_entities,
-                source=resolved.source or "product_search_flow",
-            )
+                if understanding:
+                    log_reasoning(
+                        "Product search — locked route entities (skip duplicate classifier LLM)."
+                    )
+                    log_product_catalog_routing(
+                        detected_intent="product_search",
+                        product_entities=route_entities,
+                        selected_route="product_ai_flow",
+                        filters=route_entities,
+                        source="ai_route_locked",
+                    )
+                    return _run_locked_catalog_search_fast(
+                        original_msg,
+                        msg_en,
+                        user_id,
+                        ctx=ctx,
+                        reply_lang=reply_lang,
+                        search_query=route_sq,
+                        conversation_context=conversation_context,
+                        ai_understanding=understanding,
+                        ai_route=ai_route,
+                    )
+            if not understanding:
+                log_reasoning(
+                    "Product catalog locked — force fast OpenSearch (no Product-catalog LLM)."
+                )
+                return _run_locked_catalog_search_fast(
+                    original_msg,
+                    msg_en,
+                    user_id,
+                    ctx=ctx,
+                    reply_lang=reply_lang,
+                    search_query=route_sq,
+                    conversation_context=conversation_context,
+                    ai_route=ai_route,
+                )
     except ImportError:
         pass
-    skip_parser = bool(route_sq)
-    try:
-        from services.product_catalog_resolver import product_catalog_route_is_locked
 
-        skip_parser = skip_parser or product_catalog_route_is_locked(ai_route)
-    except ImportError:
-        pass
+    if not understanding and not catalog_locked:
+        try:
+            from services.product_catalog_resolver import (
+                entities_to_understanding,
+                log_product_catalog_routing,
+                resolve_product_search_turn,
+            )
+
+            resolved = resolve_product_search_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=ai_route,
+                allow_llm=True,
+            )
+            if resolved.kind == "product_search":
+                route_entities = (ai_route or {}).get("_product_entities") or resolved.entities
+                if resolved.search_query and not route_sq:
+                    route_sq = resolved.search_query
+                if route_entities:
+                    understanding = entities_to_understanding(
+                        route_entities,
+                        search_query=resolved.search_query or route_sq,
+                        original_msg=original_msg,
+                    )
+                    if understanding and resolved.search_query and not understanding.get(
+                        "search_terms"
+                    ):
+                        understanding["search_terms"] = resolved.search_query
+                log_product_catalog_routing(
+                    detected_intent="product_search",
+                    product_entities=route_entities,
+                    selected_route="product_ai_flow",
+                    filters=route_entities or {},
+                    source=resolved.source or "product_search_flow",
+                )
+        except ImportError:
+            pass
+
+    skip_parser = bool(route_sq) or catalog_locked or bool(understanding and understanding.get("_ai_first"))
     if not skip_parser:
         try:
             from services.product_intent_parser import ProductIntentParser
@@ -1972,13 +2400,16 @@ def run_product_search_ai_flow(
             f"color={parsed.filters.color!r} conf={parsed.confidence:.2f}"
         )
 
-    skip_extra_nlu = False
-    try:
-        from services.product_catalog_resolver import product_catalog_route_is_locked
+    skip_extra_nlu = catalog_locked or bool(
+        understanding and understanding.get("_ai_first")
+    )
+    if not skip_extra_nlu:
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
 
-        skip_extra_nlu = product_catalog_route_is_locked(ai_route) or bool(route_sq)
-    except ImportError:
-        skip_extra_nlu = bool(route_sq)
+            skip_extra_nlu = product_catalog_route_is_locked(ai_route) or bool(route_sq)
+        except ImportError:
+            skip_extra_nlu = bool(route_sq)
 
     if route_sq and not understanding:
         understanding = _heuristic_product_understanding(
@@ -1994,6 +2425,10 @@ def run_product_search_ai_flow(
             original_msg.strip() or msg_en.strip(),
             conversation_context=conversation_context,
             reply_lang=reply_lang,
+        )
+    elif understanding and understanding.get("_ai_first"):
+        log_reasoning(
+            "Product search — skip second product NLU LLM (AI-first filters already set)."
         )
     if not understanding:
         understanding = _heuristic_product_understanding(

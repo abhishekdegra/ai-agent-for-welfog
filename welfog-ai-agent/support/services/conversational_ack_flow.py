@@ -137,7 +137,7 @@ def ai_conversational_ack_reply(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import (
@@ -206,7 +206,7 @@ JSON only."""
         user_payload += f"\nRECENT CONVERSATION:\n{compact_ctx}\n"
     user_payload += f"\nLATEST USER MESSAGE (ack only):\n{user_line}"
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return ""
 
@@ -288,7 +288,7 @@ def ai_chitchat_reply(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import (
@@ -313,13 +313,15 @@ The user sent CASUAL CHIT-CHAT (not a shopping/order question): greeting, thanks
 Return ONLY JSON: {{"reasoning":"1 line","response":"reply"}}
 
 RULES:
-- "response" in the SAME language/script as the user's LATEST message (Hinglish, Hindi, English, etc.).
-- 1-3 short sentences — warm, natural, human (like a helpful friend, not a corporate bot).
-- Greeting → greet back briefly; mention you help with Welfog shopping/orders if natural (not a sales pitch).
-- Thanks → acknowledge warmly ("welcome", "khushi hui help karke"); do NOT restart with "Hello! How can I help".
-- "Are you free/busy?" → you are always here to help on chat; light friendly tone.
-- "What are you doing?" → you're here on Welfog support chat, ready to help.
-- Bye / no help needed → warm sign-off; invite them back anytime.
+- "response" in the SAME language, script, and conversational STYLE as the user's LATEST message
+  (Hinglish, Hindi, English, slang, formal, poetic, playful — mirror their vibe; never default to plain "Hi").
+- 1-3 short sentences — warm, natural, human (like ChatGPT in live chat, not a corporate bot).
+- Greeting (any wording) → greet back in their style; light mention you help with Welfog shopping/orders if natural.
+- Thanks / praise / satisfaction ("maza aa gaya", "bahut accha", "help ke liye dhanyawad") → warm acknowledgment;
+  do NOT restart with "Hello! How can I help"; say they can return anytime for Welfog help.
+- "Are you free/busy?" → you are always here on chat; light friendly tone in their language.
+- "What are you doing?" → you're on Welfog support chat, ready to help — match their casual/formal tone.
+- Bye / closing / no more help → friendly sign-off; welcome them back whenever they need Welfog support.
 - Do NOT search products, do NOT ask for Order ID, do NOT dump policies.
 - Do NOT echo the user's message verbatim.
 {language_reply_instruction(rl)}
@@ -330,7 +332,7 @@ JSON only."""
         user_payload += f"RECENT CONVERSATION:\n{compact_ctx}\n\n"
     user_payload += f"LATEST USER MESSAGE (chitchat):\n{user_line}"
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return ""
 
@@ -341,8 +343,8 @@ JSON only."""
             {"role": "user", "content": user_payload},
         ],
         max_tokens=200,
-        timeout_sec=12,
-        max_attempts=2,
+        timeout_sec=8,
+        max_attempts=1,
         temperature=0.35,
     )
     if not data:
@@ -359,6 +361,80 @@ JSON only."""
         return ""
     log_reasoning(f"Chitchat AI reply: {(data.get('reasoning') or '')[:100]}")
     return finalize_customer_reply(_wrap_ack_html(raw), original_msg or msg_en, rl)
+
+
+def resolve_natural_conversational_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    ctx: dict | None = None,
+    ai_route: dict | None = None,
+    *,
+    check_off_topic: bool = False,
+) -> str:
+    """
+    ChatGPT-style natural reply for greetings, thanks, closings, chitchat, and off-topic.
+    One lightweight LLM call; KB templates only when LLM is unavailable.
+    """
+    from services.conversation_scope import SCOPE_OUT, build_scope_reply
+    from services.translation_service import finalize_customer_reply, resolve_customer_reply_lang
+
+    rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+
+    if isinstance(ai_route, dict):
+        scope_reply = (ai_route.get("scope_reply") or "").strip()
+        if scope_reply:
+            return finalize_customer_reply(
+                f"<div style='color:#333;line-height:1.55;'>{scope_reply}</div>"
+                if "<" not in scope_reply
+                else scope_reply,
+                original_msg or msg_en,
+                rl,
+            )
+
+    if check_off_topic:
+        try:
+            from services.conversation_scope import ai_classify_scope_and_reply
+
+            scope_dec = ai_classify_scope_and_reply(
+                original_msg, msg_en, conversation_context, rl
+            )
+            if scope_dec and scope_dec.scope == SCOPE_OUT:
+                body = build_scope_reply(
+                    scope_dec, original_msg, msg_en, rl, prefer_llm=False
+                )
+                if body:
+                    log_reasoning("Natural conversational reply — out-of-domain scope LLM.")
+                    return body
+        except ImportError:
+            pass
+        return ""
+
+    body = ai_chitchat_reply(
+        original_msg, msg_en, conversation_context, reply_lang=rl, ctx=ctx
+    )
+    if body:
+        log_reasoning("Natural conversational reply — chitchat AI.")
+        return body
+
+    from utils.helpers import (
+        fast_warm_reply_html,
+        should_send_warm_greeting_reply,
+    )
+
+    if should_send_warm_greeting_reply(original_msg, msg_en, conversation_context):
+        warm = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
+        if warm:
+            return finalize_customer_reply(warm, original_msg or msg_en, rl)
+    tmpl = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
+    if tmpl:
+        log_reasoning("Natural conversational reply — template fallback.")
+        return finalize_customer_reply(tmpl, original_msg or msg_en, rl)
+    return ""
 
 
 def build_contextual_ack_reply(

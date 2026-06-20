@@ -130,6 +130,39 @@ def resolve_explicit_turn_goal_from_message(
     if re.fullmatch(r"[0-9]{4,20}", comb) or re.fullmatch(r"[A-Za-z0-9]{4,20}", comb):
         return ""
 
+    try:
+        from utils.helpers import (
+            _text_has_pincode_delivery_intent,
+            _text_is_pincode_serviceability_question_light,
+            message_has_live_pincode_check_intent,
+        )
+
+        if message_has_live_pincode_check_intent(
+            current_msg, conversation_context, msg_en
+        ) or _text_is_pincode_serviceability_question_light(comb) or _text_has_pincode_delivery_intent(
+            comb, conversation_context
+        ):
+            return ""
+    except ImportError:
+        pass
+
+    try:
+        from utils.helpers import (
+            _text_asks_order_history,
+            _text_asks_wishlist,
+            _text_wants_order_history_list_in_chat,
+            message_is_wishlist_like_request,
+        )
+
+        if _text_asks_order_history(comb) or _text_wants_order_history_list_in_chat(
+            comb, conversation_context
+        ):
+            return ""
+        if _text_asks_wishlist(comb) or message_is_wishlist_like_request(comb):
+            return ""
+    except ImportError:
+        pass
+
     if getattr(_EXPLICIT_GOAL_GUARD, "active", False):
         return ""
 
@@ -151,24 +184,61 @@ def resolve_explicit_turn_goal_from_message(
             pass
 
         try:
+            from utils.helpers import _text_is_refund_return_policy_howto
+
+            if _text_is_refund_return_policy_howto(comb):
+                return ""
+        except ImportError:
+            pass
+
+        try:
+            from services.refund_status_semantics import (
+                KIND_PERSONAL_STATUS,
+                resolve_refund_turn,
+            )
+
+            resolved = resolve_refund_turn(
+                current_msg,
+                msg_en,
+                conversation_context,
+                ai_route=ai_route,
+                reply_lang=reply_lang,
+                allow_llm=allow_llm,
+            )
+            if resolved.kind == KIND_PERSONAL_STATUS:
+                return "refund_status"
+        except ImportError:
+            pass
+
+        try:
+            from services.order_details_flow import message_wants_order_details_or_invoice
+
+            od = message_wants_order_details_or_invoice(
+                current_msg, msg_en, conversation_context
+            )
+            if od in ("order_details", "order_invoice"):
+                return od
+        except ImportError:
+            pass
+
+        try:
             from utils.helpers import _text_is_order_tracking_intent_leaf
 
             if _text_is_order_tracking_intent_leaf(comb):
                 return "track"
         except ImportError:
             pass
-
-        try:
-            from services.refund_status_semantics import _message_has_refund_topic
-
-            if _message_has_refund_topic(comb):
-                return "refund_status"
-        except ImportError:
-            pass
     finally:
         _EXPLICIT_GOAL_GUARD.active = False
 
-    if allow_llm and len(re.findall(r"\S+", comb)) >= 4:
+    if allow_llm and len(re.findall(r"\S+", (current_msg or msg_en or "").strip())) >= 4:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+            if should_skip_micro_classifier_llm():
+                return ""
+        except ImportError:
+            pass
         classified = ai_classify_conversation_thread(
             comb, conversation_context, reply_lang=reply_lang
         )
@@ -353,15 +423,22 @@ def ai_classify_conversation_thread(
     Micro-LLM: what thread is the user continuing (any language)?
     Only for ambiguous id handoffs — not general routing.
     """
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            return None
+    except ImportError:
+        pass
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_provider_chain,
+        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
 
-    providers = _llm_provider_chain()
+    providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
@@ -416,6 +493,12 @@ Return ONLY valid JSON:
         max_attempts=2,
     )
     if not data:
+        return None
+    if isinstance(data, list):
+        data = next((x for x in data if isinstance(x, dict)), None)
+        if not data:
+            return None
+    if not isinstance(data, dict):
         return None
     goal = (data.get("thread_goal") or "none").strip().lower()
     if goal not in _THREAD_GOALS and goal != "none":
@@ -484,6 +567,14 @@ def infer_order_thread_goal(
     goal, best_score, ambiguous = _pick_goal_from_scores(scores)
 
     need_llm = allow_llm and (best_score < 3 or ambiguous or not goal)
+    if need_llm:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+            if should_skip_micro_classifier_llm():
+                need_llm = False
+        except ImportError:
+            pass
     if need_llm:
         classified = ai_classify_conversation_thread(
             current_msg, conversation_context, reply_lang=reply_lang

@@ -77,6 +77,60 @@ def reset_context(ctx):
     ctx["order_id"] = None
 
 
+_ORDER_PENDING_ACTIONS = frozenset(
+    {
+        "track",
+        "order_invoice",
+        "order_details",
+        "refund_status",
+        "payment",
+    }
+)
+
+
+def ctx_has_order_thread_lock(ctx) -> bool:
+    """True while collecting Order ID for a locked refund/track/invoice/details turn."""
+    if not isinstance(ctx, dict):
+        return False
+    if ctx.get("awaiting") == "order_id":
+        return True
+    pending = ((ctx.get("data") or {}).get("pending_action") or "").strip().lower()
+    return pending in _ORDER_PENDING_ACTIONS
+
+
+def reset_context_unless_order_pending(ctx) -> None:
+    """Clear session ctx but keep order-id collection thread (pending_action / ai_route)."""
+    if ctx_has_order_thread_lock(ctx):
+        return
+    reset_context(ctx)
+
+
+def message_user_switches_order_scope(text: str) -> bool:
+    """User wants a different order — do not reuse session order_id or stale intent."""
+    tl = f" {(text or '').lower()} "
+    if re.search(r"\b(?:dusra|dusre|different|another|other|new)\s+order\b", tl):
+        return True
+    if "dusra" in tl and ("order" in tl or " id" in tl):
+        return True
+    if ("yeh nhi" in tl or "ye nhi" in tl) and ("dusra" in tl or "order" in tl):
+        return True
+    if "not this" in tl and "order" in tl:
+        return True
+    return False
+
+
+def clear_order_session_for_new_lookup(ctx: dict | None) -> None:
+    """Drop stale order id / locked route when user starts a fresh order question."""
+    if not isinstance(ctx, dict):
+        return
+    ctx["order_id"] = None
+    data = ctx.get("data")
+    if not isinstance(data, dict):
+        return
+    for key in ("pending_action", "topic_mode", "ai_route"):
+        data.pop(key, None)
+
+
 def _normalize_repeated_letters(token: str) -> str:
     return re.sub(r"(.)\1{1,}", r"\1", token or "")
 
@@ -156,13 +210,16 @@ def _message_looks_like_shopping_query(msg: str) -> bool:
         return False
     shop_verbs = (
         "show ", "show me", "show my", "show mw", "looking for", " buy ", " need ",
-        " want ", "dikhao", "dikha ", "dikhao", "chahiye", "chahie", "chhaie", "chaahiye",
+        " want ", "dikhao", "dikha ", " dikha", " dikhao", "chahiye", "chahie", "chhaie", "chaahiye",
         "milega", "milta", "milti", "milegi", "search ", "dikana", "dikhana",
     )
     if any(v in tl for v in shop_verbs):
         if any(w in tl for w in _FAST_SHOPPING_WORDS):
             return True
         if any(x in tl for x in ("show me", "show my", "show mw", "show the", "looking for")):
+            return True
+    if re.search(r"\b(?:dikha|dikhao|dikhana|dikhao)\b", raw):
+        if any(w in tl for w in _FAST_SHOPPING_WORDS):
             return True
     # Product noun + need/availability (Hinglish typos) — no heavy intent graph.
     if any(w in tl for w in _FAST_SHOPPING_WORDS):
@@ -231,12 +288,11 @@ def _looks_like_greeting_message(msg: str) -> bool:
             "chahiye", "milega", "product", "refund", "pincode",
         )
     )
-    if not _short_opener and _text_has_product_shopping_intent_core(raw):
+    if not _short_opener:
         return False
+
     for phrase in casual_opener_phrases:
         if phrase in raw and len(words) <= 8:
-            if _text_has_concrete_welfog_support_question(raw):
-                return False
             return True
     query_blockers = {
         "order", "track", "tracking", "delivery", "payment", "refund", "return",
@@ -995,7 +1051,8 @@ def message_is_user_feedback_or_closing(text: str) -> bool:
         return False
     tl = f" {_normalize_conversational_text(text)} "
     satisfaction = (
-        "mja aaya", "maza aaya", "maja aaya", "majaa aaya", "mja aa", "maze aaye", "mja aya",
+        "mja aaya", "maza aaya", "maza aa gaya", "maza aa gya", "maja aaya", "maja aa gaya", "maja aa gya",
+        "majaa aaya", "mja aa", "maze aaye", "mja aya",
         "achha laga", "accha laga", "acha laga", "badhiya laga", "bdiya laga", "badiya laga", "sundar laga",
         "theek h ", "thik h ", "theek hai", "thik hai", "sahi h ", "sahi hai",
         "dekh ke mja", "dekh ke maza", "dekh ke maja", "response dekh", "reply dekh",
@@ -1241,6 +1298,10 @@ def build_warm_feedback_reply(
     if isinstance(ai_route, dict):
         scope_reply = (ai_route.get("scope_reply") or "").strip()
     if scope_reply:
+        low_sr = scope_reply.lower()
+        if low_sr in ("warm", "warm reply", "warm natural reply", "natural reply"):
+            scope_reply = ""
+    if scope_reply:
         return finalize_customer_reply(
             f"<div style='color:#333;line-height:1.55;'>{scope_reply}</div>"
             if "<" not in scope_reply
@@ -1267,9 +1328,9 @@ def build_warm_feedback_reply(
         return ai_body
 
     if should_send_warm_greeting_reply(original_msg, msg_en, conversation_context):
-        warm = build_warm_conversation_reply(original_msg, msg_en, reply_lang=rl)
+        warm = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
         if warm:
-            return warm
+            return finalize_customer_reply(warm, original_msg or msg_en, rl)
     contextual = build_contextual_ack_reply(
         original_msg, msg_en, conversation_context, reply_lang=rl, ctx=ctx
     )
@@ -1299,6 +1360,9 @@ def _should_bypass_warm_greeting_fast_path(combined_text: str) -> bool:
     if not t:
         return False
     if _is_short_pure_greeting(t) or _is_light_smalltalk_fast(t):
+        return False
+    # Casual openers ("sun na", "kya haal") — never run the heavy support/shopping guard chain.
+    if _looks_like_greeting_message(t):
         return False
     if _text_asks_wishlist(t) or message_is_wishlist_like_request(t):
         return True
@@ -1413,6 +1477,8 @@ def _text_has_thanks_only_intent(text: str) -> bool:
     """Thanks/appreciation only — no active shopping/support ask."""
     raw = (text or "").strip()
     if not raw:
+        return False
+    if _looks_like_greeting_message(raw) or _is_light_smalltalk_fast(raw):
         return False
     if _should_bypass_warm_greeting_fast_path(raw.lower()):
         return False
@@ -1568,14 +1634,8 @@ def pick_warm_chat_reply_key(smalltalk: bool, original_msg: str = "", reply_lang
 
 
 def build_warm_conversation_reply(original_msg: str, msg_en: str = "", reply_lang: str = "") -> str:
-    """Human-like opener — no deals URLs on first hello."""
-    from services.kb_service import sysmsg
-
-    smalltalk = _looks_like_light_smalltalk(original_msg, msg_en) and not _looks_like_greeting_message(
-        original_msg
-    )
-    key = pick_warm_chat_reply_key(smalltalk, original_msg=original_msg, reply_lang=reply_lang)
-    return sysmsg(key) or sysmsg("greeting") or ""
+    """Human-like opener — KB templates only (no heavy guards or embedding path)."""
+    return fast_warm_reply_html(original_msg, msg_en, reply_lang=reply_lang)
 
 
 def _normalize_order_chat_text(text: str) -> str:
@@ -1716,6 +1776,10 @@ def _pincode_delivery_signal_leaf(t: str) -> bool:
         return False
     tl = f" {raw.lower()} "
     if _user_denies_pincode_insists_order_id(raw):
+        return False
+    if _leaf_non_tracking_order_id_intent(raw):
+        return False
+    if re.search(r"\b[0-9]{7,20}\b", raw) and re.search(r"\borders?\b", tl):
         return False
     if re.search(r"\b\d{4,20}\b", raw) and re.search(r"\borders?\b", tl):
         if any(
@@ -1895,6 +1959,20 @@ def _digits_in_message_are_order_id_not_pincode_impl(
         if intent in ("order", "refund", "payment") and nc == "order_id":
             if re.search(r"\b\d{4,20}\b", raw):
                 return True
+    tl_early = f" {_normalize_order_chat_text(raw).lower()} "
+    if _text_has_refund_or_return_intent(raw) and re.search(r"\b[0-9]{4,20}\b", raw):
+        return True
+    if re.search(r"\b[0-9]{7,20}\b", raw) and any(
+        x in tl_early
+        for x in (" refund", " return", " id pe", " id ka", " id ke", " is id", " iska", " iski")
+    ):
+        return True
+    if _leaf_non_tracking_order_id_intent(raw):
+        return True
+    if "order" in tl_early and re.search(r"\b[0-9]{7,20}\b", raw):
+        return not _text_has_explicit_pincode_subject(raw)
+    if _text_has_order_id_context(raw) and re.search(r"\b[0-9]{4,20}\b", raw):
+        return not _text_has_explicit_pincode_subject(raw)
     if _message_has_embedded_pincode_for_delivery(raw, conversation_context):
         return False
     if _text_is_pincode_serviceability_question_light(raw):
@@ -2166,6 +2244,8 @@ def turn_is_catalog_product_lookup(
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
         return False
+    if _leaf_non_tracking_order_id_intent(comb):
+        return False
     if _text_is_undelivered_order_complaint(comb) or _text_has_past_order_complaint_context(comb):
         return False
     if _text_is_order_tracking_intent_leaf(comb):
@@ -2213,8 +2293,9 @@ def _text_is_undelivered_order_complaint(t: str) -> bool:
     not_arrived = (
         "nhi pahucha", "nahi pahucha", "nhi pahuncha", "nahi pahuncha",
         "nhi pahunch", "nahi pahunch", "ab bhi nhi", "abhi bhi nhi", "ab tak nhi",
-        "ab tak nahi", "tk bhi nhi", "tak bhi nahi", "nhi aaya", "nahi aaya",
-        "nhi aya", "nahi aya", "nhi mila", "nahi mila", "aa nahi", "aaya nahi",
+        "ab tak nahi", "tk bhi nhi", "tak bhi nahi",         "nhi aaya", "nahi aaya",
+        "nhi aya", "nahi aya", "nhi aa ", "nahi aa ", "order nhi aa", "order nahi aa",
+        "nhi mila", "nahi mila", "aa nahi", "aaya nahi",
         "not received", "not arrived", "hasn't arrived", "has not arrived",
         "still not", "not delivered", "delivery nahi", "delivery nhi",
     )
@@ -2397,6 +2478,12 @@ def _text_is_product_id_lookup_context(t: str) -> bool:
     """Numeric id in message is for catalog lookup, not order tracking."""
     if not t:
         return False
+    try:
+        if _message_looks_like_shopping_query(t):
+            if not re.search(r"\b\d{4,12}\b", t):
+                return False
+    except Exception:
+        pass
     if (
         _text_is_undelivered_order_complaint(t)
         or _text_is_order_tracking_intent_leaf(t)
@@ -2510,14 +2597,19 @@ def extract_order_id(msg, conversation_context: str = ""):
 
 def _extract_order_id_impl(msg, conversation_context: str = ""):
     raw = _normalize_order_chat_text(msg or "")
-    if turn_is_catalog_product_lookup(raw):
+    if _leaf_non_tracking_order_id_intent(raw):
+        order_id_topic = True
+    elif turn_is_catalog_product_lookup(raw):
         return None
+    else:
+        order_id_topic = False
     ctx_comb = f"{raw} {(conversation_context or '')[-1200:]}"
-    order_id_topic = (
-        _text_has_order_id_context(raw)
-        or _text_is_live_order_lookup_intent(raw, conversation_context)
-        or _user_denies_pincode_insists_order_id(raw)
-    )
+    if not order_id_topic:
+        order_id_topic = (
+            _text_has_order_id_context(raw)
+            or _text_is_live_order_lookup_intent(raw, conversation_context)
+            or _user_denies_pincode_insists_order_id(raw)
+        )
     awaiting_oid = _conversation_awaiting_order_id(conversation_context)
     if awaiting_oid or _message_is_order_id_followup_submission(raw, conversation_context):
         early = _bare_order_id_token_from_msg(raw, conversation_context)
@@ -2870,6 +2962,25 @@ def resolve_live_api_intent_from_conversation(
     if isinstance(ai_route, dict):
         route_intent = (ai_route.get("intent") or "").strip().lower()
         route_olk = (ai_route.get("order_lookup_kind") or "").strip().lower()
+        try:
+            from services.ai_route_semantics import resolve_order_live_goal_for_turn
+
+            live = resolve_order_live_goal_for_turn(
+                ai_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
+            )
+            if live == "order_invoice":
+                return "order"
+            if live in ("order_details", "payment"):
+                return "order"
+            if live == "refund_status":
+                return "refund"
+            if live == "track":
+                return "order"
+        except ImportError:
+            pass
 
     if route_olk == "refund_status" or route_intent == "refund":
         return "refund"
@@ -2878,6 +2989,11 @@ def resolve_live_api_intent_from_conversation(
     if route_intent == "payment":
         return "payment" if _user_explicitly_asks_payment_status(turn) else "order"
 
+    if _text_has_refund_or_return_intent(turn) and (
+        _text_needs_order_id_for_refund_or_payment(turn)
+        or _text_is_refund_return_status_lookup(turn, conversation_context)
+    ):
+        return "refund"
     if _text_is_order_tracking_intent(turn):
         return "order"
     if "order" in tl and any(
@@ -2888,9 +3004,8 @@ def resolve_live_api_intent_from_conversation(
             "bta ", "bata ", "milega", "aaya", "aaya",
         )
     ):
-        return "order"
-    if _text_has_refund_or_return_intent(turn) and _text_needs_order_id_for_refund_or_payment(turn):
-        return "refund"
+        if not _text_has_refund_or_return_intent(turn):
+            return "order"
     if _user_explicitly_asks_payment_status(turn):
         return "payment"
 
@@ -3414,6 +3529,8 @@ def extract_pincode_preferred_from_message(
         tl = f" {_normalize_order_chat_text(text).lower()} "
         if re.search(r"\b(?:order\s*id|orderid|order-id|oid)\b", tl):
             return ""
+        if _text_has_order_id_context(text) and re.search(r"\b[0-9]{7,20}\b", text):
+            return ""
         m = re.search(r"\b([1-9]\d{6,8})\b", text)
         if m:
             return _normalize_pin_candidate(m.group(1))
@@ -3696,6 +3813,7 @@ def _leaf_non_tracking_order_id_intent(t: str) -> bool:
         return True
     if re.search(
         r"\bamount\b|grand\s+total|total\s+amount|kitna\s+tha|kitne\s+ka|kitne\s+rs|"
+        r"kitni\s+thi|kitna\s+tha|\bprice\b|\bdaam\b|\bcost\b|"
         r"how\s+much\s+(?:did\s+i\s+)?pay",
         tl,
         re.I,
@@ -3705,6 +3823,85 @@ def _leaf_non_tracking_order_id_intent(t: str) -> bool:
         r"payment\s+status|payment\s+mode|payment\s+ka|paid\s+or\s+not|unpaid|cod\b",
         tl,
         re.I,
+    ):
+        return True
+    if re.search(
+        r"\b(?:detail|details|info|summary|vivaran|jankari|जानकारी|विवरण)\b",
+        tl,
+        re.I,
+    ):
+        return True
+    if re.search(r"\bdetail", tl) and re.search(
+        r"\b(?:saari|sari|poori|poore|full|all|complete|chahiye|chahie)\b", tl
+    ):
+        return True
+    return False
+
+
+def message_is_general_delivery_policy_question(text: str) -> bool:
+    """
+    Company-wide delivery timeline (no personal order id) → KB, not live tracking API.
+    e.g. 'Welfog kitne din me delivery deta hai'
+    """
+    raw = _normalize_order_chat_text((text or "").strip())
+    if not raw:
+        return False
+    if re.search(r"\b\d{4,20}\b", raw):
+        return False
+    if _current_turn_has_order_id(raw):
+        return False
+    tl = f" {raw.lower()} "
+    policy_time = (
+        "kitne din",
+        "kitna time",
+        "kitne din me",
+        "kitne dino",
+        "generally",
+        "usually",
+        "normally",
+        "typically",
+        "on average",
+    )
+    if any(m in tl for m in policy_time) and any(
+        x in tl
+        for x in (
+            "welfog",
+            "delivery",
+            "shipping",
+            "courier",
+            "dispatch",
+            "deliver",
+            "order aata",
+            "order aati",
+            "order milt",
+        )
+    ):
+        if not re.search(r"\b[1-9]\d{5}\b", raw):
+            return True
+    try:
+        from services.order_details_flow import _text_wants_order_invoice
+
+        if _text_wants_order_invoice(raw, ""):
+            return False
+    except ImportError:
+        pass
+    if _text_is_pincode_serviceability_question_light(raw):
+        return False
+    if not any(m in tl for m in policy_time):
+        return False
+    if any(
+        x in tl
+        for x in (
+            "welfog",
+            "delivery",
+            "shipping",
+            "courier",
+            "dispatch",
+            "deliver",
+            "order aata",
+            "order aati",
+            "order milt",
+        )
     ):
         return True
     return False
@@ -3729,6 +3926,8 @@ def _text_is_order_tracking_intent_leaf(t: str) -> bool:
         pass
 
     raw = _normalize_order_chat_text((t or "").strip())
+    if _text_asks_order_history(raw) or _text_wants_order_history_list_in_chat(raw):
+        return False
     if _text_is_undelivered_order_complaint(raw):
         return True
     if _text_is_delivery_serviceability_hypothetical(raw):
@@ -3741,13 +3940,20 @@ def _text_is_order_tracking_intent_leaf(t: str) -> bool:
         return False
     if _leaf_non_tracking_order_id_intent(raw):
         return False
+    tl_refund_guard = f" {raw.lower()} "
+    if _text_has_refund_or_return_intent(raw) or re.search(
+        r"\brefund\b", tl_refund_guard
+    ) or re.search(r"\breturn\b", tl_refund_guard):
+        return False
     if native_order_tracking_request(raw) or multilingual_order_tracking_match(raw, raw):
         return True
     tl = f" {raw.lower()} "
     markers = (
         "track", "tracking", "trck", "trak", "traking", "teck", "order status", "order id",
         "orderid", "where is my order", "where my order", "delivery status", "shipment",
-        "kab aayega", "kab aaega", "kab aaega", "kab tak", "kab milega", "kb aayega",
+        "kab aayega", "kab aaega", "kab aaega", "kab tak", "kab tk", "kb tk", "kab milega", "kb aayega",
+        "pahuch jayga", "pahuch jayega", "pahunch jayga", "pahunch jayega", "pahunch jaega",
+        "mere pass kab", "mere paas kab", "pass kab tk", "paas kab tk",
         "kahan hai order", "order kahan", "order kaha", "parcel", "package kahan",
         "track ese", "track kar", "track kr", "trck kr", "trck kar", "ese track",
         "track kaise", "tracking ese", "track ki", "track krke", "track krke bata",
@@ -4320,6 +4526,100 @@ def _resolve_ambiguous_bare_numeric_context(
     return "none"
 
 
+def message_is_bare_numeric_submission(text: str) -> bool:
+    """Latest turn is only digits / short alphanumeric id (pincode, order id, SKU)."""
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    return bool(
+        re.fullmatch(r"[1-9]\d{5}\s*\??", raw)
+        or re.fullmatch(r"[0-9]{4,20}", raw)
+        or re.fullmatch(r"[A-Za-z0-9]{4,20}", raw)
+    )
+
+
+def classify_bare_numeric_turn(
+    current_msg: str,
+    conversation_context: str = "",
+    *,
+    ctx: dict | None = None,
+    ai_route: dict | None = None,
+) -> str:
+    """
+    Disambiguate bare numeric submissions using session lock + recent chat.
+    Returns: pincode | order_id | product_id | none
+    """
+    raw = (current_msg or "").strip()
+    if not raw or not message_is_bare_numeric_submission(raw):
+        return "none"
+
+    if isinstance(ctx, dict):
+        awaiting = (ctx.get("awaiting") or "").strip().lower()
+        if awaiting == "pincode":
+            return "pincode"
+        if awaiting == "order_id":
+            return "order_id"
+        last = (ctx.get("last") or "").strip().lower()
+        data = dict(ctx.get("data") or {})
+        if last == "pincode" and re.fullmatch(r"[1-9]\d{5}\s*\??", raw):
+            return "pincode"
+        topic = (data.get("topic_mode") or "").strip().lower()
+        if topic == "pincode_check" and re.fullmatch(r"[1-9]\d{5}\s*\??", raw):
+            return "pincode"
+        if data.get("lookup_pro_id") or data.get("lookup_sku"):
+            return "product_id"
+        pending = (data.get("pending_action") or "").strip().lower()
+        if pending in (
+            "track",
+            "order_invoice",
+            "order_details",
+            "refund_status",
+            "payment",
+        ):
+            if re.fullmatch(r"[0-9]{4,20}", raw) or re.fullmatch(r"[0-9]{7,20}", raw):
+                return "order_id"
+
+    if re.fullmatch(r"[1-9]\d{5}\s*\??", raw):
+        if _conversation_bot_asked_for_pincode(conversation_context):
+            return "pincode"
+        kind = _resolve_ambiguous_bare_numeric_context(
+            raw, conversation_context, ai_route=ai_route
+        )
+        if kind == "pincode":
+            return "pincode"
+        if _conversation_in_pincode_delivery_flow(conversation_context):
+            return "pincode"
+        return kind
+
+    if re.fullmatch(r"[0-9]{7,20}", raw):
+        if _conversation_awaiting_order_id(conversation_context):
+            return "order_id"
+        if _conversation_in_order_tracking_flow(conversation_context):
+            return "order_id"
+        kind = _resolve_ambiguous_bare_numeric_context(
+            raw, conversation_context, ai_route=ai_route
+        )
+        return kind if kind != "none" else "order_id"
+
+    return _resolve_ambiguous_bare_numeric_context(
+        raw, conversation_context, ai_route=ai_route
+    )
+
+
+def set_pincode_await_context(ctx: dict, ai_route: dict | None = None) -> None:
+    """Lock session for next bare-PIN reply — do not wipe with full reset_context."""
+    if not isinstance(ctx, dict):
+        return
+    ctx["intent"] = None
+    ctx["awaiting"] = "pincode"
+    ctx["last"] = "pincode"
+    ctx["order_id"] = None
+    ctx.setdefault("data", {})
+    ctx["data"]["topic_mode"] = "pincode_check"
+    if isinstance(ai_route, dict) and ai_route:
+        ctx["data"]["ai_route"] = ai_route
+
+
 def _text_has_pincode_delivery_intent(t: str, conversation_context: str = "") -> bool:
     """
     Delivery / service at a PIN — must win over order-id tracking and product search.
@@ -4695,6 +4995,23 @@ def _text_requests_category_product_browse(t: str, ctx=None) -> bool:
     User wants products FROM a named category (e.g. beauty / electronics ke products bta).
     Not the full 'all categories' department list.
     """
+    try:
+        from services.welfog_api import (
+            message_requests_category_browse,
+            resolve_nav_category_id_fast,
+            resolve_category_browse_for_catalog,
+        )
+
+        if not message_requests_category_browse(t):
+            return False
+        if resolve_nav_category_id_fast(t, ctx=ctx):
+            return True
+        route = resolve_category_browse_for_catalog(
+            t, ctx=ctx, allow_inner_lookup=False
+        )
+        return bool(route)
+    except ImportError:
+        pass
     if _looks_like_browse_all_categories_message(t):
         return False
     try:
@@ -4708,8 +5025,9 @@ def _text_requests_category_product_browse(t: str, ctx=None) -> bool:
 
     tl = f" {(t or '').lower()} "
     browse_signals = (
-        "dikhao", "dikha", "dikhe", "dikhaa", "dekho", "dekh", "show", "list", "display",
+        "dikhao", "dikha", "dikhe", "dikhaa", "dikha de", "dikha do", "dekho", "dekh", "show", "list", "display",
         "batao", "btao", "bata", "bta", "btana", "batana", "bta de", "bata de", "bta do",
+        "bhi bta", "bhi dikha", "k bhi",
         "chahiye", "chiye", "dena", "de do", "dede", "de de",
         "lao", "la do", "bhejo", "send", "view", "see",
         "puchh", "pooch", "puch", "puch rha", "bol", "bolo",
@@ -5635,12 +5953,23 @@ def _text_is_refund_return_status_lookup_impl(t: str, conversation_context: str 
         return False
     tl = f" {raw.lower()} "
     status_markers = (
-        "check", "status", "kb tk", "kab tak", "kab milega", "kab aayega", "kab aaye",
+        "check", "status", "kb tk", "kab tk", "kab tak", "kab milega", "kab aayega", "kab aaye",
         "kab hoga", "kab hogi", "kab approve", "kitne din", "aajayega", "aa jayega",
         "atak", "atka", "stuck", "delay", "approve", "approved", "approval",
         "dekh ke bta", "check krke", "check karke", "verify", "record", "bta de",
         "bata de", "btao de", "check kr", "check kar", "return status", "refund status",
+        "bata", "btao", "batao", "btana", "bata do", "bta do",
     )
+    refund_complaint_markers = (
+        "nhi aaya", "nahi aaya", "nhi mila", "nahi mila", "nhi aaye", "nahi aaye",
+        "abhi tak", "abhi tk", "not received", "not come", "haven't received",
+        "approve hua", "approved hua", "hua kya", "hui kya",
+    )
+    has_refund_topic = bool(
+        _text_has_refund_or_return_intent(raw) or "refund" in tl or "return" in tl
+    )
+    if has_refund_topic and any(c in tl for c in refund_complaint_markers):
+        return True
     if not any(m in tl for m in status_markers):
         return False
     # General timeline without a specific order → policy KB, not live status API.
@@ -5671,7 +6000,8 @@ def _text_is_refund_return_status_lookup_impl(t: str, conversation_context: str 
         raw, conversation_context
     ):
         return True
-    return False
+    # Personal refund/return status (any language) — live API; order id optional on this turn.
+    return True
 
 
 def _text_is_refund_return_policy_howto(t: str) -> bool:
@@ -5689,6 +6019,15 @@ def _text_is_refund_return_policy_howto(t: str) -> bool:
     if _text_is_refund_return_status_lookup(raw):
         return False
     tl = f" {raw.lower()} "
+    if any(
+        x in tl
+        for x in (
+            "nahi aaya", "nhi aaya", "nahi mila", "nhi mila", "abhi tak", "abhi tk",
+            "approve hua", "approved hua", "status bta", "status bata",
+        )
+    ):
+        if not _current_turn_has_order_id(raw) and not re.search(r"\b\d{4,20}\b", raw):
+            return False
     howto_markers = (
         "kaise", "kese", "kes ", "krte", "karte", "karna", "krna", "karu", "karun",
         "batana", "batao", "btao", "process", "steps", "step", "kya kar", "kya kr",
@@ -5698,6 +6037,8 @@ def _text_is_refund_return_policy_howto(t: str) -> bool:
     general_timeline = (
         "kitne din", "kitna time", "kitne din me", "generally", "usually",
         "normally", "typically", "in general",
+        "kab aayega", "kab aaega", "kab milega", "kab tak", "kb tk", "aa jayega",
+        "aayega", "mil jata", "mil jati", "kitne dino",
     )
     if _text_has_refund_or_return_intent(raw) and any(x in tl for x in howto_markers):
         return True
@@ -6345,6 +6686,34 @@ _INFO_READ_VERBS = (
 )
 
 
+def _text_has_kb_topic_hint(t: str) -> bool:
+    """Cheap scan — avoid heavy policy/about/social checks on every /chat turn."""
+    if not (t or "").strip():
+        return False
+    tl = f" {_normalize_policy_typos(t)} "
+    for topic in _KNOWLEDGE_INFO_TOPICS:
+        if topic in tl:
+            return True
+    if "policy" in tl or "policies" in tl or "privacy" in tl:
+        return True
+    if any(x in tl for x in (" faq", "faqs", "help & support", "help and support")):
+        return True
+    if _text_mentions_welfog_brand(tl) and any(
+        x in tl
+        for x in (
+            " kya hai",
+            " kya h ",
+            " what is ",
+            " ke baare",
+            " about ",
+            " company ",
+            " story",
+        )
+    ):
+        return True
+    return False
+
+
 def _text_is_sim_ejector_pin_product_request(t: str) -> bool:
     """SIM tray ejector pin/tool — product buy, NOT delivery pincode."""
     if not (t or "").strip():
@@ -6588,6 +6957,16 @@ def message_is_knowledge_information_request(
     User wants policy / legal / FAQ / company info from KB — NOT catalog product search.
     e.g. 'privacy policy dikhao', 'terms batao', 'welfog ki privacy policy'.
     """
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _looks_like_greeting_message(raw) or _is_short_pure_greeting(raw):
+        return False
+    if _is_light_smalltalk_fast(raw, ""):
+        return False
+    if not _text_has_kb_topic_hint(raw) and not _is_welfog_about_fast_path(raw):
+        return False
+
     from services.policy_scope import (
         _user_explicitly_wants_welfog_policy,
         policy_question_is_for_welfog,
@@ -6773,6 +7152,8 @@ def message_is_generic_help_request(t: str) -> bool:
 
 def message_needs_support_not_product(t: str) -> bool:
     """Support / customer-care / complaint+contact — never catalog product search."""
+    if _message_looks_like_shopping_query(t):
+        return False
     if _user_asks_order_history_navigation_help(t):
         return False
     if message_is_bot_search_complaint(t) or message_is_bot_capability_question(t):
@@ -7199,7 +7580,7 @@ def _my_welfog_purchases_data_request_signals(text: str) -> bool:
 
     show_verbs = (
         "dikha", "dikhao", "dikha de", "dikha do", "data", "list", "bata", "batao",
-        "btao", "puchh", "puch", "dekh", "show", "dede", "de do", "bhejo",
+        "btao", "puchh", "puch", "dekh", "show", "dede", "de do", "bhejo", " de ",
     )
     bought_verbs = (
         "mangaya", "mangaye", "managaye", "mangwaya", "mangwaye", "mangaye h", "mangaya h",
@@ -7234,6 +7615,12 @@ def _my_welfog_purchases_data_request_signals(text: str) -> bool:
         if any(m in tl for m in ("mangaya", "mangaye", "mangwaya", "mene", "maine", "kiye", "kiya", "mang")):
             if not any(m in tl for m in ("milta", "milega", "milti", "sell", "available", "kharid")):
                 return True
+    if re.search(r"\bpurchased?\b", tl) and any(v in tl for v in show_verbs):
+        if any(x in tl for x in ("mere", "meri", "my", "mujhe", "mene", "maine", "items", "item")):
+            return True
+    if "items" in tl and any(p in tl for p in ("purchased", "purchase", "bought", "ordered")):
+        if any(v in tl for v in ("list", "dede", "de do", "bata", "btao", "dikha", "show", " de ")):
+            return True
     return False
 
 
@@ -8128,6 +8515,43 @@ def extract_product_search_query(
     Prefer a sensible model-provided search_query; otherwise strip Roman-Hindi filler
     and keep product nouns/brands (e.g. 'cover h ky' -> 'cover').
     """
+    ai_sq = (ai_search_query or "")
+    if isinstance(ai_sq, str):
+        ai_sq = ai_sq.strip()
+    else:
+        ai_sq = str(ai_sq or "").strip()
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if isinstance(ai_route, dict) and product_catalog_route_is_locked(ai_route):
+            route_sq = (ai_route.get("search_query") or "").strip()
+            if route_sq:
+                return route_sq
+            if ai_sq and len(ai_sq) >= 2:
+                return ai_sq
+    except ImportError:
+        pass
+    if _message_looks_like_shopping_query(f"{original_msg} {msg_en}".strip()):
+        try:
+            from services.product_query_understanding import extract_focused_product_query
+
+            focused = extract_focused_product_query(original_msg, msg_en)
+            if focused and len(focused.strip()) >= 2:
+                return focused.strip()
+        except ImportError:
+            pass
+        if ai_sq and len(ai_sq) >= 2:
+            return ai_sq
+        try:
+            from services.product_query_understanding import clean_product_part_label, polish_search_terms
+
+            quick = clean_product_part_label(
+                polish_search_terms(ai_sq or original_msg, original_msg), original_msg
+            )
+            if quick and len(quick) >= 2:
+                return quick
+        except ImportError:
+            pass
     try:
         from services.ai_route_semantics import ai_route_allows_catalog_search
         from services.semantic_intent import llm_semantic_route_available

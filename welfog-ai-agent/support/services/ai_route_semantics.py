@@ -130,6 +130,12 @@ def _normalize_llm_route(route: dict | None) -> dict:
     out["intent"] = coerce_route_str(out.get("intent"), "general")
     out["data_channel"] = coerce_route_str(out.get("data_channel"), "")
     out["search_query"] = coerce_route_str(out.get("search_query"), "")
+    out["category_browse"] = coerce_route_str(out.get("category_browse"), "")
+    out["category_id"] = coerce_route_str(out.get("category_id"), "")
+    if "category_only_browse" in out:
+        out["category_only_browse"] = coerce_route_bool(
+            out.get("category_only_browse"), False
+        )
     out["numeric_context"] = coerce_route_str(out.get("numeric_context"), "none")
     out["extracted_pincode"] = coerce_route_str(out.get("extracted_pincode"), "")
     out["reuse_user_value_from_chat"] = coerce_route_str(out.get("reuse_user_value_from_chat"), "")
@@ -139,13 +145,43 @@ def _normalize_llm_route(route: dict | None) -> dict:
     out["conversation_scope"] = coerce_route_str(out.get("conversation_scope"), "")
     out["account_list_kind"] = coerce_route_str(out.get("account_list_kind"), "none").lower()
     out["order_lookup_kind"] = coerce_route_str(out.get("order_lookup_kind"), "none").lower()
+    out["field_focus"] = coerce_route_str(out.get("field_focus"), "").lower()
     olk = (out.get("order_lookup_kind") or "none").strip().lower()
     if olk not in ("none", "track", "details", "invoice", "refund_status", ""):
         out["order_lookup_kind"] = "none"
     elif olk == "":
         out["order_lookup_kind"] = "none"
 
-    intent_raw = (out.get("intent") or "").strip().lower()
+    intent_raw = (out.get("intent") or "").strip().lower().replace("-", "_")
+    if intent_raw in (
+        "invoice",
+        "order_invoice",
+        "order_bill",
+        "order_bill_request",
+        "bill_request",
+        "bill",
+        "receipt",
+        "order_receipt",
+        "gst_invoice",
+    ):
+        out["intent"] = "order"
+        out["order_lookup_kind"] = "invoice"
+        out["data_channel"] = out.get("data_channel") or "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+    elif intent_raw in ("order_track", "order_tracking", "tracking_request"):
+        out["intent"] = "order"
+        out["order_lookup_kind"] = "track"
+        out["data_channel"] = out.get("data_channel") or "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+    elif intent_raw in ("order_details", "order_detail", "order_info"):
+        out["intent"] = "order"
+        out["order_lookup_kind"] = "details"
+        out["data_channel"] = out.get("data_channel") or "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
     if intent_raw == "refund_status":
         out["intent"] = "refund"
         out["order_lookup_kind"] = "refund_status"
@@ -171,6 +207,44 @@ def _normalize_llm_route(route: dict | None) -> dict:
     intent = (out.get("intent") or "").strip().lower()
     channel = (out.get("data_channel") or "").strip().lower()
     sq = (out.get("search_query") or "").strip()
+
+    alk_now = (out.get("account_list_kind") or "none").strip().lower()
+    if intent in (
+        "saved_items",
+        "saved_items_list",
+        "liked_items",
+        "saved_list",
+        "favorites",
+        "favourites",
+        "favorite",
+        "favourite",
+    ):
+        out["intent"] = "wishlist"
+        if alk_now in ("", "none"):
+            out["account_list_kind"] = "wishlist_in_chat"
+        out["data_channel"] = channel or "live_api"
+        out["run_catalog_search"] = False
+        out["search_query"] = ""
+        intent = "wishlist"
+        channel = (out.get("data_channel") or "").strip().lower()
+        sq = ""
+    elif intent in (
+        "purchases",
+        "purchase_list",
+        "orders_list",
+        "my_purchases",
+        "bought_items",
+        "past_purchases",
+    ):
+        out["intent"] = "order_history"
+        if alk_now in ("", "none"):
+            out["account_list_kind"] = "purchase_history_in_chat"
+        out["data_channel"] = channel or "live_api"
+        out["run_catalog_search"] = False
+        out["search_query"] = ""
+        intent = "order_history"
+        channel = (out.get("data_channel") or "").strip().lower()
+        sq = ""
 
     if "run_catalog_search" not in out:
         out["run_catalog_search"] = bool(
@@ -218,11 +292,37 @@ def _normalize_llm_route(route: dict | None) -> dict:
     if not (out.get("user_meaning") or "").strip():
         out["user_meaning"] = (out.get("reasoning") or "")[:280]
 
+    intent = (out.get("intent") or "").strip().lower()
+    channel = (out.get("data_channel") or "").strip().lower()
+    sq = (out.get("search_query") or "").strip()
+    if intent == "product" and sq and (out.get("meta_kind") or "none") == "none":
+        if not channel:
+            out["data_channel"] = "catalog"
+        if not out.get("run_catalog_search"):
+            out["run_catalog_search"] = True
+
+    intent_raw = (out.get("intent") or "").strip().lower().replace("-", "_")
+    if intent_raw in ("general_chitchat", "chitchat", "conversational"):
+        out["intent"] = "general"
+        out["conversation_scope"] = "general_chitchat"
+        out["data_channel"] = "none"
+        out["run_catalog_search"] = False
+        out["needs_order_id"] = False
+        if (out.get("meta_kind") or "none") == "none":
+            out["meta_kind"] = "conversational"
+
+    if (out.get("meta_kind") or "") in ("conversational", "assistant_intro"):
+        out["conversation_scope"] = "general_chitchat"
+        out["data_channel"] = "none"
+        out["run_catalog_search"] = False
+        out["needs_order_id"] = False
+
     cs = (out.get("conversation_scope") or "").strip().lower().replace("-", "_")
     if cs in ("welfog_support", "general_chitchat", "out_of_domain", "harm_sensitive"):
         out["conversation_scope"] = cs
     elif out.get("intent") == "out_of_domain" or out.get("is_welfog_related") is False:
         out["conversation_scope"] = "out_of_domain"
+        out["intent"] = "out_of_domain"
     else:
         out.setdefault("conversation_scope", "welfog_support")
 
@@ -231,6 +331,294 @@ def _normalize_llm_route(route: dict | None) -> dict:
         out["scope_reply"] = sr
 
     out = _promote_off_domain_from_llm_meaning(out)
+    out = finalize_order_lookup_from_brain_json(out)
+    out = apply_order_live_route_handler(out)
+    ent = _brain_product_entities_from_route(out)
+    if ent:
+        out["_product_entities"] = ent
+        pn = (ent.get("product_name") or "").strip()
+        if (
+            pn
+            and out.get("run_catalog_search")
+            and (out.get("meta_kind") or "none") == "none"
+        ):
+            out["search_query"] = pn
+    return out
+
+
+def repair_brain_json_quality(route: dict | None, user_msg: str = "") -> dict:
+    """
+    Normalize brain output so routing uses structured JSON only (any customer language).
+    Does not re-classify intent from customer text — only fixes invalid/missing enum fields.
+    """
+    out = dict(route or {})
+    um = (out.get("user_meaning") or "").strip()
+    raw = (user_msg or "").strip()
+    if um and raw and um.lower() == raw.lower():
+        log_reasoning(
+            "Brain user_meaning echoed customer text — backend will use "
+            "order_lookup_kind/route_handler/field_focus only."
+        )
+
+    nc = coerce_route_str(out.get("numeric_context"), "none")
+    if re.fullmatch(r"\d{4,20}", nc):
+        if len(nc) >= 7:
+            out["numeric_context"] = "order_id"
+            out["needs_order_id"] = True
+        elif (out.get("intent") or "").strip().lower() == "pincode_check":
+            out["numeric_context"] = "pincode"
+            out["needs_order_id"] = False
+
+    intent = (out.get("intent") or "").strip().lower()
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if intent in ("order", "refund", "payment") and olk in (
+        "track",
+        "details",
+        "invoice",
+        "refund_status",
+    ):
+        out["data_channel"] = out.get("data_channel") or "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+
+    if intent == "pincode_check":
+        out["needs_order_id"] = False
+        if (out.get("numeric_context") or "none").strip().lower() not in (
+            "pincode",
+            "order_id",
+        ):
+            out["numeric_context"] = "pincode"
+
+    ch = (out.get("data_channel") or "").strip().lower()
+    if ch in ("order", "order_details", "order_tracking", "tracking"):
+        out["data_channel"] = "live_api"
+
+    intent = (out.get("intent") or "").strip().lower()
+    if intent == "product" and (out.get("meta_kind") or "none") == "none":
+        out["data_channel"] = "catalog"
+        out["run_catalog_search"] = True
+        ent = _brain_product_entities_from_route(out, original_msg=user_msg)
+        if ent:
+            out["_product_entities"] = ent
+            pn = (ent.get("product_name") or "").strip()
+            if pn and pn.lower() not in ("products", "product"):
+                out["search_query"] = pn
+
+    return out
+
+
+# Brain sometimes misplaces sub-intent in conversation_scope — trust AI token, not customer text.
+_BRAIN_SCOPE_TO_ORDER_LOOKUP: dict[str, str] = {
+    "order_details": "details",
+    "order_detail": "details",
+    "order_info": "details",
+    "order_track": "track",
+    "order_tracking": "track",
+    "tracking": "track",
+    "order_invoice": "invoice",
+    "invoice": "invoice",
+    "refund_status": "refund_status",
+}
+
+
+def reconcile_order_sub_intent_from_brain_json(route: dict | None) -> dict:
+    """
+    Map AI routing JSON sub-intent tokens → order_lookup_kind + live_api.
+    Uses brain fields only (conversation_scope, scope_reply) — never customer message text.
+    """
+    out = dict(route or {})
+    intent = (out.get("intent") or "").strip().lower()
+    if intent not in ("order", "payment", "refund"):
+        return out
+
+    ch = (out.get("data_channel") or "").strip().lower()
+    if ch in ("order", "order_details", "order_tracking", "tracking"):
+        out["data_channel"] = "live_api"
+        out["run_catalog_search"] = False
+
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk not in ("none", ""):
+        return out
+
+    for field in ("conversation_scope", "scope_reply"):
+        token = (out.get(field) or "").strip().lower()
+        mapped = _BRAIN_SCOPE_TO_ORDER_LOOKUP.get(token)
+        if mapped:
+            out["order_lookup_kind"] = mapped
+            out["data_channel"] = "live_api"
+            out["needs_order_id"] = True
+            out["numeric_context"] = "order_id"
+            out["run_catalog_search"] = False
+            out["kb_keys"] = []
+            ff = (out.get("field_focus") or "").strip().lower()
+            if mapped == "track" and ff not in ("timeline",):
+                out["field_focus"] = "timeline"
+            elif mapped == "details" and ff not in (
+                "payment",
+                "product",
+                "delivery",
+                "summary",
+                "status",
+            ):
+                out["field_focus"] = "summary"
+            elif mapped == "invoice":
+                out["field_focus"] = "invoice"
+            if field == "conversation_scope":
+                out["conversation_scope"] = "welfog_support"
+            if field == "scope_reply":
+                out["scope_reply"] = ""
+            log_reasoning(
+                f"Brain JSON scope → order_lookup_kind={mapped} (not customer keywords)."
+            )
+            break
+
+    return out
+
+
+def infer_order_lookup_from_brain_english_fields(route: dict | None) -> dict:
+    """
+    When order_lookup_kind is still empty — read AI English user_meaning/reasoning only.
+    Never scans the customer's original message.
+    """
+    out = dict(route or {})
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk not in ("none", ""):
+        return out
+    intent = (out.get("intent") or "").strip().lower()
+    if intent not in ("order", "payment", "refund") or not out.get("needs_order_id"):
+        return out
+
+    if intent == "refund" and not ai_route_is_kb_read(out):
+        out["order_lookup_kind"] = "refund_status"
+        out["data_channel"] = "live_api"
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+        out["kb_keys"] = []
+        log_reasoning("Brain intent=refund live → order_lookup_kind=refund_status.")
+        return out
+
+    blob = _ai_meaning_blob(out).strip()
+    if not blob:
+        return out
+
+    def _score(markers: tuple[str, ...]) -> int:
+        return sum(1 for m in markers if m in blob)
+
+    inv_score = _score(
+        ("invoice", "bill", "receipt", "gst invoice", "tax invoice", "download invoice")
+    )
+    track_score = _score(
+        (
+            "track order",
+            "order tracking",
+            "track the order",
+            "track my order",
+            "track this order",
+            "shipment",
+            "courier",
+            "eta",
+            "when will",
+            "when it arrive",
+            "when will it arrive",
+            "delivery timeline",
+            "order timeline",
+            "live status",
+        )
+    )
+    if re.search(r"\btrack(?:ing)?\b", blob):
+        track_score += 3
+    if re.search(r"\bwhen\b.{0,24}\barriv", blob):
+        track_score += 2
+    detail_score = _score(
+        (
+            "order details",
+            "order detail",
+            "complete details",
+            "full details",
+            "details of",
+            "order info",
+            "order summary",
+            "shipping address",
+            "delivery address",
+            "payment",
+            "payment status",
+            "amount",
+            "price",
+            "how much",
+            "address",
+            "what did i order",
+        )
+    )
+    refund_score = _score(
+        (
+            "refund status",
+            "return status",
+            "refund record",
+            "return record",
+            "refund progress",
+            "money back",
+            "refund for order",
+            "when will refund",
+            "check refund",
+            "refund timeline",
+        )
+    )
+    if re.search(r"\brefund\b", blob):
+        refund_score += 3
+    if re.search(r"\breturn\b", blob) and "return policy" not in blob:
+        refund_score += 2
+
+    if refund_score >= max(inv_score, track_score, detail_score) and refund_score > 0:
+        out["order_lookup_kind"] = "refund_status"
+        out["intent"] = "refund"
+        out["data_channel"] = "live_api"
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+        out["kb_keys"] = []
+        log_reasoning(
+            f"Brain English fields → order_lookup_kind=refund_status "
+            f"(scores refund={refund_score})."
+        )
+        return out
+    if inv_score >= max(track_score, detail_score) and inv_score > 0:
+        out["order_lookup_kind"] = "invoice"
+        out["field_focus"] = "invoice"
+    elif track_score >= 3 or (track_score > 0 and track_score >= detail_score):
+        out["order_lookup_kind"] = "track"
+        out["field_focus"] = "timeline"
+    elif detail_score > 0:
+        out["order_lookup_kind"] = "details"
+        ff = (out.get("field_focus") or "").strip().lower()
+        if ff not in ("payment", "product", "delivery", "summary", "status"):
+            if "address" in blob:
+                out["field_focus"] = "delivery"
+            elif "payment" in blob or "amount" in blob or "price" in blob:
+                out["field_focus"] = "payment"
+            else:
+                out["field_focus"] = "summary"
+    else:
+        ff = (out.get("field_focus") or "").strip().lower()
+        if ff == "timeline":
+            out["order_lookup_kind"] = "track"
+            out["field_focus"] = "timeline"
+        elif ff == "invoice":
+            out["order_lookup_kind"] = "invoice"
+            out["field_focus"] = "invoice"
+        elif ff in ("payment", "product", "delivery", "summary", "status"):
+            out["order_lookup_kind"] = "details"
+        else:
+            out["order_lookup_kind"] = "details"
+            out["field_focus"] = ff or "summary"
+
+    out["data_channel"] = "live_api"
+    out["numeric_context"] = "order_id"
+    out["run_catalog_search"] = False
+    out["kb_keys"] = []
+    log_reasoning(
+        f"Brain English fields → order_lookup_kind={out.get('order_lookup_kind')} "
+        f"(scores detail={detail_score} track={track_score})."
+    )
     return out
 
 
@@ -251,6 +639,1209 @@ def _ai_meaning_denies_order_tracking(blob: str) -> bool:
         or "not order tracking" in blob
         or "not tracking" in blob
     )
+
+
+def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
+    """
+    Trust brain user_meaning when customer wants category/department products
+    but intent drifted to KB/chitchat/delivery — no customer-text keyword lists.
+    """
+    out = dict(route or {})
+    um = (out.get("user_meaning") or "").strip().lower()
+    if not um:
+        return out
+    browse_markers = (
+        "electronics",
+        "beauty",
+        "fashion",
+        "grocery",
+        "home kitchen",
+        "products in",
+        "products from",
+        "show products",
+        "see products",
+        "browse",
+        "department",
+        "category",
+    )
+    if not any(m in um for m in browse_markers):
+        return out
+    if (out.get("data_channel") or "").strip().lower() == "catalog" and (
+        out.get("category_browse") or out.get("category_only_browse")
+    ):
+        return out
+    import re
+
+    if re.search(
+        r"\b(track|tracking|refund|invoice|pincode|delivery service|deliver to)\b", um
+    ):
+        return out
+    out["intent"] = "product"
+    out["data_channel"] = "catalog"
+    out["run_catalog_search"] = True
+    out["category_only_browse"] = True
+    out["needs_order_id"] = False
+    out["order_lookup_kind"] = "none"
+    out["conversation_scope"] = "welfog_support"
+    out["scope_reply"] = ""
+    if not (out.get("category_browse") or "").strip():
+        for name in (
+            "electronics",
+            "beauty",
+            "men fashion",
+            "women fashion",
+            "home kitchen",
+            "grocery",
+        ):
+            if name in um:
+                out["category_browse"] = name
+                break
+    if not (out.get("search_query") or "").strip():
+        out["search_query"] = ""
+    log_reasoning(
+        "Brain user_meaning category browse — lock catalog (fix KB/delivery drift)."
+    )
+    return out
+
+
+_CATALOG_INTENT_IN_BRAIN_BLOB = (
+    "product search",
+    "catalog search",
+    "browse catalog",
+    "browse products",
+    "browse product",
+    "shop for",
+    "looking for",
+    "wants to buy",
+    "wants to find",
+    "wants to see",
+    "show products",
+    "find products",
+    "search for",
+    "customer wants",
+    "user wants",
+    "wants a",
+    "needs a",
+    "filter by",
+    "run_catalog_search",
+)
+
+_CATALOG_BLOCK_IN_BRAIN_BLOB = (
+    "order id",
+    "track order",
+    "tracking order",
+    "refund",
+    "invoice",
+    "wishlist",
+    "order history",
+    "pincode",
+    "delivery status",
+    "not related to welfog",
+    "out of domain",
+    "off-topic",
+    "off topic",
+)
+
+
+def _brain_meaning_blob(route: dict | None) -> str:
+    r = route or {}
+    return f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip().lower()
+
+
+def _brain_product_name_is_noisy(name: str) -> bool:
+    pn = (name or "").strip()
+    if not pn:
+        return True
+    low = pn.lower()
+    if len(pn.split()) > 5:
+        return True
+    noisy = (
+        "want ",
+        "chahiye",
+        "dikhao",
+        "dikha",
+        "lena",
+        "leni",
+        "customer ",
+        "user ",
+        "for my ",
+        "for your ",
+        "i need",
+        "show me",
+        "milega",
+        "bata de",
+    )
+    return any(n in low for n in noisy)
+
+
+def _clean_brain_product_name(name: str) -> str:
+    s = (name or "").strip()
+    low = s.lower()
+    for prefix in (
+        "i want a ",
+        "i want ",
+        "i need a ",
+        "i need ",
+        "show me ",
+        "find ",
+        "search for ",
+        "search ",
+        "customer wants ",
+        "user wants ",
+    ):
+        if low.startswith(prefix):
+            s = s[len(prefix) :].strip()
+            low = s.lower()
+    s = re.sub(r"\s+for\s+my\s+.+$", "", s, flags=re.I).strip()
+    s = re.sub(r"\s+ke\s+liye\s*$", "", s, flags=re.I).strip()
+    return s
+
+
+def _product_noun_from_brain_english(blob: str) -> str:
+    """Extract product type from brain English fields only (not customer Hinglish)."""
+    low = (blob or "").lower()
+    patterns: tuple[tuple[re.Pattern[str], str], ...] = (
+        (re.compile(r"mobile\s+cover|phone\s+cover|back\s+cover", re.I), "mobile cover"),
+        (re.compile(r"\bcovers?\b", re.I), "mobile cover"),
+        (re.compile(r"\bjeans?\b", re.I), "jeans"),
+        (re.compile(r"\b(pajama|pajami|nightwear|night\s*wear)\b", re.I), "pajama"),
+        (re.compile(r"water\s+bottle", re.I), "water bottle"),
+        (re.compile(r"track\s+pants?|\blower\b", re.I), "track pants"),
+        (re.compile(r"\biphones?\b", re.I), "iphone"),
+    )
+    for pattern, canonical in patterns:
+        if pattern.search(low):
+            return canonical
+    return ""
+
+
+def _infer_brand_from_brain_english(
+    user_meaning: str,
+    reasoning: str = "",
+    product_entities: dict | None = None,
+) -> str:
+    """
+    Brand from brain JSON English only — any capitalized name the LLM wrote.
+    No fixed brand keyword list; never scans customer Hinglish text.
+    """
+    pe = product_entities or {}
+    if (pe.get("brand") or "").strip():
+        return str(pe["brand"]).strip()
+    blob = f"{user_meaning or ''} {reasoning or ''}".strip()
+    if not blob:
+        return ""
+    for pattern in (
+        r"\b(?:for|wants?|needs?|buy|show|find|see)\s+(?:an?\s+)?([A-Z][A-Za-z0-9]+(?:\s+[A-Z][A-Za-z0-9]+)?)\s+(?:mobile|phone)?\s*covers?\b",
+        r"\b([A-Z][A-Za-z0-9]+)\s+(?:mobile|phone)\s+cover",
+        r"\b([A-Z][A-Za-z0-9]+)\s+covers?\b",
+        r"\b(?:brand|from)\s+([A-Z][A-Za-z0-9]+)\b",
+    ):
+        m = re.search(pattern, blob)
+        if m:
+            brand = m.group(1).strip()
+            if brand.lower() not in (
+                "user",
+                "customer",
+                "friend",
+                "sister",
+                "brother",
+                "son",
+                "daughter",
+                "mobile",
+                "phone",
+                "cover",
+                "covers",
+                "product",
+                "products",
+                "wants",
+                "show",
+                "best",
+            ):
+                try:
+                    from services.product_catalog_resolver import sanitize_catalog_brand
+
+                    return sanitize_catalog_brand(
+                        brand,
+                        product_name="",
+                        explicit_from_brain=False,
+                    ) or ""
+                except ImportError:
+                    return brand
+    return ""
+
+
+    return ""
+
+
+def _repair_brain_product_entities(
+    ent: dict,
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """Normalize brain product_entities — trust LLM JSON; no customer-text brand lists."""
+    out = dict(ent or {})
+    r = route or {}
+    pn = (out.get("product_name") or "").strip()
+    sq = (r.get("search_query") or "").strip()
+    um = (r.get("user_meaning") or "").strip()
+    reasoning = (r.get("reasoning") or "").strip()
+    raw_pe = r.get("product_entities") if isinstance(r.get("product_entities"), dict) else {}
+    brain_blob = f"{um} {reasoning} {sq} {pn}".strip()
+
+    for k in (
+        "brand",
+        "color",
+        "size",
+        "sku",
+        "product_id",
+        "price_min",
+        "price_max",
+        "rating_min",
+        "product_intent",
+        "related_search_terms",
+        "allow_related_fallback",
+        "exclude_title_tokens",
+        "mandatory_match_tokens",
+    ):
+        if not out.get(k) and isinstance(raw_pe, dict) and raw_pe.get(k) not in (None, "", "null", []):
+            out[k] = raw_pe[k]
+
+    if pn and _brain_product_name_is_noisy(pn):
+        cleaned = _clean_brain_product_name(pn)
+        if cleaned and not _brain_product_name_is_noisy(cleaned):
+            pn = cleaned
+        elif sq and not _brain_product_name_is_noisy(sq):
+            pn = sq
+        elif um:
+            pn_um = _clean_brain_product_name(um)
+            if pn_um and not _brain_product_name_is_noisy(pn_um):
+                pn = pn_um
+
+    color_words = (
+        "black", "white", "red", "blue", "green", "yellow", "pink", "purple",
+        "grey", "gray", "orange", "brown", "silver", "gold", "navy", "maroon", "beige",
+    )
+    words = pn.split()
+    if len(words) >= 2 and words[0].lower() in color_words and not out.get("color"):
+        out["color"] = words[0].title()
+        pn = " ".join(words[1:]).strip()
+
+    if not pn or pn.lower() in ("products", "product") or _brain_product_name_is_noisy(pn):
+        inferred = _product_noun_from_brain_english(brain_blob)
+        if inferred:
+            pn = inferred
+
+    if pn.lower() in ("iphones", "iphone phones"):
+        pn = "iphone"
+
+    if not out.get("brand"):
+        brand = _infer_brand_from_brain_english(um, reasoning, raw_pe)
+        if brand:
+            out["brand"] = brand
+
+    try:
+        from services.product_catalog_resolver import sanitize_catalog_brand
+
+        clean = sanitize_catalog_brand(
+            out.get("brand"),
+            product_name=pn or out.get("product_name") or "",
+            explicit_from_brain=bool(
+                isinstance(raw_pe, dict) and (raw_pe.get("brand") or "").strip()
+            ),
+            user_meaning=um,
+        )
+        if clean:
+            out["brand"] = clean
+        else:
+            out.pop("brand", None)
+    except ImportError:
+        pass
+
+    if out.get("color"):
+        pn = re.sub(r"\bcolor\b", "", pn, flags=re.I).strip()
+        pn = " ".join(
+            w for w in pn.split() if w.lower() != str(out["color"]).lower()
+        ).strip()
+
+    if out.get("price_max") is not None or out.get("price_min") is not None:
+        pn = re.sub(r"\b(?:under|below|upto|above|over)\s*\d+.*$", "", pn, flags=re.I).strip()
+        pn = re.sub(r"\b\d+\s*(?:rs|rupees?|inr)\b", "", pn, flags=re.I).strip()
+        pn = re.sub(r"\s+", " ", pn).strip()
+
+    if out.get("price_max") is None and out.get("price_min") is None and original_msg:
+        try:
+            from services.opensearch_products import _extract_price_bounds
+
+            pmax, pmin = _extract_price_bounds(original_msg, original_msg.lower())
+            if pmax is not None:
+                out["price_max"] = pmax
+            if pmin is not None:
+                out["price_min"] = pmin
+        except ImportError:
+            pass
+
+    if not out.get("size") and re.search(
+        r"\b(kids?|children|son|daughter|little)\b", brain_blob, re.I
+    ):
+        out["size"] = "kids"
+
+    if pn:
+        out["product_name"] = pn
+    return out
+
+
+def _sanitize_brand_in_entities(ent: dict) -> dict:
+    try:
+        from services.product_catalog_resolver import sanitize_catalog_brand
+
+        out = dict(ent or {})
+        pn = (out.get("product_name") or "").strip()
+        raw_brand = (out.get("brand") or "").strip()
+        clean = sanitize_catalog_brand(
+            raw_brand,
+            product_name=pn,
+            explicit_from_brain=bool(raw_brand),
+        )
+        if clean:
+            out["brand"] = clean
+        else:
+            out.pop("brand", None)
+        return out
+    except ImportError:
+        return dict(ent or {})
+
+
+def _brain_product_entities_from_route(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """Normalize ai_brain_route product_entities → catalog filter dict."""
+    r = route or {}
+    raw = r.get("product_entities")
+    if not isinstance(raw, dict):
+        raw = {}
+    ent: dict = {}
+    for k in (
+        "product_name",
+        "brand",
+        "color",
+        "size",
+        "sku",
+        "product_id",
+        "pro_id",
+        "price_min",
+        "price_max",
+        "rating_min",
+        "rating_max",
+        "category",
+        "model",
+        "product_intent",
+        "related_search_terms",
+    ):
+        v = raw.get(k)
+        if v is None:
+            continue
+        s = str(v).strip()
+        if not s or s.lower() in ("null", "none", "n/a"):
+            continue
+        ent[k] = v
+
+    sq = (r.get("search_query") or "").strip()
+    if not ent.get("product_name") and sq:
+        ent["product_name"] = sq
+
+    pid = ent.get("product_id") or ent.get("pro_id")
+    if pid is not None:
+        ps = str(pid).strip()
+        if ps.isdigit():
+            ent["product_id"] = int(ps)
+        else:
+            ent.pop("product_id", None)
+            ent.pop("pro_id", None)
+
+    for pk in ("price_min", "price_max", "rating_min", "rating_max"):
+        if ent.get(pk) is not None:
+            try:
+                ent[pk] = float(ent[pk])
+            except (TypeError, ValueError):
+                ent.pop(pk, None)
+
+    sku = ent.get("sku")
+    if sku is not None:
+        ent["sku"] = str(sku).strip()
+
+    if "allow_related_fallback" in raw:
+        ent["allow_related_fallback"] = coerce_route_bool(
+            raw.get("allow_related_fallback"), True
+        )
+    for list_key in ("exclude_title_tokens", "mandatory_match_tokens"):
+        if list_key in raw and raw.get(list_key) not in (None, "", []):
+            try:
+                from services.product_catalog_resolver import _ai_entity_token_list
+
+                toks = _ai_entity_token_list(raw.get(list_key))
+                if toks:
+                    ent[list_key] = toks
+            except ImportError:
+                vals = raw.get(list_key)
+                if isinstance(vals, list):
+                    ent[list_key] = [str(x).strip() for x in vals if str(x).strip()]
+
+    if r.get("numeric_context") == "product_id" and not ent.get("product_id"):
+        pass
+
+    ent = _repair_brain_product_entities(
+        ent, r, original_msg=original_msg, msg_en=msg_en
+    )
+    ent = _sanitize_brand_in_entities(ent)
+    return ent
+
+
+def _catalog_search_query_from_brain_route(route: dict | None) -> str:
+    """English product-type search terms from ai_brain_route JSON only."""
+    r = route or {}
+    stored = r.get("_product_entities")
+    if isinstance(stored, dict):
+        pn = (stored.get("product_name") or "").strip()
+        if pn and pn.lower() not in ("products", "product"):
+            return pn
+    ent = _brain_product_entities_from_route(r)
+    pn = (ent.get("product_name") or "").strip()
+    if pn:
+        return pn
+    sq = (r.get("search_query") or "").strip()
+    if sq:
+        return sq
+    um = (r.get("user_meaning") or "").strip()
+    if not um:
+        return ""
+    low = um.lower()
+    for prefix in (
+        "show me ",
+        "show ",
+        "find ",
+        "search for ",
+        "search ",
+        "looking for ",
+        "need a ",
+        "need ",
+        "customer wants ",
+        "user wants ",
+        "wants ",
+    ):
+        if low.startswith(prefix):
+            return um[len(prefix) :].strip()[:120]
+    return um[:120].strip()
+
+
+def brain_route_indicates_product_catalog(route: dict | None) -> bool:
+    """
+    True when universal brain JSON already understood a catalog turn (any language in → English out).
+    Uses intent/channel/search_query/_product_entities/user_meaning — never customer keyword lists.
+    """
+    if not isinstance(route, dict):
+        return False
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(route):
+            return True
+    except ImportError:
+        pass
+    intent = (route.get("intent") or "").strip().lower()
+    channel = (route.get("data_channel") or "").strip().lower()
+    if intent in ("order", "refund", "order_history", "wishlist", "pincode_check", "delivery"):
+        return False
+    if channel == "live_api" or route.get("needs_order_id"):
+        return False
+    if intent == "product" and channel in ("catalog", ""):
+        return True
+    if route.get("run_catalog_search"):
+        return True
+    if route.get("category_only_browse") or (route.get("category_browse") or "").strip():
+        return True
+    entities = route.get("_product_entities") or {}
+    if isinstance(entities, dict) and any(v not in (None, "", [], {}) for v in entities.values()):
+        return True
+    blob = _brain_meaning_blob(route)
+    if any(b in blob for b in _CATALOG_BLOCK_IN_BRAIN_BLOB):
+        return False
+    sq = (route.get("search_query") or "").strip()
+    if sq and intent not in ("order", "refund", "wishlist", "order_history", "pincode_check"):
+        return True
+    if any(p in blob for p in _CATALOG_INTENT_IN_BRAIN_BLOB):
+        return True
+    if "product" in blob and any(
+        x in blob for x in ("want", "buy", "browse", "shop", "find", "show", "search", "looking")
+    ):
+        return True
+    return False
+
+
+def reconcile_product_catalog_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """
+    Brain sometimes labels shopping as out_of_domain / sets meta_kind that blocks catalog.
+    Trust ai_brain_route JSON (user_meaning, search_query, entities) — not customer keywords.
+    """
+    out = dict(route or {})
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(out):
+            out["_product_catalog_locked"] = True
+            return out
+    except ImportError:
+        pass
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+
+        if account_list_route_is_locked(out):
+            return out
+    except ImportError:
+        pass
+    if not brain_route_indicates_product_catalog(out):
+        return out
+    ent = _brain_product_entities_from_route(out, original_msg=original_msg, msg_en=msg_en)
+    if ent:
+        out["_product_entities"] = ent
+    sq = _catalog_search_query_from_brain_route(out)
+    out["intent"] = "product"
+    out["data_channel"] = "catalog"
+    out["run_catalog_search"] = True
+    out["_product_catalog_locked"] = True
+    out["meta_kind"] = "none"
+    out["conversation_scope"] = "welfog_support"
+    out["needs_order_id"] = False
+    out["numeric_context"] = "none"
+    out["order_lookup_kind"] = "none"
+    out["scope_reply"] = ""
+    out["is_welfog_related"] = True
+    if sq:
+        out["search_query"] = sq
+    log_reasoning(
+        f"Brain shopping reconcile — lock product catalog sq={sq!r} (AI JSON, no keyword gate)."
+    )
+    return out
+
+
+def reconcile_invoice_from_brain_meaning(route: dict | None) -> dict:
+    """
+    When ai_brain_route user_meaning (English) says invoice/bill/receipt/challan but
+    intent/channel drifted to KB/chitchat — trust user_meaning, not customer keywords.
+    """
+    out = dict(route or {})
+    olk = (out.get("order_lookup_kind") or "").strip().lower()
+    focus = (out.get("field_focus") or "").strip().lower()
+    intent = (out.get("intent") or "").strip().lower()
+    if olk == "invoice" and (out.get("data_channel") or "").strip().lower() == "live_api":
+        return out
+    if focus == "invoice" or intent in (
+        "invoice",
+        "order_invoice",
+        "order_bill",
+        "bill",
+        "receipt",
+        "gst_invoice",
+    ):
+        out["intent"] = "order"
+        out["data_channel"] = "live_api"
+        out["order_lookup_kind"] = "invoice"
+        out["route_handler"] = "order_details_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+        out["kb_keys"] = []
+        out["field_focus"] = "invoice"
+        out["conversation_scope"] = "welfog_support"
+        out["scope_reply"] = ""
+        out["meta_kind"] = "none"
+        log_reasoning(
+            "Brain JSON field_focus/intent invoice — lock live invoice API."
+        )
+        return out
+    um = (out.get("user_meaning") or "").strip().lower()
+    if not um:
+        return out
+    markers = (
+        "invoice",
+        "bill",
+        "receipt",
+        "gst",
+        "chalan",
+        "challan",
+        "tax invoice",
+        "download invoice",
+        "involve",
+        "invoic",
+    )
+    if not any(m in um for m in markers):
+        return out
+    import re
+
+    if not re.search(r"\b\d{4,20}\b", um) and not re.search(
+        r"\b\d{4,20}\b", (out.get("reasoning") or "")
+    ):
+        if "challan" not in um and "chalan" not in um:
+            return out
+    out["intent"] = "order"
+    out["data_channel"] = "live_api"
+    out["order_lookup_kind"] = "invoice"
+    out["route_handler"] = "order_details_api"
+    out["needs_order_id"] = True
+    out["numeric_context"] = "order_id"
+    out["run_catalog_search"] = False
+    out["kb_keys"] = []
+    out["conversation_scope"] = "welfog_support"
+    out["scope_reply"] = ""
+    out["meta_kind"] = "none"
+    log_reasoning(
+        "Brain user_meaning invoice/challan — lock live invoice API (fix KB/chitchat drift)."
+    )
+    return out
+
+
+def finalize_order_lookup_from_brain_json(route: dict | None) -> dict:
+    """
+    Trust ai_brain_route JSON only — sync structured fields, zero keyword re-classification.
+    The routing LLM must set order_lookup_kind / route_handler from customer meaning (any language).
+    """
+    out = dict(route or {})
+    if not llm_semantic_route_available(out):
+        return out
+    if (out.get("meta_kind") or "none").strip().lower() != "none":
+        return out
+    if ai_route_is_kb_read(out):
+        return out
+
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    rh = (out.get("route_handler") or "").strip().lower()
+    intent = (out.get("intent") or "").strip().lower()
+
+    handler_to_olk = {
+        "order_tracking_api": "track",
+        "order_details_api": "details",
+        "refund_status_api": "refund_status",
+    }
+    olk_to_handler = {
+        "track": "order_tracking_api",
+        "tracking": "order_tracking_api",
+        "details": "order_details_api",
+        "invoice": "order_details_api",
+        "refund_status": "refund_status_api",
+    }
+
+    if olk in ("none", "") and rh in handler_to_olk:
+        out["order_lookup_kind"] = handler_to_olk[rh]
+        olk = out["order_lookup_kind"]
+    elif olk in olk_to_handler and rh not in olk_to_handler.values():
+        out["route_handler"] = olk_to_handler[olk]
+    elif olk in olk_to_handler and rh in olk_to_handler.values():
+        expected = olk_to_handler[olk]
+        if rh != expected:
+            out["route_handler"] = expected
+
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk in olk_to_handler and intent in ("order", "refund", "payment"):
+        out["data_channel"] = "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+    return out
+
+
+def apply_order_live_route_handler(route: dict | None) -> dict:
+    """Map order_lookup_kind → existing live API handler (no extra LLM)."""
+    out = dict(route or {})
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    handlers = {
+        "track": "order_tracking_api",
+        "tracking": "order_tracking_api",
+        "details": "order_details_api",
+        "invoice": "order_details_api",
+        "refund_status": "refund_status_api",
+    }
+    if olk not in handlers:
+        return out
+    out["route_handler"] = handlers[olk]
+    out["data_channel"] = "live_api"
+    out["answer_strategy"] = "live_api_only"
+    out["run_catalog_search"] = False
+    out["search_query"] = ""
+    if olk == "refund_status":
+        out["intent"] = "refund"
+    elif olk in ("track", "tracking", "details", "invoice"):
+        if (out.get("intent") or "").strip().lower() not in ("refund", "payment"):
+            out["intent"] = "order"
+    out["needs_order_id"] = True
+    out["numeric_context"] = "order_id"
+    return out
+
+
+def lock_order_live_api_from_brain(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    """After brain + meaning alignment: lock live API fields — no customer-text promotions."""
+    out = dict(route or {})
+    out = correct_pincode_vs_order_id_numeric_context(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    out = correct_order_details_vs_tracking_from_ai_meaning(out)
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk in ("none", ""):
+        return out
+    return apply_order_live_route_handler(out)
+
+
+_LIVE_GOAL_FROM_SEMANTIC = {
+    "order_invoice": "order_invoice",
+    "order_details": "order_details",
+    "track_single_order": "track",
+    "refund_status": "refund_status",
+}
+
+LIVE_API_FROM_GOAL = {
+    "order_invoice": "order_details_api",
+    "order_details": "order_details_api",
+    "track": "order_tracking_api",
+    "payment": "order_details_api",
+    "refund_status": "refund_status_api",
+}
+
+
+def ensure_brain_order_route_locked(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    """Idempotent order sub-intent enrichment before goal/tool mapping."""
+    out = dict(route or {})
+    if out.get("_order_live_route_locked"):
+        return out
+    if not llm_semantic_route_available(out):
+        return out
+    out = repair_brain_json_quality(out, original_msg)
+    out = infer_order_lookup_from_brain_english_fields(out)
+    out = reconcile_order_sub_intent_from_brain_json(out)
+    out = reconcile_invoice_from_brain_meaning(out)
+    out = finalize_order_lookup_from_brain_json(out)
+    out = lock_order_live_api_from_brain(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    out = reconcile_structural_order_sub_intent_from_message(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    out = reconcile_structural_order_sub_intent_from_tracking_message(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    out = lock_order_live_api_from_brain(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    out["_order_live_route_locked"] = True
+    return out
+
+
+def brain_route_to_live_goal(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> str:
+    """Single source: enriched brain JSON → live dispatch goal string."""
+    locked = ensure_brain_order_route_locked(
+        route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    semantic = infer_semantic_goal_from_ai_route(locked)
+    if semantic in _LIVE_GOAL_FROM_SEMANTIC:
+        return _LIVE_GOAL_FROM_SEMANTIC[semantic]
+    olk = (locked.get("order_lookup_kind") or "").strip().lower()
+    rh = (locked.get("route_handler") or "").strip().lower()
+    focus = (locked.get("field_focus") or "").strip().lower()
+    intent = (locked.get("intent") or "").strip().lower()
+    if focus == "invoice" or olk == "invoice":
+        return "order_invoice"
+    if olk in ("details", "order_details") or rh == "order_details_api":
+        return "order_details"
+    if olk in ("track", "tracking") or rh == "order_tracking_api":
+        return "track"
+    if olk == "refund_status" or rh == "refund_status_api":
+        return "refund_status"
+    if intent == "refund" and (locked.get("data_channel") or "").strip().lower() == "live_api":
+        return "refund_status"
+    if intent in ("invoice", "order_invoice", "order_bill", "bill", "receipt"):
+        return "order_invoice"
+    if focus in ("payment", "product", "delivery", "summary", "status"):
+        return "order_details"
+    if focus == "timeline":
+        return "track"
+    return ""
+
+
+def brain_route_to_api_tool(
+    route: dict | None,
+    *,
+    live_goal: str = "",
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> str:
+    goal = (live_goal or "").strip().lower()
+    if not goal:
+        goal = brain_route_to_live_goal(
+            route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conversation_context,
+        )
+    return LIVE_API_FROM_GOAL.get(goal, "")
+
+
+def _structural_refund_goal_from_message(
+    original_msg: str = "",
+    msg_en: str = "",
+) -> str:
+    """Guardrail — order id + personal refund/return status (not policy KB)."""
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb or not re.search(r"\b\d{4,20}\b", comb):
+        return ""
+    try:
+        from services.refund_status_semantics import _message_has_refund_topic
+        from utils.helpers import _text_is_refund_return_status_lookup
+
+        if _message_has_refund_topic(comb) or _text_is_refund_return_status_lookup(
+            comb, ""
+        ):
+            return "refund_status"
+    except ImportError:
+        pass
+    return ""
+
+
+def _structural_details_or_invoice_goal_from_message(
+    original_msg: str = "",
+    msg_en: str = "",
+) -> str:
+    """
+    Guardrail only — order id + non-tracking markers (invoice/address/price/details).
+    Overrides brain track misroutes; not the primary router when brain is clear.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb or not re.search(r"\b\d{4,20}\b", comb):
+        return ""
+    if _structural_refund_goal_from_message(original_msg, msg_en):
+        return ""
+    try:
+        from utils.helpers import _leaf_non_tracking_order_id_intent
+
+        if not _leaf_non_tracking_order_id_intent(comb):
+            return ""
+    except ImportError:
+        pass
+    try:
+        from services.order_details_flow import _lightweight_details_or_invoice_signal
+
+        light = (_lightweight_details_or_invoice_signal(comb) or "").strip()
+        if light in ("order_invoice", "order_details"):
+            return light
+    except ImportError:
+        pass
+    return ""
+
+
+def _structural_track_goal_from_message(
+    original_msg: str = "",
+    msg_en: str = "",
+) -> str:
+    """
+    Guardrail: personal order tracking (ETA/status/not received) with order id in message.
+    Does not fire for general delivery-policy KB questions.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+    try:
+        from utils.helpers import (
+            message_is_general_delivery_policy_question,
+            _text_is_order_tracking_intent_leaf,
+            _text_is_undelivered_order_complaint,
+        )
+
+        if message_is_general_delivery_policy_question(comb):
+            return ""
+        if _structural_details_or_invoice_goal_from_message(original_msg, msg_en):
+            return ""
+        if not re.search(r"\b\d{4,20}\b", comb):
+            return ""
+        if _text_is_order_tracking_intent_leaf(comb) or _text_is_undelivered_order_complaint(
+            comb
+        ):
+            return "track"
+    except ImportError:
+        pass
+    return ""
+
+
+def reconcile_structural_order_sub_intent_from_tracking_message(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """When brain locked details but message+order_id clearly wants tracking — fix JSON."""
+    out = dict(route or {})
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    rh = (out.get("route_handler") or "").strip().lower()
+    if olk in ("invoice", "refund_status") or rh in (
+        "order_details_api",
+        "refund_status_api",
+    ):
+        if olk in ("invoice", "refund_status", "details", "order_details"):
+            return out
+    structural = _structural_track_goal_from_message(original_msg, msg_en)
+    if structural != "track":
+        return out
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    rh = (out.get("route_handler") or "").strip().lower()
+    if olk in ("track", "tracking") and rh == "order_tracking_api":
+        return out
+    out["intent"] = "order"
+    out["data_channel"] = "live_api"
+    out["needs_order_id"] = True
+    out["numeric_context"] = "order_id"
+    out["run_catalog_search"] = False
+    out["kb_keys"] = []
+    out["order_lookup_kind"] = "track"
+    out["field_focus"] = "timeline"
+    out["route_handler"] = "order_tracking_api"
+    out.pop("_order_tracking_locked", None)
+    log_reasoning(
+        "Structural guard: message+order_id → track (fix brain details drift)."
+    )
+    return out
+
+
+def reconcile_general_delivery_policy_from_message(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """General delivery timeline question — KB only, not live order API."""
+    out = dict(route or {})
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    try:
+        from utils.helpers import message_is_general_delivery_policy_question
+
+        if not message_is_general_delivery_policy_question(comb):
+            return out
+    except ImportError:
+        return out
+    out["intent"] = "general"
+    out["data_channel"] = "kb"
+    out["kb_keys"] = ["shipping", "faqs"]
+    out["needs_order_id"] = False
+    out["numeric_context"] = "none"
+    out["order_lookup_kind"] = "none"
+    out["route_handler"] = ""
+    out["run_catalog_search"] = False
+    out["conversation_scope"] = "welfog_support"
+    log_reasoning(
+        "General delivery policy question — KB shipping/faqs (not live track API)."
+    )
+    return out
+
+
+def reconcile_structural_order_sub_intent_from_message(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict:
+    """When brain locked track but message+order_id clearly wants details/invoice — fix JSON."""
+    out = dict(route or {})
+    refund_struct = _structural_refund_goal_from_message(original_msg, msg_en)
+    if refund_struct == "refund_status":
+        olk_rf = (out.get("order_lookup_kind") or "none").strip().lower()
+        rh_rf = (out.get("route_handler") or "").strip().lower()
+        if olk_rf == "refund_status" and rh_rf == "refund_status_api":
+            return out
+        out["intent"] = "refund"
+        out["data_channel"] = "live_api"
+        out["needs_order_id"] = True
+        out["numeric_context"] = "order_id"
+        out["run_catalog_search"] = False
+        out["kb_keys"] = []
+        out["order_lookup_kind"] = "refund_status"
+        out["field_focus"] = "status"
+        out.pop("_order_tracking_locked", None)
+        log_reasoning(
+            "Structural guard: message+order_id → refund_status (fix brain details drift)."
+        )
+        return apply_order_live_route_handler(out)
+    structural = _structural_details_or_invoice_goal_from_message(original_msg, msg_en)
+    if not structural:
+        return out
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    rh = (out.get("route_handler") or "").strip().lower()
+    if structural == "order_invoice":
+        if olk == "invoice" and rh == "order_details_api":
+            return out
+    elif structural == "order_details":
+        if olk in ("details", "invoice") and rh == "order_details_api":
+            return out
+    if olk not in ("none", "", "track", "tracking") and rh not in (
+        "",
+        "order_tracking_api",
+    ):
+        if structural != "order_invoice" or olk == "invoice":
+            return out
+    out["intent"] = "order"
+    out["data_channel"] = "live_api"
+    out["needs_order_id"] = True
+    out["numeric_context"] = "order_id"
+    out["run_catalog_search"] = False
+    out["kb_keys"] = []
+    if structural == "order_invoice":
+        out["order_lookup_kind"] = "invoice"
+        out["field_focus"] = "invoice"
+    else:
+        out["order_lookup_kind"] = "details"
+        focus = (out.get("field_focus") or "").strip().lower()
+        if focus not in ("payment", "product", "delivery", "summary", "status"):
+            out["field_focus"] = "summary"
+    out.pop("_order_tracking_locked", None)
+    log_reasoning(
+        f"Structural guard: message+order_id → {structural} (fix brain track drift)."
+    )
+    return apply_order_live_route_handler(out)
+
+
+def resolve_order_live_goal_for_turn(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> str:
+    """Brain enrich + structural guard — single live goal for dispatch."""
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    try:
+        from utils.helpers import message_is_general_delivery_policy_question
+
+        if message_is_general_delivery_policy_question(comb):
+            return ""
+    except ImportError:
+        pass
+
+    refund_struct = _structural_refund_goal_from_message(original_msg, msg_en)
+    if refund_struct == "refund_status":
+        return "refund_status"
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if comb and not re.search(r"\b\d{4,20}\b", comb):
+        try:
+            from services.order_details_flow import _lightweight_details_or_invoice_signal
+
+            light = (_lightweight_details_or_invoice_signal(comb) or "").strip()
+            if light == "order_invoice":
+                return "order_invoice"
+        except ImportError:
+            pass
+        try:
+            from utils.helpers import (
+                _text_is_order_tracking_intent_leaf,
+                _text_is_undelivered_order_complaint,
+            )
+
+            if _text_is_order_tracking_intent_leaf(
+                comb
+            ) or _text_is_undelivered_order_complaint(comb):
+                return "track"
+        except ImportError:
+            pass
+
+    details_struct = _structural_details_or_invoice_goal_from_message(
+        original_msg, msg_en
+    )
+    track_struct = _structural_track_goal_from_message(original_msg, msg_en)
+
+    if details_struct == "order_invoice":
+        return "order_invoice"
+    if details_struct == "order_details" and track_struct != "track":
+        return "order_details"
+    if track_struct == "track":
+        return "track"
+
+    locked = ensure_brain_order_route_locked(
+        route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    locked = reconcile_structural_order_sub_intent_from_message(
+        locked,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    locked = reconcile_structural_order_sub_intent_from_tracking_message(
+        locked,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    goal = brain_route_to_live_goal(
+        locked,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    if goal in ("order_details", "payment") and track_struct == "track":
+        if details_struct in ("order_invoice", "order_details"):
+            return details_struct if details_struct == "order_invoice" else "order_details"
+        return "track"
+    try:
+        from utils.helpers import _text_is_order_tracking_intent_leaf
+
+        if (
+            goal in ("order_details", "payment", "")
+            and re.search(r"\b\d{4,20}\b", comb)
+            and _text_is_order_tracking_intent_leaf(comb)
+            and not details_struct
+        ):
+            return "track"
+    except ImportError:
+        pass
+    return goal
 
 
 def ai_route_is_kb_read(route: dict | None) -> bool:
@@ -286,7 +1877,7 @@ def ai_route_is_kb_read(route: dict | None) -> bool:
 
 
 def ai_meaning_describes_delivery_serviceability(route: dict | None) -> bool:
-    """PIN / area delivery — from Groq intent fields (works for any customer language)."""
+    """PIN / area delivery — brain JSON fields only (any customer language via LLM)."""
     r = route or {}
     handler = (r.get("route_handler") or "").strip().lower()
     if handler == "pincode_delivery_api":
@@ -294,68 +1885,187 @@ def ai_meaning_describes_delivery_serviceability(route: dict | None) -> bool:
     if not llm_semantic_route_available(route):
         return False
     intent = (r.get("intent") or "").strip().lower()
-    if intent == "pincode_check":
+    nc = (r.get("numeric_context") or "").strip().lower()
+    if r.get("needs_order_id") or nc == "order_id":
+        return False
+    olk = (r.get("order_lookup_kind") or "").strip().lower()
+    if olk in ("track", "tracking", "details", "invoice", "refund_status"):
+        return False
+    if ai_meaning_describes_order_details(r):
+        return False
+    focus = (r.get("field_focus") or "").strip().lower()
+    if focus in ("payment", "product", "delivery", "summary", "status", "timeline", "invoice"):
+        return False
+    if intent == "pincode_check" or nc == "pincode":
         return True
-    if (r.get("numeric_context") or "").strip().lower() == "pincode":
-        return True
-    blob = _ai_meaning_blob(r)
-    _delivery_meaning = (
-        "delivery",
-        "deliver to",
-        "deliver in",
-        "service in",
-        "service at",
-        "serviceable",
-        "ship to",
-        "pin code",
-        "pincode",
-        "postal code",
-        "area service",
-        "can you deliver",
-        "will welfog deliver",
-        "provide service",
-        "serviceability",
-        "service availability",
-        "availability in",
-        "check service",
-        "delivery check",
-    )
-    if any(m in blob for m in _delivery_meaning):
-        try:
-            from services.order_tracking_semantics import tracking_blocks_refund_meaning
-
-            if tracking_blocks_refund_meaning(blob):
-                return False
-        except ImportError:
-            pass
-        if "refund" in blob and "delivery" not in blob and "service" not in blob:
-            return False
-        return True
-    if intent in ("order", "general") and _ai_meaning_denies_order_tracking(blob):
-        if not r.get("needs_order_id"):
-            return True
     return False
 
 
-def ai_meaning_describes_existing_order_track(route: dict | None) -> bool:
-    """Live track/status of one order — Groq order_lookup_kind + intent, not keyword lists."""
+def ai_meaning_describes_order_details(route: dict | None) -> bool:
+    """One-order info — brain order_lookup_kind / route_handler / field_focus only."""
     if not llm_semantic_route_available(route):
         return False
     r = route or {}
     olk = (r.get("order_lookup_kind") or "").strip().lower()
-    if olk == "track":
+    rh = (r.get("route_handler") or "").strip().lower()
+    if olk == "invoice":
+        return False
+    if olk in ("details", "order_details") or rh == "order_details_api":
         return True
-    if olk in ("details", "invoice", "none", ""):
-        if olk in ("details", "invoice"):
-            return False
+    focus = (r.get("field_focus") or "").strip().lower()
+    if focus in ("payment", "product", "delivery", "summary", "status"):
+        return True
     intent = (r.get("intent") or "").strip().lower()
-    if intent in ("order", "refund", "payment") and r.get("needs_order_id"):
-        if olk == "track":
-            return True
-        if ai_route_is_kb_read(r):
+    if intent in ("order_details", "order_detail", "order_info"):
+        return bool(r.get("needs_order_id"))
+    if (
+        intent == "payment"
+        and r.get("needs_order_id")
+        and (r.get("data_channel") or "").strip().lower() == "live_api"
+    ):
+        return True
+    return False
+
+
+def correct_pincode_vs_order_id_numeric_context(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    """
+    Groq sometimes echoes order id in numeric_context with intent=pincode_check.
+    Entity shape + AI user_meaning — not customer-text keyword routing.
+    """
+    out = dict(route or {})
+    if not llm_semantic_route_available(out):
+        return out
+    nc_val = coerce_route_str(out.get("numeric_context"), "none")
+    order_digits = ""
+    if re.fullmatch(r"\d{4,20}", nc_val):
+        order_digits = nc_val
+    if not order_digits:
+        comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        if comb and (out.get("intent") or "").strip().lower() == "pincode_check":
+            try:
+                from utils.helpers import (
+                    _digits_in_message_are_order_id_not_pincode_impl,
+                    extract_order_id,
+                )
+
+                if _digits_in_message_are_order_id_not_pincode_impl(comb):
+                    oid = (extract_order_id(comb, conversation_context) or "").strip()
+                    if oid:
+                        order_digits = oid
+            except ImportError:
+                pass
+    if not order_digits:
+        return out
+
+    intent = (out.get("intent") or "").strip().lower()
+    is_order_id_entity = len(order_digits) >= 7
+    if not is_order_id_entity and intent == "pincode_check":
+        if ai_meaning_describes_order_details(out) or out.get("needs_order_id"):
+            is_order_id_entity = True
+
+    if not is_order_id_entity:
+        return out
+
+    out["numeric_context"] = "order_id"
+    out["needs_order_id"] = True
+    out["extracted_pincode"] = ""
+    out["run_catalog_search"] = False
+    out["data_channel"] = "live_api"
+    if intent == "pincode_check":
+        out["intent"] = "order"
+        out["conversation_scope"] = "welfog_support"
+        out["scope_reply"] = ""
+        log_reasoning(
+            "Route fix: order id entity in brain JSON — order live API (not pincode_check)."
+        )
+    out = correct_order_details_vs_tracking_from_ai_meaning(out)
+    olk_after = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk_after in ("none", ""):
+        out["order_lookup_kind"] = "details"
+        ff = (out.get("field_focus") or "").strip().lower()
+        if ff not in ("payment", "product", "delivery", "summary", "status", "invoice"):
+            out["field_focus"] = "summary"
+        out["route_handler"] = "order_details_api"
+    return out
+
+
+def correct_order_details_vs_tracking_from_ai_meaning(route: dict | None) -> dict:
+    """
+    Groq sometimes sets order_lookup_kind=track when field_focus/olk say details.
+    Trust brain JSON fields only — not phrase lists on user_meaning or customer text.
+    """
+    out = dict(route or {})
+    if not llm_semantic_route_available(out):
+        return out
+    if (out.get("meta_kind") or "none").strip().lower() != "none":
+        return out
+    if ai_route_is_kb_read(out):
+        return out
+
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    rh = (out.get("route_handler") or "").strip().lower()
+    focus = (out.get("field_focus") or "").strip().lower()
+
+    if olk in ("details", "invoice") and rh == "order_details_api":
+        return out
+    if olk == "track" and rh == "order_tracking_api" and focus == "timeline":
+        return out
+
+    if not ai_meaning_describes_order_details(out):
+        return out
+    if olk == "track" and focus == "timeline":
+        return out
+
+    out["intent"] = "order"
+    out["data_channel"] = "live_api"
+    out["needs_order_id"] = True
+    out["numeric_context"] = "order_id"
+    out["run_catalog_search"] = False
+    out["search_query"] = ""
+    if olk == "invoice" or focus == "invoice":
+        out["order_lookup_kind"] = "invoice"
+        out["field_focus"] = "invoice"
+    else:
+        out["order_lookup_kind"] = "details"
+        if focus not in ("payment", "product", "delivery", "summary", "status"):
+            out["field_focus"] = "summary"
+    out["route_handler"] = "order_details_api"
+    out.pop("_order_tracking_locked", None)
+    log_reasoning(
+        "Route fix: brain JSON fields → order_details_api (not track/pincode)."
+    )
+    return out
+
+
+def ai_meaning_describes_existing_order_track(route: dict | None) -> bool:
+    """Live track/status of one order — brain order_lookup_kind / route_handler / field_focus."""
+    if not llm_semantic_route_available(route):
+        return False
+    r = route or {}
+    if ai_meaning_describes_order_details(r):
+        focus = (r.get("field_focus") or "").strip().lower()
+        if focus and focus != "timeline":
             return False
-        channel = (r.get("data_channel") or "").strip().lower()
-        return channel == "live_api"
+    olk = (r.get("order_lookup_kind") or "").strip().lower()
+    rh = (r.get("route_handler") or "").strip().lower()
+    if olk in ("details", "invoice"):
+        return False
+    if olk == "track" or rh == "order_tracking_api":
+        return True
+    focus = (r.get("field_focus") or "").strip().lower()
+    if focus == "timeline" and r.get("needs_order_id"):
+        return True
+    if olk in ("none", ""):
+        return False
+    intent = (r.get("intent") or "").strip().lower()
+    if intent in ("order_track", "order_tracking", "tracking_request"):
+        return True
     return False
 
 
@@ -367,10 +2077,24 @@ def infer_semantic_goal_from_ai_route(ai_route: dict | None) -> str:
     if not llm_semantic_route_available(ai_route):
         return ""
     route = dict(ai_route or {})
+    try:
+        route = correct_order_details_vs_tracking_from_ai_meaning(route)
+    except Exception:
+        pass
     intent = (route.get("intent") or "").strip().lower()
     olk = (route.get("order_lookup_kind") or "").strip().lower()
 
-    if intent == "invoice":
+    if intent in (
+        "invoice",
+        "order_invoice",
+        "order_bill",
+        "order_bill_request",
+        "bill_request",
+        "bill",
+        "receipt",
+        "order_receipt",
+        "gst_invoice",
+    ):
         return "order_invoice"
     if intent == "refund" and (route.get("data_channel") or "").strip().lower() == "live_api":
         if not ai_route_is_kb_read(route):
@@ -385,9 +2109,10 @@ def infer_semantic_goal_from_ai_route(ai_route: dict | None) -> str:
 
     if ai_meaning_describes_delivery_serviceability(route) or intent == "pincode_check":
         return "pincode_delivery"
-    if olk == "invoice":
+    focus = (route.get("field_focus") or "").strip().lower()
+    if focus == "invoice" or olk == "invoice":
         return "order_invoice"
-    if olk == "details":
+    if olk == "details" or ai_meaning_describes_order_details(route):
         return "order_details"
     rh = (route.get("route_handler") or "").strip().lower()
     if rh == "order_details_api":
@@ -548,6 +2273,8 @@ def correct_delivery_vs_tracking_from_ai_meaning(route: dict | None) -> dict:
     out = dict(route or {})
     if not llm_semantic_route_available(out):
         return out
+    out = correct_pincode_vs_order_id_numeric_context(out)
+    out = correct_order_details_vs_tracking_from_ai_meaning(out)
     if (out.get("meta_kind") or "none").strip().lower() != "none":
         return out
 
@@ -582,6 +2309,8 @@ def correct_delivery_vs_tracking_from_ai_meaning(route: dict | None) -> dict:
         log_reasoning(
             "Route fix: LLM meaning is existing-order track — order (not pincode_check)."
         )
+    out = finalize_order_lookup_from_brain_json(out)
+    out = apply_order_live_route_handler(out)
     return out
 
 
@@ -598,8 +2327,28 @@ def correct_api_vs_kb_from_embedding(
     import re
 
     out = dict(route or {})
-    if (out.get("data_channel") or "").strip().lower() == "kb":
+    if out.get("_universal_brain_route"):
         return out
+    ch = (out.get("data_channel") or "").strip().lower()
+    if ch == "kb":
+        return out
+    if ch == "live_api":
+        return out
+    intent = (out.get("intent") or "").strip().lower()
+    if intent in ("wishlist", "order_history", "product", "order", "refund", "categories", "deals"):
+        return out
+    try:
+        from services.account_list_semantics import (
+            KIND_PURCHASE_IN_CHAT,
+            KIND_WISHLIST_IN_CHAT,
+            _norm_account_list_kind,
+        )
+
+        alk = _norm_account_list_kind(out.get("account_list_kind") or "")
+        if alk in (KIND_WISHLIST_IN_CHAT, KIND_PURCHASE_IN_CHAT):
+            return out
+    except ImportError:
+        pass
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
         return out
@@ -638,7 +2387,7 @@ def correct_api_vs_kb_from_embedding(
         top_key, score = top_customer_kb_file_match(
             original_msg, msg_en, conversation_context=conversation_context
         )
-        if score >= 0.40 and top_key in (
+        if score >= 0.55 and top_key in (
             "faqs",
             "shipping",
             "payment",
@@ -663,6 +2412,132 @@ def correct_api_vs_kb_from_embedding(
             )
     except ImportError:
         pass
+    return out
+
+
+def enrich_universal_brain_route(
+    route: dict | None,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    *,
+    ctx: dict | None = None,
+) -> dict:
+    """
+    Lock refund / invoice / order live API on universal brain JSON — no second routing LLM.
+    Fixes brain misroutes (refund status → return-policy KB, invoice → track).
+    """
+    out = _normalize_llm_route(dict(route or {}))
+    out["_universal_brain_route"] = True
+    out = repair_brain_json_quality(out, original_msg)
+    out = reconcile_product_catalog_from_brain_meaning(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(out):
+            out["_turn_promotions_done"] = True
+            if isinstance(ctx, dict) and ctx.get("last"):
+                out["_ctx_last"] = ctx.get("last")
+            log_reasoning(
+                "Universal brain — product catalog locked; skip order/refund enrich stack."
+            )
+            return out
+    except ImportError:
+        pass
+    out = reconcile_general_delivery_policy_from_message(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    if (out.get("data_channel") or "").strip().lower() == "kb":
+        out["_turn_promotions_done"] = True
+        return out
+    if isinstance(ctx, dict) and ctx.get("last"):
+        out["_ctx_last"] = ctx.get("last")
+
+    try:
+        from services.account_list_semantics import reconcile_wishlist_from_brain_meaning
+
+        out = reconcile_wishlist_from_brain_meaning(out)
+    except ImportError:
+        pass
+
+    out = infer_order_lookup_from_brain_english_fields(out)
+    out = reconcile_order_sub_intent_from_brain_json(out)
+    out = reconcile_invoice_from_brain_meaning(out)
+    out = reconcile_category_browse_from_brain_meaning(out)
+    out = finalize_order_lookup_from_brain_json(out)
+    out = lock_order_live_api_from_brain(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    out = reconcile_structural_order_sub_intent_from_message(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    out = reconcile_structural_order_sub_intent_from_tracking_message(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    out = lock_order_live_api_from_brain(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb and not conversation_context:
+        out["_turn_promotions_done"] = True
+        return out
+
+    try:
+        from services.account_list_semantics import promote_account_list_on_route
+
+        out = promote_account_list_on_route(
+            out,
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang,
+            allow_llm=False,
+        )
+    except ImportError:
+        pass
+
+    olk = (out.get("order_lookup_kind") or "none").strip().lower()
+    if olk in ("none", ""):
+        try:
+            from services.refund_status_semantics import promote_refund_status_on_route
+
+            out = promote_refund_status_on_route(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang,
+                allow_llm=False,
+            )
+            out = finalize_order_lookup_from_brain_json(out)
+            out = lock_order_live_api_from_brain(
+                out,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
+            )
+        except ImportError:
+            pass
+
+    out["_turn_promotions_done"] = True
     return out
 
 
@@ -706,6 +2581,23 @@ def enrich_route_from_llm(
         except ImportError:
             pass
         return out
+    if out.get("_universal_brain_route"):
+        try:
+            from services.chat_flow_telemetry import record_route_step, skip_step
+
+            record_route_step("enrich_route_from_llm_light")
+            skip_step(
+                "enrich_route_from_llm",
+                "universal brain — order/refund/invoice promotions",
+            )
+        except ImportError:
+            pass
+        return enrich_universal_brain_route(
+            out,
+            original_msg,
+            msg_en,
+            conversation_context,
+        )
     try:
         from services.chat_flow_telemetry import record_route_step
 

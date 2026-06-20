@@ -4,6 +4,7 @@ run the live API immediately — before warm feedback, KB dumps, or generic temp
 """
 from __future__ import annotations
 
+import re
 from typing import Optional
 
 from utils.reasoning_log import log_reasoning
@@ -19,8 +20,12 @@ def try_pincode_delivery_reply(
 ) -> str | None:
     """Live pincode API (city geocode or PIN), AI ask-PIN reply, or invalid-PIN message."""
     from services.location_delivery_resolver import turn_requests_delivery_serviceability
-    from services.pincode_delivery_flow import run_delivery_location_check
+    from services.pincode_delivery_flow import (
+        build_pincode_missing_or_invalid_reply,
+        run_delivery_location_check,
+    )
 
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not turn_requests_delivery_serviceability(
         original_msg,
         msg_en,
@@ -30,21 +35,49 @@ def try_pincode_delivery_reply(
     ):
         return None
 
+    brain_locked = isinstance(ai_route, dict) and (
+        (ai_route.get("intent") or "").strip().lower() == "pincode_check"
+        or (ai_route.get("route_handler") or "").strip().lower() == "pincode_delivery_api"
+        or ai_route.get("_universal_brain_route")
+    )
+    has_pin = bool(re.search(r"\b[1-9]\d{5}\b", comb))
+    allow_delivery_llm = True
+    if brain_locked and has_pin:
+        allow_delivery_llm = False
+
     result = run_delivery_location_check(
         original_msg,
         msg_en,
         conversation_context=conv_for_llm,
         reply_lang=lang,
         ai_route=ai_route,
+        allow_llm=allow_delivery_llm,
     )
-    if not result.handled or not result.reply_html:
-        return None
+    if result.handled and result.reply_html:
+        log_reasoning("Entity-first pincode delivery — location resolver + live API.")
+        ctx["last"] = "pincode"
+        ctx["awaiting"] = None
+        ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+        return result.reply_html
 
-    log_reasoning("Entity-first pincode delivery — location resolver + live API.")
-    ctx["last"] = "pincode"
-    ctx["awaiting"] = None
-    ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
-    return result.reply_html
+    if brain_locked or (
+        isinstance(ai_route, dict)
+        and (ai_route.get("intent") or "").strip().lower() == "pincode_check"
+    ):
+        fallback = build_pincode_missing_or_invalid_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            reply_lang=lang,
+        )
+        if fallback:
+            log_reasoning("Entity-first pincode — ask PIN fallback (no clarify menu).")
+            ctx["last"] = "pincode"
+            ctx["awaiting"] = "pincode"
+            ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+            return fallback
+
+    return None
 
 
 def try_live_order_reply(

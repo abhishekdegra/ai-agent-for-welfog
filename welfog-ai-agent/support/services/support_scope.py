@@ -63,7 +63,7 @@ def _has_support_topic(text: str) -> bool:
     tl = f" {_normalize_scope_text(text)} "
     if any(w in tl for w in _SUPPORT_TOPIC_WORDS):
         return True
-    if re.search(r"\b(track|trck|deliver|ship|refund|return|cancel)\b", tl):
+    if re.search(r"\b(track|trck|deliver|ship|refund|return|cancel|service)\b", tl):
         return True
     return False
 
@@ -301,8 +301,9 @@ Question: Should Welfog help with this request, or is the user asking about anot
 
 Rules:
 - Welfog ONLY: orders placed on Welfog, Welfog products, Welfog delivery PIN, Welfog refunds, Welfog order ID tracking.
-- EXTERNAL (about_welfog=false): help with Amazon/Flipkart/any other shop's order, tracking, refund, delivery, wishlist, cart — when THAT shop is NAMED in the message.
-- EXTERNAL: "amazon ki wishlist dikhao", "flipkart order nahi aaya".
+- EXTERNAL (about_welfog=false): help with ANY other company/app/shop/person's order, tracking, refund, delivery, wishlist, cart — when THAT entity is NAMED (Amazon, Meesho, a friend's order, any marketplace you recognize).
+- EXTERNAL: "amazon ki wishlist dikhao", "flipkart order nahi aaya", "amazon delivery 302012 pe", "meesho dega kya delivery".
+- Do NOT require a fixed brand list — infer from context whether the user wants Welfog or another entity.
 - WELFOG (about_welfog=true): "meri wishlist dikhao", "mereko meri wishlist batana", "my wishlist", "meri order history" — user on Welfog chat asking for THEIR saved items; NO competitor named. NEVER external.
 - Price compare mentioning another site WITHOUT asking bot to act on that site's order → still Welfog if they want Welfog products.
 - Brand names (Samsung, iPhone, Redmi, Nike…) when user wants to BUY on Welfog (cover, shirt, phone accessory) → about_welfog=true — NOT external.
@@ -437,6 +438,30 @@ def message_mentions_other_company_support(
     if _is_welfog_in_chat_account_request(combined):
         return False
 
+    if _names_shopping_competitor(combined) and _has_support_topic(combined):
+        if not support_request_is_for_welfog(
+            original_msg, msg_en, conversation_context
+        ):
+            log_reasoning(
+                "Other-company support topic — decline (overrides pincode route)."
+            )
+            return True
+
+    if _names_shopping_competitor(combined) and isinstance(ai_route, dict):
+        try:
+            from utils.helpers import _text_mentions_welfog_brand
+
+            welfog_in_msg = _text_mentions_welfog_brand(combined)
+        except ImportError:
+            welfog_in_msg = bool(re.search(r"\bwelfog\b", combined, re.I))
+        if not welfog_in_msg and (
+            (ai_route.get("intent") or "").strip().lower() == "pincode_check"
+        ):
+            log_reasoning(
+                "Competitor named on delivery question — decline Welfog pincode API."
+            )
+            return True
+
     if ai_route and ai_route.get("is_welfog_related", True):
         intent = (ai_route.get("intent") or "").strip().lower()
         channel = (ai_route.get("data_channel") or "").strip().lower()
@@ -475,6 +500,24 @@ def message_mentions_other_company_support(
         return False
 
     return not support_request_is_for_welfog(original_msg, msg_en, conversation_context)
+
+
+def try_external_scope_fast_decline(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+) -> Optional[str]:
+    """
+    Early polite decline when user asks about another company/person — before order/pincode fast paths.
+    Uses heuristics + LLM scope (no fixed list of every company).
+    """
+    if message_mentions_other_company_support(
+        original_msg, msg_en, conversation_context
+    ):
+        log_reasoning("External scope fast decline — not Welfog support.")
+        return build_other_company_support_decline(original_msg, reply_lang=reply_lang)
+    return None
 
 
 def build_other_company_social_decline(original_msg: str, reply_lang: str = "") -> str:

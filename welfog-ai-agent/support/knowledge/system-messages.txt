@@ -113,6 +113,8 @@ inner_categories_footer = <div style='margin-top:10px; color:#666; font-size:12p
 
 products_title_category = <div style='margin-bottom: 10px; color: #333;'>Here are products from your selected category:</div>
 products_title_query = <div style='margin-bottom: 10px; color: #333;'>Here are the best options for '<b>{query}</b>':</div>
+products_related_fallback = <div style='margin-bottom: 10px; color: #333;'>We don't have <b>{query}</b> on Welfog right now — here are related <b>{related}</b> you can check:</div>
+products_related_fallback_hinglish = <div style='margin-bottom: 10px; color: #333;'><b>{query}</b> abhi Welfog par nahi hai — related <b>{related}</b> dikha rahe hain:</div>
 no_image = No Image
 view_product = View Product
 
