@@ -2183,14 +2183,24 @@ def _finalize_brain_route_decision(
                     f"olk={route_data.get('order_lookup_kind')} channel={route_data.get('data_channel')}."
                 )
             if fast_locked:
+                product_finalize_locked = False
                 try:
-                    from services.ai_route_semantics import enrich_route_from_llm
-
-                    route_data = enrich_route_from_llm(
-                        route_data, original_msg, msg_en, conv_for_llm
+                    from services.product_catalog_resolver import (
+                        product_catalog_route_is_locked,
                     )
+
+                    product_finalize_locked = product_catalog_route_is_locked(route_data)
                 except ImportError:
                     pass
+                if not product_finalize_locked:
+                    try:
+                        from services.ai_route_semantics import enrich_route_from_llm
+
+                        route_data = enrich_route_from_llm(
+                            route_data, original_msg, msg_en, conv_for_llm
+                        )
+                    except ImportError:
+                        pass
                 try:
                     route_data = apply_ai_route_corrections(
                         route_data, original_msg, msg_en, conv_for_llm

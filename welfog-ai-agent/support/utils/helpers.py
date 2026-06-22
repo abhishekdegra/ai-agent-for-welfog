@@ -1853,6 +1853,12 @@ def _turn_blocks_pincode_serviceability_routing(t: str) -> bool:
         return True
     if "wishlist" in tl or "wish list" in tl:
         return True
+    if _text_wants_order_history_list_in_chat(raw) or message_is_past_purchase_list_request(raw):
+        return True
+    if _text_is_order_tracking_intent_leaf(raw) and "delivery" not in tl:
+        return True
+    if turn_is_obvious_product_shopping_turn(raw):
+        return True
     if _text_mentions_welfog_brand(tl) and any(
         x in tl
         for x in (
@@ -2277,6 +2283,27 @@ def turn_is_catalog_product_lookup(
     if _text_is_product_id_lookup_context(comb):
         return True
     if _text_is_sku_product_lookup_context(comb):
+        return True
+    return False
+
+
+def turn_is_obvious_product_shopping_turn(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    Clear catalog shopping turn — skip delivery/KB micro-classifiers (any language).
+    Does not use customer keyword lists for routing; combines structural product signals.
+    """
+    if turn_is_catalog_product_lookup(original_msg, msg_en):
+        return True
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return False
+    if _turn_is_catalog_product_request(comb):
+        return True
+    if _text_has_product_shopping_intent_core(comb):
         return True
     return False
 
@@ -4618,6 +4645,25 @@ def set_pincode_await_context(ctx: dict, ai_route: dict | None = None) -> None:
     ctx["data"]["topic_mode"] = "pincode_check"
     if isinstance(ai_route, dict) and ai_route:
         ctx["data"]["ai_route"] = ai_route
+
+
+def mark_pincode_delivery_completed(
+    ctx: dict,
+    *,
+    pin: str = "",
+    ai_route: dict | None = None,
+) -> None:
+    """Delivery check answered — release pincode thread so wishlist/order/product can run."""
+    if not isinstance(ctx, dict):
+        return
+    ctx["awaiting"] = None
+    ctx["last"] = None
+    data = ctx.setdefault("data", {})
+    data["topic_mode"] = "pincode_check"
+    if pin:
+        data["last_pincode"] = pin
+    if isinstance(ai_route, dict) and ai_route:
+        data["ai_route"] = ai_route
 
 
 def _text_has_pincode_delivery_intent(t: str, conversation_context: str = "") -> bool:

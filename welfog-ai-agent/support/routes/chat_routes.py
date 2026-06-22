@@ -489,7 +489,13 @@ def _try_bare_numeric_live_fast_reply(
     return None, ""
 
 
-def _ctx_pending_continuation_applies(ctx: dict, original_msg: str, msg_en: str) -> bool:
+def _ctx_pending_continuation_applies(
+    ctx: dict,
+    original_msg: str,
+    msg_en: str,
+    *,
+    conversation_context: str = "",
+) -> bool:
     """Session lock: bot asked for Order ID / PIN — resolve from ctx without brain LLM."""
     if not isinstance(ctx, dict):
         return False
@@ -502,27 +508,23 @@ def _ctx_pending_continuation_applies(ctx: dict, original_msg: str, msg_en: str)
     if _ctx_has_order_pending(ctx) and re.search(r"\b[0-9]{4,20}\b", comb):
         return True
     last = (ctx.get("last") or "").strip().lower()
+    if awaiting == "pincode" and re.search(r"\b[1-9]\d{5}\b", comb):
+        return True
     if last == "pincode" and re.search(r"\b[1-9]\d{5}\b", comb):
         return True
     # Fresh catalog/KB turns — skip delivery/thread micro-classifiers (~10s+).
-    if not awaiting and not _ctx_has_order_pending(ctx) and last not in (
-        "pincode",
-        "order",
-        "refund",
-        "payment",
-        "invoice",
-    ):
+    if not awaiting and not _ctx_has_order_pending(ctx):
         return False
-    if last == "pincode" or awaiting == "pincode":
+    if awaiting == "pincode":
         try:
             from services.location_delivery_resolver import (
                 _short_area_followup_in_pincode_thread,
                 turn_continues_pincode_area_check,
             )
 
-            if turn_continues_pincode_area_check(comb, "") or _short_area_followup_in_pincode_thread(
-                comb
-            ):
+            if turn_continues_pincode_area_check(
+                comb, conversation_context
+            ) or _short_area_followup_in_pincode_thread(comb):
                 return True
         except ImportError:
             pass
@@ -551,12 +553,16 @@ def _try_ctx_continuation_reply(
     """
     from utils.helpers import message_is_bare_numeric_submission
 
-    pending = _ctx_pending_continuation_applies(ctx, original_msg, msg_en)
+    conv = _conversation_snapshot_for_chat(chat_id) if chat_id else ""
+    pending = _ctx_pending_continuation_applies(
+        ctx, original_msg, msg_en, conversation_context=conv
+    )
     bare_numeric = message_is_bare_numeric_submission(original_msg)
     if not pending and not bare_numeric:
         return None, ""
 
-    conv = _conversation_snapshot_for_chat(chat_id) if (pending or bare_numeric) else ""
+    if not conv and (pending or bare_numeric):
+        conv = _conversation_snapshot_for_chat(chat_id)
 
     bare_body, bare_route = _try_bare_numeric_live_fast_reply(
         original_msg,
@@ -576,7 +582,7 @@ def _try_ctx_continuation_reply(
     awaiting = ctx.get("awaiting") if isinstance(ctx, dict) else None
     last = (ctx.get("last") or "").strip().lower() if isinstance(ctx, dict) else ""
 
-    if awaiting == "pincode" or (last == "pincode" and awaiting != "order_id"):
+    if awaiting == "pincode":
         try:
             from services.pincode_delivery_fast_path import try_pincode_delivery_fast_reply
 
@@ -749,19 +755,67 @@ def _try_early_ai_brain_reply(
     ctx: dict,
     *,
     conv_for_llm: str = "",
+    chat_id: str | None = None,
 ) -> tuple[str | None, dict | None]:
     """
     ONE ai_brain_route per turn — any language/style → locked API / KB / chitchat.
     Cached for the rest of the request (no duplicate routing LLM).
     """
-    if isinstance(ctx, dict) and ctx.get("awaiting") in ("order_id", "pincode"):
-        return None, None
+    conv = (conv_for_llm or "").strip() or _conversation_snapshot_for_chat(chat_id)
+    if isinstance(ctx, dict) and ctx.get("awaiting") == "order_id":
+        try:
+            from services.order_id_handoff_fast_path import try_order_id_handoff_reply
+
+            handoff = try_order_id_handoff_reply(
+                original_msg,
+                msg_en,
+                conv,
+                user_id,
+                lang,
+                ctx,
+                reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                reset_context_fn=reset_context,
+            )
+            if handoff:
+                log_reasoning(
+                    "Early brain skipped — awaiting Order ID handoff (zero extra LLM)."
+                )
+                return handoff, (ctx.get("data") or {}).get("ai_route")
+        except ImportError:
+            pass
+        return None, (ctx.get("data") or {}).get("ai_route")
+    if isinstance(ctx, dict) and ctx.get("awaiting") == "pincode":
+        comb_pin = f"{original_msg} {msg_en}".strip()
+        try:
+            from utils.helpers import (
+                _turn_blocks_pincode_serviceability_routing,
+                message_is_past_purchase_list_request,
+                turn_is_obvious_product_shopping_turn,
+            )
+
+            if (
+                _turn_blocks_pincode_serviceability_routing(comb_pin)
+                or turn_is_obvious_product_shopping_turn(
+                    original_msg, msg_en, conv
+                )
+                or message_is_past_purchase_list_request(comb_pin)
+            ):
+                ctx["awaiting"] = None
+                ctx["last"] = None
+            else:
+                return None, None
+        except ImportError:
+            return None, None
     try:
         from services.ai_first_router import early_universal_brain_route
-        from services.brain_direct_dispatch import try_brain_direct_dispatch
+        from services.brain_direct_dispatch import (
+            _try_brain_order_live_fallback_dispatch,
+            _try_brain_pincode_direct_reply,
+            try_brain_direct_dispatch,
+        )
 
         brain_route_data = early_universal_brain_route(
-            original_msg, conv_for_llm, lang, msg_en=msg_en, ctx=ctx
+            original_msg, conv, lang, msg_en=msg_en, ctx=ctx
         )
         if not isinstance(brain_route_data, dict):
             return None, None
@@ -770,15 +824,31 @@ def _try_early_ai_brain_reply(
 
         ctx.setdefault("data", {})["ai_route"] = brain_route_data
 
-        # Brain locked product catalog → OpenSearch immediately (skip order/KB dispatch detours).
+        # Delivery / pincode before product — location serviceability is live API.
+        pin_early = _try_brain_pincode_direct_reply(
+            brain_route_data,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv,
+            lang=lang,
+            ctx=ctx,
+            reset_context_fn=reset_context,
+        )
+        if pin_early:
+            return pin_early, brain_route_data
+
+        # Product catalog before order — shopping must not wait on order enrich / ask-ID.
         try:
+            from services.ai_route_semantics import brain_route_indicates_product_catalog
             from services.product_catalog_resolver import product_catalog_route_is_locked
             from services.brain_direct_dispatch import (
                 _prepare_brain_product_route,
                 _run_product_catalog_flow,
             )
 
-            if product_catalog_route_is_locked(brain_route_data):
+            if product_catalog_route_is_locked(
+                brain_route_data
+            ) or brain_route_indicates_product_catalog(brain_route_data):
                 product_route, sq = _prepare_brain_product_route(
                     brain_route_data, original_msg, msg_en
                 )
@@ -790,7 +860,7 @@ def _try_early_ai_brain_reply(
                     sq,
                     original_msg=original_msg,
                     msg_en=msg_en,
-                    conv_for_llm=conv_for_llm,
+                    conv_for_llm=conv,
                     user_id=user_id,
                     lang=lang,
                     ctx=ctx,
@@ -798,6 +868,44 @@ def _try_early_ai_brain_reply(
                 )
                 if product_body:
                     return product_body, brain_route_data
+        except ImportError:
+            pass
+
+        order_early = _try_brain_order_live_fallback_dispatch(
+            brain_route_data,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context,
+        )
+        if order_early:
+            log_reasoning(
+                "Brain early — order live (ask ID or API) before catalog detours."
+            )
+            return order_early, brain_route_data
+
+        # Product fallback (brain JSON locked shopping but direct dispatch missed).
+        try:
+            from services.brain_direct_dispatch import (
+                _try_brain_product_catalog_fallback_dispatch,
+            )
+
+            product_fb = _try_brain_product_catalog_fallback_dispatch(
+                brain_route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if product_fb:
+                return product_fb, brain_route_data
         except ImportError:
             pass
 
@@ -817,7 +925,7 @@ def _try_early_ai_brain_reply(
             brain_route_data,
             original_msg=original_msg,
             msg_en=msg_en,
-            conv_for_llm=conv_for_llm,
+            conv_for_llm=conv,
             user_id=user_id,
             lang=lang,
             ctx=ctx,
@@ -828,6 +936,38 @@ def _try_early_ai_brain_reply(
         )
         if brain_direct:
             return brain_direct, brain_route_data
+        order_fb = _try_brain_order_live_fallback_dispatch(
+            brain_route_data,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+            reset_context_fn=reset_context,
+        )
+        if order_fb:
+            return order_fb, brain_route_data
+        try:
+            from services.brain_direct_dispatch import (
+                _try_brain_product_catalog_fallback_dispatch,
+            )
+
+            product_fb = _try_brain_product_catalog_fallback_dispatch(
+                brain_route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if product_fb:
+                return product_fb, brain_route_data
+        except ImportError:
+            pass
         return None, brain_route_data
     except ImportError:
         return None, None
@@ -1562,6 +1702,171 @@ def chat():
             pass
         return jsonify({"chat_id": current_chat_id, "type": "text", "data": body})
 
+    # === ORDER SESSION FIRST (pending Order ID / bare id — zero LLM) ===
+    _t_order_sess = time.perf_counter()
+    ctx_sess_body, ctx_sess_route = _try_ctx_continuation_reply(
+        original_msg, msg_en, user_id, lang, ctx, chat_id=current_chat_id
+    )
+    if ctx_sess_body:
+        try:
+            from services.chat_flow_telemetry import record_phase, record_route
+
+            record_phase(
+                "order_session_first",
+                (time.perf_counter() - _t_order_sess) * 1000.0,
+            )
+            ar = (ctx.get("data") or {}).get("ai_route") or {}
+            record_route(
+                intent=ar.get("intent") or "order",
+                source=ar.get("route_handler") or ctx_sess_route,
+            )
+        except ImportError:
+            pass
+        log_reasoning(
+            f"Order session fast path ({ctx_sess_route}) — zero LLM, live API."
+        )
+        return _fast_path_json_reply(
+            ctx_sess_body,
+            ai_route_snapshot=(ctx.get("data") or {}).get("ai_route")
+            or {
+                "intent": "order",
+                "data_channel": "live_api",
+                "route_handler": ctx_sess_route,
+            },
+        )
+
+    # === PINCODE / DELIVERY before brain LLM (city/PIN thread — zero extra routing) ===
+    _t_pin_pre = time.perf_counter()
+    conv_snap_early = _conversation_snapshot_for_chat(current_chat_id)
+    _skip_pin_pre_brain = False
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        _skip_pin_pre_brain = turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conv_snap_early
+        )
+    except ImportError:
+        pass
+    if not _skip_pin_pre_brain:
+        try:
+            from services.pincode_delivery_fast_path import try_pincode_delivery_fast_reply
+
+            pin_pre_brain = try_pincode_delivery_fast_reply(
+                original_msg,
+                msg_en,
+                conv_snap_early,
+                lang,
+                ctx,
+                reset_context_fn=reset_context,
+            )
+            if pin_pre_brain:
+                try:
+                    from services.chat_flow_telemetry import record_phase
+
+                    record_phase(
+                        "pincode_pre_brain",
+                        (time.perf_counter() - _t_pin_pre) * 1000.0,
+                    )
+                except ImportError:
+                    pass
+                log_reasoning("Pincode delivery pre-brain — live API / area follow-up.")
+                return _fast_path_json_reply(
+                    pin_pre_brain,
+                    ai_route_snapshot=(ctx.get("data") or {}).get("ai_route")
+                    or {
+                        "intent": "pincode_check",
+                        "data_channel": "live_api",
+                        "route_handler": "pincode_delivery_fast",
+                    },
+                )
+            try:
+                from services.pincode_delivery_flow import run_delivery_location_check
+                from services.pincode_delivery_fast_path import (
+                    turn_is_pincode_delivery_fast_path,
+                )
+                from utils.helpers import _text_is_pincode_serviceability_question
+
+                pin_route_stub = {
+                    "intent": "pincode_check",
+                    "data_channel": "live_api",
+                    "_pincode_delivery_locked": True,
+                }
+                if turn_is_pincode_delivery_fast_path(
+                    original_msg, msg_en, conv_snap_early, ctx
+                ) or _text_is_pincode_serviceability_question(
+                    f"{original_msg} {msg_en}".strip(), conv_snap_early
+                ):
+                    loc_res = run_delivery_location_check(
+                        original_msg,
+                        msg_en,
+                        conv_snap_early,
+                        reply_lang=lang,
+                        ai_route=pin_route_stub,
+                        allow_llm=True,
+                    )
+                    if loc_res.handled and loc_res.reply_html:
+                        try:
+                            from services.chat_flow_telemetry import record_phase
+
+                            record_phase(
+                                "pincode_pre_brain_geocode",
+                                (time.perf_counter() - _t_pin_pre) * 1000.0,
+                            )
+                        except ImportError:
+                            pass
+                        if isinstance(ctx, dict):
+                            try:
+                                from utils.helpers import mark_pincode_delivery_completed
+
+                                mark_pincode_delivery_completed(
+                                    ctx, ai_route=pin_route_stub
+                                )
+                            except ImportError:
+                                ctx["last"] = None
+                                ctx["awaiting"] = None
+                                ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+                                ctx.setdefault("data", {})["ai_route"] = pin_route_stub
+                        log_reasoning(
+                            "Pincode pre-brain geocode — city/PIN live API (zero brain LLM)."
+                        )
+                        return _fast_path_json_reply(
+                            loc_res.reply_html,
+                            ai_route_snapshot=pin_route_stub,
+                        )
+            except ImportError:
+                pass
+        except ImportError:
+            pass
+
+    # === AI BRAIN EARLY (one LLM — order before catalog/KB detours) ===
+    _t_brain_top = time.perf_counter()
+    early_top_body, early_top_route = _try_early_ai_brain_reply(
+        original_msg,
+        msg_en,
+        user_id,
+        lang,
+        ctx,
+        conv_for_llm=_conversation_snapshot_for_chat(current_chat_id),
+        chat_id=current_chat_id,
+    )
+    if early_top_body:
+        try:
+            from services.chat_flow_telemetry import record_phase
+
+            record_phase(
+                "ai_brain_early",
+                (time.perf_counter() - _t_brain_top) * 1000.0,
+            )
+        except ImportError:
+            pass
+        log_reasoning(
+            "AI brain early (top) — semantic route reply (one ai_brain_route)."
+        )
+        return _fast_path_json_reply(
+            early_top_body,
+            ai_route_snapshot=early_top_route,
+        )
+
     # === ZERO-LLM natural-language order intent (invoice/track — before catalog/brain) ===
     comb_nl = f"{original_msg} {msg_en}".strip()
     nl_goal = ""
@@ -1597,7 +1902,9 @@ def chat():
         nl_goal = "track"
     if nl_goal and not re.search(r"\b[0-9]{4,20}\b", comb_nl):
         try:
-            from services.order_history_flow import _localized_sysmsg
+            from services.order_history_flow import (
+                _localized_sysmsg as order_history_localized_sysmsg,
+            )
 
             ask_intent = (
                 "refund"
@@ -1606,7 +1913,7 @@ def chat():
                 if nl_goal == "order_invoice"
                 else "order"
             )
-            nl_body = _localized_sysmsg(
+            nl_body = order_history_localized_sysmsg(
                 "ask_order_id_for_intent",
                 original_msg,
                 reply_lang=lang or "en",
@@ -1693,37 +2000,6 @@ def chat():
     except ImportError:
         pass
 
-    if isinstance(ctx, dict) and ctx.get("awaiting") == "order_id":
-        if re.fullmatch(r"[0-9]{4,20}", (original_msg or "").strip()):
-            try:
-                from services.order_id_handoff_fast_path import try_order_id_handoff_reply
-
-                handoff_body = try_order_id_handoff_reply(
-                    original_msg,
-                    msg_en,
-                    "",
-                    user_id,
-                    lang,
-                    ctx,
-                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
-                    reset_context_fn=reset_context,
-                )
-                if handoff_body:
-                    log_reasoning(
-                        "Awaiting Order ID — bare numeric handoff (zero LLM)."
-                    )
-                    return _fast_path_json_reply(
-                        handoff_body,
-                        ai_route_snapshot=(ctx.get("data") or {}).get("ai_route")
-                        or {
-                            "intent": "order",
-                            "data_channel": "live_api",
-                            "route_handler": "order_id_handoff_fast",
-                        },
-                    )
-            except ImportError:
-                pass
-
     # === ZERO-LLM EXPLICIT SKU (first — before ctx/brain/product AI) ===
     _t_sku_fast = time.perf_counter()
     try:
@@ -1793,39 +2069,6 @@ def chat():
     except ImportError:
         pass
 
-    # === ZERO-LLM CONTEXT CONTINUATION (Order ID / pincode follow-up — before brain) ===
-    _t_ctx_cont = time.perf_counter()
-    ctx_body, ctx_route = _try_ctx_continuation_reply(
-        original_msg, msg_en, user_id, lang, ctx, chat_id=current_chat_id
-    )
-    if ctx_body:
-        try:
-            from services.chat_flow_telemetry import record_phase, record_route
-
-            record_phase(
-                "ctx_continuation",
-                (time.perf_counter() - _t_ctx_cont) * 1000.0,
-            )
-            ar = (ctx.get("data") or {}).get("ai_route") or {}
-            record_route(
-                intent=ar.get("intent") or "order",
-                source=ar.get("route_handler") or ctx_route,
-            )
-        except ImportError:
-            pass
-        log_reasoning(
-            f"Context continuation fast path ({ctx_route}) — zero LLM, live API."
-        )
-        return _fast_path_json_reply(
-            ctx_body,
-            ai_route_snapshot=(ctx.get("data") or {}).get("ai_route")
-            or {
-                "intent": "order",
-                "data_channel": "live_api",
-                "route_handler": ctx_route,
-            },
-        )
-
     # === ZERO-LLM STRUCTURAL API/CATALOG (order id / SKU — before AI brain) ===
     if _can_resolve_without_conversation(original_msg, msg_en, lang, ctx):
         _t_early_live = time.perf_counter()
@@ -1888,29 +2131,6 @@ def chat():
             )
     except ImportError:
         pass
-
-    # === AI BRAIN — understand once (any language/style) → API / KB / chitchat ===
-    _t_brain_early = time.perf_counter()
-    early_brain_body, early_brain_route = _try_early_ai_brain_reply(
-        original_msg, msg_en, user_id, lang, ctx, conv_for_llm=""
-    )
-    if early_brain_body:
-        try:
-            from services.chat_flow_telemetry import record_phase
-
-            record_phase(
-                "ai_brain_early",
-                (time.perf_counter() - _t_brain_early) * 1000.0,
-            )
-        except ImportError:
-            pass
-        log_reasoning(
-            "AI brain early — locked route reply (one ai_brain_route, no keyword gate)."
-        )
-        return _fast_path_json_reply(
-            early_brain_body,
-            ai_route_snapshot=early_brain_route,
-        )
 
     _t_kb_hint = time.perf_counter()
     try:
@@ -2427,6 +2647,30 @@ def chat():
                     return send_reply(
                         brain_direct, lang, ai_route_snapshot=brain_route_data
                     )
+                try:
+                    from services.brain_direct_dispatch import (
+                        _try_brain_product_catalog_fallback_dispatch,
+                    )
+
+                    product_fb = _try_brain_product_catalog_fallback_dispatch(
+                        brain_route_data,
+                        original_msg=original_msg,
+                        msg_en=msg_en,
+                        conv_for_llm=conv_for_llm,
+                        user_id=user_id,
+                        lang=lang,
+                        ctx=ctx,
+                        reset_context_fn=reset_context,
+                    )
+                    if product_fb:
+                        log_reasoning(
+                            "Brain direct miss — product catalog fallback (zero extra LLM)."
+                        )
+                        return send_reply(
+                            product_fb, lang, ai_route_snapshot=brain_route_data
+                        )
+                except ImportError:
+                    pass
         except ImportError:
             pass
 
@@ -2722,6 +2966,29 @@ def chat():
             traceback.print_exc()
             log_reasoning(f"Brain locked executor failed (fallback): {brain_exec_exc}")
             reset_context_unless_order_pending(ctx)
+            try:
+                from services.brain_direct_dispatch import (
+                    _try_brain_order_live_fallback_dispatch,
+                )
+
+                order_exc_fb = _try_brain_order_live_fallback_dispatch(
+                    brain_route_data or {},
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv_for_llm
+                    or _conversation_snapshot_for_chat(current_chat_id),
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                    reset_context_fn=reset_context,
+                )
+                if order_exc_fb:
+                    return send_reply(
+                        order_exc_fb, lang, ai_route_snapshot=brain_route_data
+                    )
+            except ImportError:
+                pass
             scope_reply = ""
             if isinstance(brain_route_data, dict):
                 scope_reply = (brain_route_data.get("scope_reply") or "").strip()
@@ -2751,6 +3018,52 @@ def chat():
                     "Brain route OK — order live fallback before busy reply (zero extra LLM)."
                 )
                 return send_reply(busy_fallback, lang, ai_route_snapshot=brain_route_data)
+            from services.brain_direct_dispatch import (
+                _try_brain_product_catalog_fallback_dispatch,
+            )
+
+            product_busy_fb = _try_brain_product_catalog_fallback_dispatch(
+                brain_route_data or {},
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if product_busy_fb:
+                log_reasoning(
+                    "Brain route OK — product catalog fallback before busy reply (zero extra LLM)."
+                )
+                return send_reply(
+                    product_busy_fb, lang, ai_route_snapshot=brain_route_data
+                )
+            try:
+                from services.order_id_handoff_fast_path import try_order_id_handoff_reply
+
+                conv_busy = conv_for_llm or _conversation_snapshot_for_chat(
+                    current_chat_id
+                )
+                handoff_busy = try_order_id_handoff_reply(
+                    original_msg,
+                    msg_en,
+                    conv_busy,
+                    user_id,
+                    lang,
+                    ctx,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                    reset_context_fn=reset_context,
+                )
+                if handoff_busy:
+                    log_reasoning(
+                        "Brain route OK — order ID handoff before busy reply (zero extra LLM)."
+                    )
+                    return send_reply(
+                        handoff_busy, lang, ai_route_snapshot=brain_route_data
+                    )
+            except ImportError:
+                pass
         except ImportError:
             pass
         reset_context_unless_order_pending(ctx)
@@ -3064,9 +3377,14 @@ def chat():
                 "Delivery serviceability — pincode flow before intent executor."
             )
             reset_context(ctx)
-            ctx["last"] = "pincode"
-            ctx["awaiting"] = None
-            ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+            try:
+                from utils.helpers import mark_pincode_delivery_completed
+
+                mark_pincode_delivery_completed(ctx)
+            except ImportError:
+                ctx["last"] = None
+                ctx["awaiting"] = None
+                ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
             return send_reply(pin_pre.reply_html, lang)
 
     from services.intent_executor import (
@@ -3111,21 +3429,46 @@ def chat():
 
     if message_is_user_confused_or_rephrasing_bot(
         f"{original_msg} {msg_en}".strip(), conv_for_llm
-    ) and (
-        ai_pin_semantic
-        or _conversation_in_pincode_delivery_flow(conv_for_llm)
-        or _text_is_pincode_serviceability_question(f"{original_msg} {msg_en}".strip(), conv_for_llm)
     ):
-        from services.pincode_delivery_flow import build_pincode_missing_or_invalid_reply
+        comb_conf = f"{original_msg} {msg_en}".strip()
+        try:
+            from utils.helpers import (
+                _turn_blocks_pincode_serviceability_routing,
+                message_is_past_purchase_list_request,
+                turn_is_obvious_product_shopping_turn,
+            )
 
-        clarify_pin = build_pincode_missing_or_invalid_reply(
-            original_msg, msg_en, conv_for_llm, reply_lang=lang
-        )
-        if clarify_pin:
-            log_reasoning("User confused on delivery thread — re-ask PIN (not warm/KB).")
-            ctx["last"] = "pincode"
-            ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
-            return send_reply(clarify_pin, lang)
+            topic_switch = (
+                _turn_blocks_pincode_serviceability_routing(comb_conf)
+                or turn_is_obvious_product_shopping_turn(
+                    original_msg, msg_en, conv_for_llm
+                )
+                or message_is_past_purchase_list_request(comb_conf)
+            )
+        except ImportError:
+            topic_switch = False
+        if not topic_switch and (
+            ai_pin_semantic
+            or _conversation_in_pincode_delivery_flow(conv_for_llm)
+            or _text_is_pincode_serviceability_question(
+                f"{original_msg} {msg_en}".strip(), conv_for_llm
+            )
+        ):
+            from services.pincode_delivery_flow import build_pincode_missing_or_invalid_reply
+
+            clarify_pin = build_pincode_missing_or_invalid_reply(
+                original_msg, msg_en, conv_for_llm, reply_lang=lang
+            )
+            if clarify_pin:
+                log_reasoning("User confused on delivery thread — re-ask PIN (not warm/KB).")
+                try:
+                    from utils.helpers import set_pincode_await_context
+
+                    set_pincode_await_context(ctx)
+                except ImportError:
+                    ctx["last"] = "pincode"
+                    ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+                return send_reply(clarify_pin, lang)
 
     keyword_routes_ok = not skip_keyword_intent_routes(ai_route_data)
 

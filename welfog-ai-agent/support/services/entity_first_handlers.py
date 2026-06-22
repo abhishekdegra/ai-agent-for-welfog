@@ -55,9 +55,14 @@ def try_pincode_delivery_reply(
     )
     if result.handled and result.reply_html:
         log_reasoning("Entity-first pincode delivery — location resolver + live API.")
-        ctx["last"] = "pincode"
-        ctx["awaiting"] = None
-        ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+        try:
+            from utils.helpers import mark_pincode_delivery_completed
+
+            mark_pincode_delivery_completed(ctx, ai_route=ai_route)
+        except ImportError:
+            ctx["last"] = None
+            ctx["awaiting"] = None
+            ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
         return result.reply_html
 
     if brain_locked or (

@@ -21,6 +21,13 @@ def _pincode_thread_nudge_without_digits(
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb or re.search(r"\b[1-9]\d{5}\b", comb):
         return False
+    try:
+        from utils.helpers import _turn_blocks_pincode_serviceability_routing
+
+        if _turn_blocks_pincode_serviceability_routing(comb):
+            return False
+    except ImportError:
+        pass
     tl = f" {comb.lower()} "
     in_thread = False
     try:
@@ -44,6 +51,13 @@ def _pincode_thread_nudge_without_digits(
     ):
         return True
     if "pincode" in tl or "pincod" in tl or "pin code" in tl:
+        try:
+            from utils.helpers import _turn_blocks_pincode_serviceability_routing
+
+            if _turn_blocks_pincode_serviceability_routing(comb):
+                return False
+        except ImportError:
+            pass
         return True
     return False
 
@@ -92,6 +106,21 @@ def turn_is_pincode_delivery_fast_path(
             _looks_like_greeting_message(original_msg or comb)
             or _is_short_pure_greeting(comb)
             or _is_light_smalltalk_fast(original_msg, msg_en)
+        ):
+            return False
+    except ImportError:
+        pass
+
+    try:
+        from utils.helpers import (
+            _turn_blocks_pincode_serviceability_routing,
+            turn_is_obvious_product_shopping_turn,
+        )
+
+        if _turn_blocks_pincode_serviceability_routing(comb):
+            return False
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
         ):
             return False
     except ImportError:
@@ -152,10 +181,20 @@ def turn_is_pincode_delivery_fast_path(
     ):
         return True
     if isinstance(ctx, dict) and (ctx.get("last") or "").strip().lower() == "pincode":
-        if _naive_six_digit_pin_from_text(comb) or _conversation_in_pincode_delivery_flow(
-            conversation_context
-        ):
+        if _naive_six_digit_pin_from_text(comb):
             return True
+        try:
+            from services.location_delivery_resolver import (
+                _short_area_followup_in_pincode_thread,
+                turn_continues_pincode_area_check,
+            )
+
+            if turn_continues_pincode_area_check(
+                comb, conversation_context
+            ) or _short_area_followup_in_pincode_thread(comb):
+                return True
+        except ImportError:
+            pass
     if _conversation_in_pincode_delivery_flow(conversation_context):
         if _naive_six_digit_pin_from_text(comb):
             return True
@@ -284,10 +323,15 @@ def try_pincode_delivery_fast_reply(
         if isinstance(ctx, dict):
             if reset_context_fn:
                 reset_context_fn(ctx)
-            ctx["last"] = None
-            ctx["awaiting"] = None
-            ctx.setdefault("data", {})["topic_mode"] = "pincode_done"
-            ctx.setdefault("data", {})["last_pincode"] = pin
+            try:
+                from utils.helpers import mark_pincode_delivery_completed
+
+                mark_pincode_delivery_completed(ctx, pin=pin)
+            except ImportError:
+                ctx["awaiting"] = None
+                ctx["last"] = None
+                ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+                ctx.setdefault("data", {})["last_pincode"] = pin
             ctx["data"].pop("pending_action", None)
 
         return body

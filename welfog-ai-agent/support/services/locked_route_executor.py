@@ -687,6 +687,38 @@ def execute_locked_route_turn(
     except ImportError:
         pass
 
+    # --- Product catalog guard: never fall through to KB synthesis on shopping turns ---
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from services.brain_direct_dispatch import (
+            _prepare_brain_product_route,
+            _run_product_catalog_flow,
+        )
+
+        if brain_route_indicates_product_catalog(ai_route):
+            product_route, sq = _prepare_brain_product_route(
+                ai_route or {}, original_msg, msg_en
+            )
+            body = _run_product_catalog_flow(
+                product_route,
+                sq,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+            )
+            if body:
+                log_reasoning(
+                    "Locked dispatch: product catalog guard — KB synthesis blocked."
+                )
+                reset_context_fn(ctx)
+                return body
+    except ImportError:
+        pass
+
     # --- KB + AI synthesis for general/policy/support turns ---
     kb_ai = _try_kb_ai_synthesis(
         route_decision,

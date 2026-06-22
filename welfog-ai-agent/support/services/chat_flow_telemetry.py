@@ -4,6 +4,7 @@ Thread-local so concurrent /chat requests stay isolated.
 """
 from __future__ import annotations
 
+import json
 import os
 import threading
 import time
@@ -467,6 +468,7 @@ def log_order_dispatch(
     api_called: bool = False,
     api_time_ms: float = 0.0,
     entities: dict | None = None,
+    confidence: float | None = None,
 ) -> None:
     """Production order-flow log: intent → pending action → tool → API."""
     try:
@@ -479,21 +481,31 @@ def log_order_dispatch(
     entity_map: dict[str, str] = dict(entities or {})
     if order_id_found:
         entity_map.setdefault("order_id", order_id_found)
+        entity_map.setdefault("extracted_order_id", order_id_found)
     if pending_action:
         entity_map.setdefault("pending_action", pending_action)
     prev_snip = (previous_context or "").strip().replace("\n", " ")[:120]
     msg_snip = (message or "").strip().replace("\n", " ")[:120]
     entities_s = ",".join(f"{k}={v}" for k, v in entity_map.items()) or "-"
     ctx_used = previous_context_used or bool(prev_snip)
+    conf = confidence
+    if conf is None:
+        conf = float(getattr(_TLS, "scope_confidence", 0.0) or 0.0)
+    conf_s = f"{conf:.2f}" if conf else "-"
+    total = response_time_sec()
     extra = (
         f"message={msg_snip or '-'} "
-        f"detected_language={detected_language or '-'} "
+        f"language={detected_language or '-'} "
+        f"intent={detected_intent or '-'} "
+        f"confidence={conf_s} "
         f"entities={entities_s} "
+        f"extracted_order_id={order_id_found or '-'} "
+        f"selected_tool={selected_tool or '-'} "
         f"previous_context_used={ctx_used} "
         f"previous_context={prev_snip or '-'} "
         f"pending_action={pending_action or '-'} "
-        f"order_id_found={order_id_found or '-'} "
-        f"api_called={api_called} api_time_ms={api_time_ms:.0f} "
+        f"api_called={api_called} api_time={api_time_ms / 1000.0:.2f}s "
+        f"total_time={total:.2f}s "
         f"llm_call_count={llm_calls_count()}"
     )
     log_intent_routing(
@@ -508,13 +520,72 @@ def log_order_dispatch(
     log_reasoning(
         f"[order-flow] detected_intent={detected_intent or '-'} "
         f"detected_language={detected_language or '-'} "
+        f"confidence={conf_s} "
         f"entities={entities_s} "
-        f"previous_context_used={ctx_used} "
+        f"extracted_order_id={order_id_found or '-'} "
         f"selected_tool={selected_tool or '-'} "
-        f"api_time_ms={api_time_ms:.0f} "
-        f"total_time={response_time_sec():.2f}s "
+        f"api_time={api_time_ms / 1000.0:.2f}s "
+        f"total_time={total:.2f}s "
+        f"previous_context_used={ctx_used} "
         f"api_called={api_called} llm_call_count={llm_calls_count()}"
     )
+
+
+def log_product_dispatch(
+    *,
+    message: str = "",
+    detected_intent: str = "product",
+    detected_language: str = "",
+    entities: dict | None = None,
+    selected_tool: str = "",
+    opensearch_query: dict | None = None,
+    api_time_ms: float | None = None,
+    total_time_sec: float | None = None,
+) -> None:
+    """Production product-flow log: intent → entities → OpenSearch → timing."""
+    try:
+        record_route_step("product_catalog_dispatch")
+        if detected_intent:
+            record_route(intent=detected_intent, source=selected_tool or "product_catalog")
+        mark_routing_complete()
+    except Exception:
+        pass
+    entity_map: dict[str, str] = {}
+    for k, v in (entities or {}).items():
+        if v is not None and v != "" and v != []:
+            entity_map[k] = str(v)
+    os_q = dict(opensearch_query or {})
+    os_s = json.dumps(os_q, default=str, ensure_ascii=False)[:400] if os_q else "-"
+    msg_snip = (message or "").strip().replace("\n", " ")[:120]
+    entities_s = ",".join(f"{k}={v}" for k, v in entity_map.items()) or "-"
+    api_ms = api_time_ms
+    if api_ms is None:
+        api_ms = float(getattr(_TLS, "api_time_ms", 0.0) or 0.0)
+    total = total_time_sec
+    if total is None:
+        total = response_time_sec()
+    lang_f = (detected_language or getattr(_TLS, "detected_language", "") or "-").strip() or "-"
+    extra = (
+        f"message={msg_snip or '-'} "
+        f"detected_language={lang_f} "
+        f"intent={detected_intent or 'product'} "
+        f"entities={entities_s} "
+        f"selected_tool={selected_tool or '-'} "
+        f"opensearch_query={os_s} "
+        f"api_time={api_ms / 1000.0:.2f}s "
+        f"total_time={total:.2f}s "
+        f"llm_call_count={llm_calls_count()}"
+    )
+    log_intent_routing(
+        detected_intent=detected_intent or "product",
+        selected_existing_tool=selected_tool or "-",
+        entities=entity_map,
+        source_used="brain_direct_product" if selected_tool else "product_catalog",
+        response_time=total,
+        reason="Product catalog dispatch",
+        extra=extra,
+    )
+    log_reasoning(f"[product-flow] {extra}")
 
 
 def log_turn_complete(

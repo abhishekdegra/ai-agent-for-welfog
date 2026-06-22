@@ -352,6 +352,13 @@ def _is_order_id_handoff_turn(
 
     if not _message_is_bare_order_id_submission(original_msg, msg_en):
         try:
+            from utils.helpers import extract_order_id
+
+            if extract_order_id(comb, conversation_context):
+                return True
+        except ImportError:
+            pass
+        try:
             from services.refund_status_semantics import _message_has_refund_topic
             from services.order_details_flow import _lightweight_details_or_invoice_signal
 
@@ -556,6 +563,13 @@ def _handoff_requires_brain_first(
     comb = _combined(original_msg, msg_en)
     if not comb:
         return False
+    try:
+        from utils.helpers import extract_order_id
+
+        if extract_order_id(comb, conversation_context):
+            return False
+    except ImportError:
+        pass
     if _message_is_bare_order_id_submission(original_msg, msg_en):
         return False
     if _bot_awaiting_order_id(conversation_context, ctx):

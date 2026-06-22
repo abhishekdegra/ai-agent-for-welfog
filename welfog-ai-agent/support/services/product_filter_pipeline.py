@@ -1050,6 +1050,19 @@ def log_product_search_pipeline(
     chat_log(debug_line)
     log_reasoning(line)
     chat_log(line)
+    try:
+        from services.chat_flow_telemetry import log_product_dispatch
+
+        log_product_dispatch(
+            message=original_msg or msg_en,
+            detected_intent=detected_intent or "product",
+            detected_language=lang_hint if lang_hint != "auto" else "",
+            entities=entities,
+            selected_tool=selected_route or selected_api,
+            opensearch_query=api_params,
+        )
+    except ImportError:
+        pass
 
 
 def apply_understanding_sku_pro_id_fixes(

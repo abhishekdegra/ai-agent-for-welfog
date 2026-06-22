@@ -879,6 +879,27 @@ def resolve_delivery_turn(
         except ImportError:
             pass
 
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            try:
+                from utils.helpers import _conversation_in_pincode_delivery_flow
+
+                if not _conversation_in_pincode_delivery_flow(conversation_context):
+                    empty = DeliveryTurnUnderstanding(source="product_shopping")
+                    cache_key = _delivery_turn_cache_key(
+                        original_msg, msg_en, conversation_context
+                    )
+                    _delivery_turn_cache_put(cache_key, empty)
+                    return empty
+            except ImportError:
+                pass
+    except ImportError:
+        pass
+
     cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
     cached = _delivery_turn_cache_get(cache_key)
     if cached is not None and cached.source != "pending":
@@ -1437,6 +1458,21 @@ def turn_requests_delivery_serviceability(
 
         if product_catalog_route_is_locked(ai_route):
             return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            try:
+                from utils.helpers import _conversation_in_pincode_delivery_flow
+
+                if not _conversation_in_pincode_delivery_flow(conversation_context):
+                    return False
+            except ImportError:
+                return False
     except ImportError:
         pass
     try:

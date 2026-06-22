@@ -338,6 +338,19 @@ def get_kb_turn_ai_classification(
         return None
 
     try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            log_reasoning("KB-turn: product shopping — skip micro-LLM.")
+            _KB_TURN_CACHE.key = key
+            _KB_TURN_CACHE.result = None
+            return None
+    except ImportError:
+        pass
+
+    try:
         from utils.helpers import (
             _is_light_smalltalk_fast,
             _is_short_pure_greeting,

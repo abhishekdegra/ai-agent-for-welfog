@@ -210,6 +210,7 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
     "rating_min": null,
     "sku": "Exact SKU preserving hyphens (Xiaomi-SK) or empty",
     "product_id": "Numeric Welfog product id when user gave pro_id/product id, else empty",
+    "model": "Device/model if mentioned (iPhone 15, Redmi Note 10, Galaxy S22) else empty",
     "product_intent": "device or accessory or general",
     "allow_related_fallback": true,
     "related_search_terms": "English fallback product type if device absent, else empty string",
@@ -284,6 +285,7 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
     - "redmi ke covers dikha" / "X ke cover dikhao" → product_name=mobile cover, brand=Redmi (brand from X).
     - "behan ke liye iphone cover" → product_name=mobile cover, brand=Apple (iphone accessory).
     - ANY brand user names (BoAt, Noise, Itel, Lava, etc.) → put in product_entities.brand — do not limit to famous brands.
+  * mandatory_match_tokens: when user names ANY specific model/device/brand product (any language/style), set 1-4 English title tokens that MUST appear in catalog results — you infer from meaning, not fixed lists. Examples: iphone cover → ["iphone"]; philips trimmer → ["philips","trimmer"]; redmi note 10 case → ["redmi","note"]. Do NOT use generic type words alone (cover, shirt, bottle). REQUIRED when a named product/model/brand is the focus.
   * product_entities is REQUIRED when run_catalog_search=true — never empty product_name AND empty brand on a named-product browse.
 - Today's deals / offers / discounts / flash sale (ANY language) → intent=deals, data_channel=live_api, run_catalog_search=false, needs_order_id=false. NOT a product named "deals".
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.

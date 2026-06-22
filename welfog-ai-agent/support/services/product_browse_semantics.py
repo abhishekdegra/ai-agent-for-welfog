@@ -538,6 +538,13 @@ def promote_product_browse_on_route(
 
     out = _normalize_llm_route(dict(route or {}))
     try:
+        from services.ai_route_semantics import _brain_route_has_shopping_entities
+
+        if _brain_route_has_shopping_entities(out, original_msg=original_msg, msg_en=msg_en):
+            return out
+    except ImportError:
+        pass
+    try:
         from services.account_list_semantics import account_list_route_is_locked
 
         if account_list_route_is_locked(out):
@@ -576,5 +583,6 @@ def promote_product_browse_on_route(
     out["needs_order_id"] = False
     out["meta_kind"] = "none"
     out["search_query"] = sq
+    out["_product_catalog_locked"] = True
     out.pop("route_handler", None)
     return out

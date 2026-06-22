@@ -770,6 +770,21 @@ def _brain_field_focus_for_details() -> str:
     return ""
 
 
+def _order_route_confidence() -> float:
+    try:
+        from services.turn_intent_coordinator import _brain_route_for_turn
+
+        brain = _brain_route_for_turn()
+        if isinstance(brain, dict):
+            for key in ("routing_confidence", "confidence", "scope_confidence"):
+                raw = brain.get(key)
+                if raw is not None and str(raw).strip() != "":
+                    return float(raw)
+    except (ImportError, TypeError, ValueError):
+        pass
+    return 0.0
+
+
 def try_order_live_intent_fast_reply(
     original_msg: str,
     msg_en: str,
@@ -883,6 +898,7 @@ def try_order_live_intent_fast_reply(
                     api_called=False,
                     api_time_ms=0.0,
                     entities={"needs_order_id": "true"},
+                    confidence=_order_route_confidence(),
                 )
             except ImportError:
                 pass
@@ -992,6 +1008,7 @@ def try_order_live_intent_fast_reply(
             api_called=bool(reply_html),
             api_time_ms=api_time_ms,
             entities={"order_id": oid},
+            confidence=_order_route_confidence(),
         )
     except ImportError:
         pass

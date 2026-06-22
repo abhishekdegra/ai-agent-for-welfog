@@ -1436,7 +1436,8 @@ def _run_locked_catalog_search_fast(
     removed_reason = ""
     if not products and raw_count == 0:
         req_brand = (os_spec.get("_requested_brand") or os_spec.get("brand") or "").strip()
-        if req_brand:
+        mandatory_device = list(os_spec.get("mandatory_match_tokens") or [])
+        if req_brand and not mandatory_device:
             retry_spec = dict(os_spec)
             retry_spec.pop("brand", None)
             retry_spec.pop("brand_aliases", None)

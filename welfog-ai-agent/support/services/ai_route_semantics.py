@@ -735,7 +735,16 @@ _CATALOG_BLOCK_IN_BRAIN_BLOB = (
     "wishlist",
     "order history",
     "pincode",
+    "pin code",
     "delivery status",
+    "delivery service",
+    "delivery in",
+    "deliver to",
+    "deliver in",
+    "serviceability",
+    "does welfog deliver",
+    "can welfog deliver",
+    "ship to",
     "not related to welfog",
     "out of domain",
     "off-topic",
@@ -815,6 +824,28 @@ def _product_noun_from_brain_english(blob: str) -> str:
     return ""
 
 
+def _coerce_brain_scalar_field(value) -> str:
+    """LLM JSON sometimes returns strings as lists — safe for .strip() callers."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, (int, float)):
+        return str(value).strip()
+    if isinstance(value, list):
+        for item in value:
+            s = _coerce_brain_scalar_field(item)
+            if s:
+                return s
+        return ""
+    if isinstance(value, dict):
+        return ""
+    s = str(value).strip()
+    if s.lower() in ("null", "none", "n/a"):
+        return ""
+    return s
+
+
 def _infer_brand_from_brain_english(
     user_meaning: str,
     reasoning: str = "",
@@ -825,8 +856,9 @@ def _infer_brand_from_brain_english(
     No fixed brand keyword list; never scans customer Hinglish text.
     """
     pe = product_entities or {}
-    if (pe.get("brand") or "").strip():
-        return str(pe["brand"]).strip()
+    brand_raw = _coerce_brain_scalar_field(pe.get("brand"))
+    if brand_raw:
+        return brand_raw
     blob = f"{user_meaning or ''} {reasoning or ''}".strip()
     if not blob:
         return ""
@@ -870,9 +902,6 @@ def _infer_brand_from_brain_english(
     return ""
 
 
-    return ""
-
-
 def _repair_brain_product_entities(
     ent: dict,
     route: dict | None,
@@ -883,13 +912,26 @@ def _repair_brain_product_entities(
     """Normalize brain product_entities — trust LLM JSON; no customer-text brand lists."""
     out = dict(ent or {})
     r = route or {}
-    pn = (out.get("product_name") or "").strip()
-    sq = (r.get("search_query") or "").strip()
-    um = (r.get("user_meaning") or "").strip()
-    reasoning = (r.get("reasoning") or "").strip()
+    pn = _coerce_brain_scalar_field(out.get("product_name"))
+    sq = _coerce_brain_scalar_field(r.get("search_query"))
+    um = _coerce_brain_scalar_field(r.get("user_meaning"))
+    reasoning = _coerce_brain_scalar_field(r.get("reasoning"))
     raw_pe = r.get("product_entities") if isinstance(r.get("product_entities"), dict) else {}
     brain_blob = f"{um} {reasoning} {sq} {pn}".strip()
 
+    _scalar_entity_keys = (
+        "brand",
+        "color",
+        "size",
+        "sku",
+        "product_id",
+        "price_min",
+        "price_max",
+        "rating_min",
+        "product_intent",
+        "model",
+        "category",
+    )
     for k in (
         "brand",
         "color",
@@ -904,9 +946,24 @@ def _repair_brain_product_entities(
         "allow_related_fallback",
         "exclude_title_tokens",
         "mandatory_match_tokens",
+        "model",
+        "category",
     ):
         if not out.get(k) and isinstance(raw_pe, dict) and raw_pe.get(k) not in (None, "", "null", []):
             out[k] = raw_pe[k]
+
+    for k in _scalar_entity_keys:
+        if k in out and k not in (
+            "price_min",
+            "price_max",
+            "rating_min",
+            "product_id",
+        ):
+            coerced = _coerce_brain_scalar_field(out.get(k))
+            if coerced:
+                out[k] = coerced
+            else:
+                out.pop(k, None)
 
     if pn and _brain_product_name_is_noisy(pn):
         cleaned = _clean_brain_product_name(pn)
@@ -936,6 +993,17 @@ def _repair_brain_product_entities(
     if pn.lower() in ("iphones", "iphone phones"):
         pn = "iphone"
 
+    if um and pn:
+        noun = _product_noun_from_brain_english(f"{um} {reasoning}".strip())
+        um_low = um.lower()
+        if noun and noun.lower() not in pn.lower():
+            if "cover" in um_low or "case" in um_low:
+                type_word = "cover" if "cover" in um_low else "case"
+                if type_word not in pn.lower():
+                    pn = f"{pn} {type_word}".strip()
+            elif len(noun.split()) >= 2 and noun.lower() not in pn.lower():
+                pn = f"{pn} {noun}".strip()
+
     if not out.get("brand"):
         brand = _infer_brand_from_brain_english(um, reasoning, raw_pe)
         if brand:
@@ -948,7 +1016,9 @@ def _repair_brain_product_entities(
             out.get("brand"),
             product_name=pn or out.get("product_name") or "",
             explicit_from_brain=bool(
-                isinstance(raw_pe, dict) and (raw_pe.get("brand") or "").strip()
+                _coerce_brain_scalar_field(
+                    raw_pe.get("brand") if isinstance(raw_pe, dict) else ""
+                )
             ),
             user_meaning=um,
         )
@@ -987,6 +1057,26 @@ def _repair_brain_product_entities(
     ):
         out["size"] = "kids"
 
+    if not out.get("mandatory_match_tokens"):
+        mandatory: list[str] = []
+        model = _coerce_brain_scalar_field(
+            out.get("model")
+            or (raw_pe.get("model") if isinstance(raw_pe, dict) else None)
+        )
+        if model:
+            try:
+                from services.product_catalog_resolver import _ai_entity_token_list
+
+                mandatory.extend(_ai_entity_token_list(model)[:3])
+            except ImportError:
+                mandatory.extend(
+                    t
+                    for t in re.findall(r"[a-z0-9]{2,}", model.lower())
+                    if t
+                )[:3]
+        if mandatory:
+            out["mandatory_match_tokens"] = list(dict.fromkeys(mandatory))[:4]
+
     if pn:
         out["product_name"] = pn
     return out
@@ -997,8 +1087,8 @@ def _sanitize_brand_in_entities(ent: dict) -> dict:
         from services.product_catalog_resolver import sanitize_catalog_brand
 
         out = dict(ent or {})
-        pn = (out.get("product_name") or "").strip()
-        raw_brand = (out.get("brand") or "").strip()
+        pn = _coerce_brain_scalar_field(out.get("product_name"))
+        raw_brand = _coerce_brain_scalar_field(out.get("brand"))
         clean = sanitize_catalog_brand(
             raw_brand,
             product_name=pn,
@@ -1025,6 +1115,15 @@ def _brain_product_entities_from_route(
     if not isinstance(raw, dict):
         raw = {}
     ent: dict = {}
+    _skip_keys = frozenset(
+        {
+            "related_search_terms",
+            "exclude_title_tokens",
+            "mandatory_match_tokens",
+            "allow_related_fallback",
+        }
+    )
+    _num_keys = frozenset({"price_min", "price_max", "rating_min", "rating_max"})
     for k in (
         "product_name",
         "brand",
@@ -1043,14 +1142,25 @@ def _brain_product_entities_from_route(
         "related_search_terms",
     ):
         v = raw.get(k)
-        if v is None:
+        if v is None or k in _skip_keys:
             continue
-        s = str(v).strip()
-        if not s or s.lower() in ("null", "none", "n/a"):
+        if k in _num_keys:
+            try:
+                ent[k] = float(v)
+            except (TypeError, ValueError):
+                s = _coerce_brain_scalar_field(v)
+                if s:
+                    try:
+                        ent[k] = float(s)
+                    except (TypeError, ValueError):
+                        pass
             continue
-        ent[k] = v
+        s = _coerce_brain_scalar_field(v)
+        if not s:
+            continue
+        ent[k] = s
 
-    sq = (r.get("search_query") or "").strip()
+    sq = _coerce_brain_scalar_field(r.get("search_query"))
     if not ent.get("product_name") and sq:
         ent["product_name"] = sq
 
@@ -1072,7 +1182,7 @@ def _brain_product_entities_from_route(
 
     sku = ent.get("sku")
     if sku is not None:
-        ent["sku"] = str(sku).strip()
+        ent["sku"] = _coerce_brain_scalar_field(sku)
 
     if "allow_related_fallback" in raw:
         ent["allow_related_fallback"] = coerce_route_bool(
@@ -1104,18 +1214,44 @@ def _brain_product_entities_from_route(
 def _catalog_search_query_from_brain_route(route: dict | None) -> str:
     """English product-type search terms from ai_brain_route JSON only."""
     r = route or {}
-    stored = r.get("_product_entities")
-    if isinstance(stored, dict):
-        pn = (stored.get("product_name") or "").strip()
-        if pn and pn.lower() not in ("products", "product"):
-            return pn
     ent = _brain_product_entities_from_route(r)
+    if not ent and isinstance(r.get("_product_entities"), dict):
+        ent = dict(r["_product_entities"])
+
     pn = (ent.get("product_name") or "").strip()
-    if pn:
-        return pn
     sq = (r.get("search_query") or "").strip()
+    model = (ent.get("model") or "").strip()
+    pi = (ent.get("product_intent") or "").strip()
+    related = ent.get("related_search_terms")
+    related_s = ""
+    if isinstance(related, list) and related:
+        related_s = " ".join(str(x).strip() for x in related[:3] if str(x).strip())
+    elif isinstance(related, str) and related.strip():
+        related_s = related.strip()
+
+    def _norm(s: str) -> str:
+        return (s or "").lower().strip()
+
+    candidates: list[str] = []
+    if pn and pn.lower() not in ("products", "product"):
+        candidates.append(pn)
     if sq:
-        return sq
+        candidates.append(sq)
+    if pi and _norm(pi) not in _norm(pn) and pi.lower() not in (
+        "browse",
+        "buy",
+        "search",
+        "shop",
+    ):
+        candidates.append(f"{pn} {pi}".strip() if pn else pi)
+    if model and _norm(model) not in _norm(pn) and _norm(model) not in _norm(sq):
+        candidates.append(f"{pn} {model}".strip() if pn else model)
+    if related_s and _norm(related_s) not in _norm(pn):
+        candidates.append(related_s)
+
+    if candidates:
+        return max(candidates, key=lambda x: (len(x.split()), len(x)))[:120]
+
     um = (r.get("user_meaning") or "").strip()
     if not um:
         return ""
@@ -1138,6 +1274,35 @@ def _catalog_search_query_from_brain_route(route: dict | None) -> str:
     return um[:120].strip()
 
 
+def _brain_route_has_shopping_entities(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    """True when ai_brain_route JSON already extracted product filters (any language in)."""
+    ent = _brain_product_entities_from_route(
+        route, original_msg=original_msg, msg_en=msg_en
+    )
+    if not ent:
+        return False
+    for k in (
+        "product_name",
+        "brand",
+        "model",
+        "color",
+        "sku",
+        "product_id",
+        "pro_id",
+    ):
+        v = ent.get(k)
+        if v not in (None, "", [], {}):
+            return True
+    if ent.get("price_max") is not None or ent.get("price_min") is not None:
+        return True
+    return False
+
+
 def brain_route_indicates_product_catalog(route: dict | None) -> bool:
     """
     True when universal brain JSON already understood a catalog turn (any language in → English out).
@@ -1145,6 +1310,15 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
     """
     if not isinstance(route, dict):
         return False
+    if ai_meaning_describes_delivery_serviceability(route):
+        return False
+    try:
+        from services.location_delivery_resolver import pincode_delivery_route_is_locked
+
+        if pincode_delivery_route_is_locked(route, allow_llm=True):
+            return False
+    except ImportError:
+        pass
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
@@ -1164,6 +1338,8 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
         return True
     if route.get("category_only_browse") or (route.get("category_browse") or "").strip():
         return True
+    if _brain_route_has_shopping_entities(route):
+        return True
     entities = route.get("_product_entities") or {}
     if isinstance(entities, dict) and any(v not in (None, "", [], {}) for v in entities.values()):
         return True
@@ -1180,6 +1356,77 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
     ):
         return True
     return False
+
+
+def reconcile_pincode_delivery_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    """
+    Lock delivery / pincode serviceability — brain JSON enums first, then delivery AI classifier.
+    Never customer-text keyword lists.
+    """
+    out = dict(route or {})
+    out = correct_delivery_vs_tracking_from_ai_meaning(out)
+
+    if ai_meaning_describes_delivery_serviceability(out):
+        out["intent"] = "pincode_check"
+        out["data_channel"] = "live_api"
+        out["route_handler"] = "pincode_delivery_api"
+        out["needs_order_id"] = False
+        out["numeric_context"] = "pincode"
+        out["run_catalog_search"] = False
+        out["search_query"] = ""
+        out["order_lookup_kind"] = "none"
+        out["scope_reply"] = ""
+        out["conversation_scope"] = "welfog_support"
+        out["meta_kind"] = "none"
+        out["is_welfog_related"] = True
+        out.pop("_product_catalog_locked", None)
+        out["_pincode_delivery_locked"] = True
+        log_reasoning(
+            "Brain delivery reconcile — pincode_check from ai_brain_route JSON."
+        )
+        return out
+
+    if brain_route_indicates_product_catalog(out):
+        return out
+
+    if original_msg or msg_en:
+        try:
+            from utils.helpers import turn_is_obvious_product_shopping_turn
+
+            if turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conversation_context
+            ):
+                return out
+        except ImportError:
+            pass
+
+    if original_msg or msg_en or conversation_context:
+        try:
+            from services.location_delivery_resolver import promote_pincode_delivery_on_route
+
+            promoted = promote_pincode_delivery_on_route(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context,
+            )
+            if (promoted.get("intent") or "").strip().lower() == "pincode_check":
+                promoted["_pincode_delivery_locked"] = True
+                promoted.pop("_product_catalog_locked", None)
+                log_reasoning(
+                    "Brain delivery reconcile — delivery AI classifier locked pincode_check."
+                )
+                return promoted
+        except ImportError:
+            pass
+
+    return out
 
 
 def reconcile_product_catalog_from_brain_meaning(
@@ -1208,6 +1455,24 @@ def reconcile_product_catalog_from_brain_meaning(
             return out
     except ImportError:
         pass
+    if ai_meaning_describes_delivery_serviceability(out):
+        return out
+    if original_msg or msg_en:
+        try:
+            from services.location_delivery_resolver import (
+                pincode_delivery_route_is_locked,
+            )
+
+            if pincode_delivery_route_is_locked(
+                out,
+                original_msg,
+                msg_en,
+                "",
+                allow_llm=False,
+            ):
+                return out
+        except ImportError:
+            pass
     if not brain_route_indicates_product_catalog(out):
         return out
     ent = _brain_product_entities_from_route(out, original_msg=original_msg, msg_en=msg_en)
@@ -1877,14 +2142,21 @@ def ai_route_is_kb_read(route: dict | None) -> bool:
 
 
 def ai_meaning_describes_delivery_serviceability(route: dict | None) -> bool:
-    """PIN / area delivery — brain JSON fields only (any customer language via LLM)."""
+    """
+    PIN / area delivery — structured ai_brain_route JSON only.
+    The universal brain LLM classifies any customer language → intent/channel/handler;
+    never scan customer text or English phrase lists here.
+    """
+    if not llm_semantic_route_available(route):
+        return False
     r = route or {}
+    if r.get("_pincode_delivery_locked"):
+        return True
     handler = (r.get("route_handler") or "").strip().lower()
     if handler == "pincode_delivery_api":
         return True
-    if not llm_semantic_route_available(route):
-        return False
     intent = (r.get("intent") or "").strip().lower()
+    channel = (r.get("data_channel") or "").strip().lower()
     nc = (r.get("numeric_context") or "").strip().lower()
     if r.get("needs_order_id") or nc == "order_id":
         return False
@@ -1894,9 +2166,11 @@ def ai_meaning_describes_delivery_serviceability(route: dict | None) -> bool:
     if ai_meaning_describes_order_details(r):
         return False
     focus = (r.get("field_focus") or "").strip().lower()
-    if focus in ("payment", "product", "delivery", "summary", "status", "timeline", "invoice"):
+    if focus in ("payment", "product", "summary", "status", "timeline", "invoice"):
         return False
-    if intent == "pincode_check" or nc == "pincode":
+    if intent == "pincode_check":
+        return True
+    if nc == "pincode" and channel == "live_api":
         return True
     return False
 
@@ -2431,6 +2705,23 @@ def enrich_universal_brain_route(
     out = _normalize_llm_route(dict(route or {}))
     out["_universal_brain_route"] = True
     out = repair_brain_json_quality(out, original_msg)
+    out = reconcile_pincode_delivery_from_brain_meaning(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    if out.get("_pincode_delivery_locked") or (
+        (out.get("intent") or "").strip().lower() == "pincode_check"
+        and (out.get("data_channel") or "").strip().lower() == "live_api"
+    ):
+        out["_turn_promotions_done"] = True
+        if isinstance(ctx, dict) and ctx.get("last"):
+            out["_ctx_last"] = ctx.get("last")
+        log_reasoning(
+            "Universal brain — pincode delivery locked; skip product/order enrich."
+        )
+        return out
     out = reconcile_product_catalog_from_brain_meaning(
         out,
         original_msg=original_msg,
@@ -2445,6 +2736,45 @@ def enrich_universal_brain_route(
                 out["_ctx_last"] = ctx.get("last")
             log_reasoning(
                 "Universal brain — product catalog locked; skip order/refund enrich stack."
+            )
+            return out
+    except ImportError:
+        pass
+    if _brain_route_has_shopping_entities(out, original_msg=original_msg, msg_en=msg_en):
+        out = reconcile_product_catalog_from_brain_meaning(
+            out,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+        try:
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+
+            if product_catalog_route_is_locked(out):
+                out["_turn_promotions_done"] = True
+                log_reasoning(
+                    "Universal brain — product_entities JSON locked; skip order enrich + classifier."
+                )
+                return out
+        except ImportError:
+            pass
+    try:
+        from services.product_browse_semantics import promote_product_browse_on_route
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if not _brain_route_has_shopping_entities(
+            out, original_msg=original_msg, msg_en=msg_en
+        ):
+            out = promote_product_browse_on_route(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context,
+            )
+        if product_catalog_route_is_locked(out):
+            out["_product_catalog_locked"] = True
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Universal brain — semantic product browse promoted; skip order enrich stack."
             )
             return out
     except ImportError:

@@ -217,6 +217,13 @@ def _should_invoke_product_classifier(
     """
     if not comb or len(comb.strip()) < 2:
         return False
+    try:
+        from services.welfog_api import message_requests_category_browse
+
+        if message_requests_category_browse(comb):
+            return False
+    except ImportError:
+        pass
     if _catalog_menu_turn(comb, "", ai_route, conversation_context=conversation_context):
         return False
     if _is_likely_chitchat_not_product(
