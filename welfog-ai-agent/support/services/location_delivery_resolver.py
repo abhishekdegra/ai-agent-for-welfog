@@ -453,7 +453,7 @@ def geocode_city_to_pincode(
 ) -> dict[str, Any]:
     """
     Map city/area/locality name → representative 6-digit PIN (anywhere in India).
-    Order: cache → Google Maps (if key) → Nominatim pan-India → major-city offline fallback.
+    Order: cache → major-city offline fallback → Google Maps (if key) → Nominatim.
     """
     key = _norm_city_key(city)
     if not key or len(key) < 2:
@@ -465,21 +465,20 @@ def geocode_city_to_pincode(
         return dict(cached[1])
 
     out: dict[str, Any] = {}
-    gkey = (
-        (os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_GEOCODING_API_KEY") or "")
-        .strip()
-    )
-    if gkey:
-        out = _geocode_google_maps(city, state_hint=state_hint, country=country, api_key=gkey)
-        if out.get("pincode"):
-            _CITY_GEO_CACHE[cache_key] = (now, out)
-            log_reasoning(f"City geocode (Google): {city!r} → PIN {out['pincode']}")
-            return out
-
-    out = _nominatim_geocode_india(city, state_hint=state_hint, country=country)
-    if out.get("pincode"):
+    fallback = _MAJOR_CITY_PINS.get(key)
+    if fallback:
+        out = {
+            "pincode": fallback,
+            "city_label": city.strip(),
+            "state_hint": state_hint or "",
+            "lat": None,
+            "lng": None,
+            "display_name": f"{city.strip()}, India",
+            "confidence": "medium",
+            "source": "city_fallback",
+        }
         _CITY_GEO_CACHE[cache_key] = (now, out)
-        log_reasoning(f"City geocode (Nominatim): {city!r} → PIN {out['pincode']}")
+        log_reasoning(f"City geocode (offline fallback): {city!r} → PIN {fallback}")
         return out
 
     fuzzy_key = _fuzzy_major_city_typo(city)
@@ -499,20 +498,21 @@ def geocode_city_to_pincode(
             _CITY_GEO_CACHE[cache_key] = (now, out)
             return out
 
-    fallback = _MAJOR_CITY_PINS.get(key)
-    if fallback:
-        out = {
-            "pincode": fallback,
-            "city_label": city.strip(),
-            "state_hint": state_hint or "",
-            "lat": None,
-            "lng": None,
-            "display_name": f"{city.strip()}, India",
-            "confidence": "medium",
-            "source": "city_fallback",
-        }
+    gkey = (
+        (os.getenv("GOOGLE_MAPS_API_KEY") or os.getenv("GOOGLE_GEOCODING_API_KEY") or "")
+        .strip()
+    )
+    if gkey:
+        out = _geocode_google_maps(city, state_hint=state_hint, country=country, api_key=gkey)
+        if out.get("pincode"):
+            _CITY_GEO_CACHE[cache_key] = (now, out)
+            log_reasoning(f"City geocode (Google): {city!r} → PIN {out['pincode']}")
+            return out
+
+    out = _nominatim_geocode_india(city, state_hint=state_hint, country=country)
+    if out.get("pincode"):
         _CITY_GEO_CACHE[cache_key] = (now, out)
-        log_reasoning(f"City geocode (offline fallback): {city!r} → PIN {fallback}")
+        log_reasoning(f"City geocode (Nominatim): {city!r} → PIN {out['pincode']}")
         return out
 
     return {}
@@ -879,6 +879,12 @@ def resolve_delivery_turn(
         except ImportError:
             pass
 
+    cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
+    cached = _delivery_turn_cache_get(cache_key)
+    if cached is not None and cached.source != "pending":
+        if cached.is_serviceability or cached.is_area_followup:
+            return cached
+
     try:
         from utils.helpers import turn_is_obvious_product_shopping_turn
 
@@ -889,10 +895,8 @@ def resolve_delivery_turn(
                 from utils.helpers import _conversation_in_pincode_delivery_flow
 
                 if not _conversation_in_pincode_delivery_flow(conversation_context):
+                    # Product availability on Welfog — not PIN/city serviceability.
                     empty = DeliveryTurnUnderstanding(source="product_shopping")
-                    cache_key = _delivery_turn_cache_key(
-                        original_msg, msg_en, conversation_context
-                    )
                     _delivery_turn_cache_put(cache_key, empty)
                     return empty
             except ImportError:
@@ -900,8 +904,6 @@ def resolve_delivery_turn(
     except ImportError:
         pass
 
-    cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
-    cached = _delivery_turn_cache_get(cache_key)
     if cached is not None and cached.source != "pending":
         return cached
 
@@ -1454,6 +1456,13 @@ def turn_requests_delivery_serviceability(
     AI-first micro-classifier + recent chat; keywords not used.
     """
     try:
+        from services.knowledge_query_pipeline import kb_vector_fast_lane_active
+
+        if kb_vector_fast_lane_active():
+            return False
+    except Exception:
+        pass
+    try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
         if product_catalog_route_is_locked(ai_route):
@@ -1461,18 +1470,10 @@ def turn_requests_delivery_serviceability(
     except ImportError:
         pass
     try:
-        from utils.helpers import turn_is_obvious_product_shopping_turn
+        from services.semantic_intent import ai_route_is_product_catalog
 
-        if turn_is_obvious_product_shopping_turn(
-            original_msg, msg_en, conversation_context
-        ):
-            try:
-                from utils.helpers import _conversation_in_pincode_delivery_flow
-
-                if not _conversation_in_pincode_delivery_flow(conversation_context):
-                    return False
-            except ImportError:
-                return False
+        if ai_route_is_product_catalog(ai_route):
+            return False
     except ImportError:
         pass
     try:
@@ -1507,6 +1508,22 @@ def turn_requests_delivery_serviceability(
     ):
         return True
 
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            try:
+                from utils.helpers import _conversation_in_pincode_delivery_flow
+
+                if not _conversation_in_pincode_delivery_flow(conversation_context):
+                    return False
+            except ImportError:
+                return False
+    except ImportError:
+        pass
+
     comb = _combined(original_msg, msg_en)
     try:
         from utils.helpers import _conversation_in_pincode_delivery_flow
@@ -1519,6 +1536,18 @@ def turn_requests_delivery_serviceability(
         pass
 
     if allow_llm:
+        try:
+            from utils.helpers import (
+                _conversation_in_pincode_delivery_flow,
+                turn_is_obvious_product_shopping_turn,
+            )
+
+            if turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conversation_context
+            ) and not _conversation_in_pincode_delivery_flow(conversation_context):
+                return False
+        except ImportError:
+            pass
         loc = resolve_delivery_check_target(
             original_msg,
             msg_en,

@@ -78,6 +78,32 @@ def turn_is_pincode_delivery_fast_path(
     if not comb:
         return False
 
+    try:
+        from utils.helpers import (
+            _turn_blocks_pincode_serviceability_routing,
+            message_asks_welfog_social_media,
+        )
+
+        if _turn_blocks_pincode_serviceability_routing(comb):
+            return False
+        if message_asks_welfog_social_media(comb, conversation_context):
+            return False
+    except ImportError:
+        pass
+
+    try:
+        from utils.helpers import (
+            _naive_six_digit_pin_from_text,
+            message_has_live_pincode_check_intent,
+        )
+
+        if _naive_six_digit_pin_from_text(comb) and message_has_live_pincode_check_intent(
+            original_msg, conversation_context, msg_en
+        ):
+            return True
+    except ImportError:
+        pass
+
     if isinstance(ctx, dict):
         if ctx.get("awaiting") == "order_id":
             return False
@@ -111,6 +137,20 @@ def turn_is_pincode_delivery_fast_path(
     except ImportError:
         pass
 
+    # AI-first delivery/serviceability (any language) — beats product heuristics.
+    try:
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+
+        if turn_requests_delivery_serviceability(
+            original_msg,
+            msg_en,
+            conversation_context,
+            allow_llm=True,
+        ):
+            return True
+    except ImportError:
+        pass
+
     try:
         from utils.helpers import (
             _turn_blocks_pincode_serviceability_routing,
@@ -127,30 +167,19 @@ def turn_is_pincode_delivery_fast_path(
         pass
 
     try:
-        from services.turn_intent_coordinator import (
-            get_kb_turn_ai_classification,
-            kb_turn_is_informational,
+        from services.conversation_followup import is_deals_request_message
+        from utils.helpers import (
+            message_asks_welfog_categories_list,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
         )
 
-        kb = get_kb_turn_ai_classification(
-            original_msg, msg_en, conversation_context
-        )
-        if kb:
-            live_kind = (kb.get("live_api_kind") or "none").strip().lower()
-            if bool(kb.get("needs_live_api")) and live_kind == "pincode":
-                return True
-            if kb_turn_is_informational(kb):
-                topic = (kb.get("kb_topic") or "").strip().lower()
-                if topic != "none" and live_kind != "pincode":
-                    return False
-    except ImportError:
-        pass
-
-    try:
-        from services.refund_intent_fast_path import refund_blocks_pincode_fast_path
-
-        if refund_blocks_pincode_fast_path(
-            original_msg, msg_en, conversation_context
+        if is_deals_request_message(original_msg, msg_en):
+            return False
+        if message_asks_welfog_categories_list(comb):
+            return False
+        if message_is_wishlist_like_request(comb) or message_is_past_purchase_list_request(
+            comb
         ):
             return False
     except ImportError:
@@ -218,6 +247,38 @@ def turn_is_pincode_delivery_fast_path(
                 return True
         except ImportError:
             pass
+
+    # Ambiguous only — micro-LLM (skip for obvious deals/product/wishlist above).
+    try:
+        from services.turn_intent_coordinator import (
+            get_kb_turn_ai_classification,
+            kb_turn_is_informational,
+        )
+
+        kb = get_kb_turn_ai_classification(
+            original_msg, msg_en, conversation_context
+        )
+        if kb:
+            live_kind = (kb.get("live_api_kind") or "none").strip().lower()
+            if bool(kb.get("needs_live_api")) and live_kind == "pincode":
+                return True
+            if kb_turn_is_informational(kb):
+                topic = (kb.get("kb_topic") or "").strip().lower()
+                if topic != "none" and live_kind != "pincode":
+                    return False
+    except ImportError:
+        pass
+
+    try:
+        from services.refund_intent_fast_path import refund_blocks_pincode_fast_path
+
+        if refund_blocks_pincode_fast_path(
+            original_msg, msg_en, conversation_context
+        ):
+            return False
+    except ImportError:
+        pass
+
     return False
 
 
@@ -248,6 +309,16 @@ def resolve_pin_for_fast_path(
             if m:
                 return m.group(1)
 
+    try:
+        from utils.helpers import message_requests_new_area_without_pin
+
+        if message_requests_new_area_without_pin(
+            original_msg, msg_en, conversation_context
+        ):
+            return ""
+    except ImportError:
+        pass
+
     pin = resolve_pincode_for_check(
         original_msg,
         conversation_context,
@@ -271,11 +342,6 @@ def resolve_pin_for_fast_path(
         )
         if latest:
             return latest
-
-    if isinstance(ctx, dict):
-        stored = (ctx.get("data") or {}).get("last_pincode") or ctx.get("last_pincode")
-        if stored and str(stored).strip():
-            return str(stored).strip()
 
     return ""
 
@@ -337,43 +403,57 @@ def try_pincode_delivery_fast_reply(
         return body
 
     try:
-        from services.location_delivery_resolver import (
-            _short_area_followup_in_pincode_thread,
-            turn_continues_pincode_area_check,
-        )
-        from utils.helpers import _conversation_in_pincode_delivery_flow
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+        from services.pincode_delivery_flow import run_delivery_location_check
 
-        in_thread = _conversation_in_pincode_delivery_flow(conversation_context)
-        if isinstance(ctx, dict) and (ctx.get("last") or "").strip().lower() == "pincode":
-            in_thread = True
-        if in_thread and (
-            turn_continues_pincode_area_check(
-                f"{original_msg} {msg_en}".strip(),
-                conversation_context,
-            )
-            or _short_area_followup_in_pincode_thread(
-                f"{original_msg} {msg_en}".strip()
-            )
+        if turn_requests_delivery_serviceability(
+            original_msg,
+            msg_en,
+            conversation_context,
+            allow_llm=True,
         ):
-            from services.pincode_delivery_flow import build_pincode_missing_or_invalid_reply
-
-            body = build_pincode_missing_or_invalid_reply(
+            loc_res = run_delivery_location_check(
                 original_msg,
                 msg_en,
                 conversation_context,
                 reply_lang=reply_lang or "en",
+                ai_route={
+                    "intent": "pincode_check",
+                    "data_channel": "live_api",
+                    "_pincode_delivery_locked": True,
+                },
+                allow_llm=False,
             )
-            if body:
-                log_reasoning(
-                    "Pincode fast path: area follow-up — ask PIN (zero routing LLM)."
-                )
+            if loc_res.handled and loc_res.reply_html:
                 if isinstance(ctx, dict):
                     if reset_context_fn:
                         reset_context_fn(ctx)
-                    ctx["last"] = "pincode"
-                    ctx["awaiting"] = "pincode"
-                    ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
-                return body
+                    try:
+                        from services.location_delivery_resolver import (
+                            resolve_delivery_check_target,
+                        )
+                        from utils.helpers import mark_pincode_delivery_completed
+
+                        loc = resolve_delivery_check_target(
+                            original_msg,
+                            msg_en,
+                            conversation_context,
+                            allow_llm=False,
+                        )
+                        if loc.kind == "ask_pin":
+                            ctx["last"] = "pincode"
+                            ctx["awaiting"] = "pincode"
+                            ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
+                        elif loc.pincode:
+                            mark_pincode_delivery_completed(
+                                ctx, pin=loc.pincode
+                            )
+                    except ImportError:
+                        pass
+                log_reasoning(
+                    "Pincode fast path: city/vague area → geocode, API, or ask PIN."
+                )
+                return loc_res.reply_html
     except ImportError:
         pass
 

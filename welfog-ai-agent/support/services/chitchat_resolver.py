@@ -603,6 +603,52 @@ def try_chitchat_ai_preflight(
     return None
 
 
+def _is_instant_greeting_thanks_lane(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    Ultra-short hello / thanks / bye only — zero LLM.
+    Anything longer or substantive goes to ai_brain_route (no keyword shopping lists).
+    """
+    comb = _combined(original_msg, msg_en)
+    if not comb or len(comb) > 48:
+        return False
+    try:
+        from utils.helpers import _native_script_message_looks_informational
+
+        if _native_script_message_looks_informational(original_msg or comb):
+            return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import (
+            _is_short_pure_greeting,
+            _looks_like_native_script_short_greeting,
+            _looks_like_greeting_message,
+            message_is_bot_availability_chitchat,
+            message_is_casual_farewell_or_closing,
+            message_is_user_feedback_or_closing,
+        )
+
+        if _is_short_pure_greeting(original_msg or comb):
+            return True
+        if _looks_like_native_script_short_greeting(original_msg):
+            return True
+        if _looks_like_greeting_message(original_msg or comb):
+            return True
+        if message_is_user_feedback_or_closing(comb):
+            return True
+        if message_is_casual_farewell_or_closing(comb):
+            return True
+        if message_is_bot_availability_chitchat(comb):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 def try_conversational_turn_fast_reply(
     original_msg: str,
     msg_en: str = "",
@@ -610,65 +656,113 @@ def try_conversational_turn_fast_reply(
     reply_lang: str = "",
 ) -> Optional[tuple[str, dict]]:
     """
-    Structural chitchat only (greeting/thanks/bye) — zero LLM.
-    Semantic chitchat is handled by universal ai_brain_route + brain_direct_dispatch.
-    Returns (html_body, ai_route_snapshot) or None to continue the Welfog pipeline.
+    Deprecated — all turns use ai_brain_route + AI scope/chitchat replies (no templates).
     """
-    from services.translation_service import finalize_customer_reply, resolve_customer_reply_lang
-    from utils.helpers import fast_warm_reply_html
+    return None
 
-    comb = _combined(original_msg, msg_en)
-    if not comb or len(comb) > 200:
+
+def try_scope_ai_early_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    *,
+    preflight: bool = False,
+) -> Optional[tuple[str, dict]]:
+    """
+    One scope LLM for chitchat / out-of-domain before universal brain — natural reply
+    in the customer's language and style (not static templates).
+    """
+    from services.translation_service import resolve_customer_reply_lang
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
         return None
 
-    # Actionable routes (API/KB/account-list) are handled by ai_brain_route upstream.
+    try:
+        from services.conversation_zero_llm_fallback import _zero_llm_kb_turn_blocked
+
+        if not preflight and _zero_llm_kb_turn_blocked(
+            original_msg, msg_en, conversation_context
+        ):
+            return None
+    except ImportError:
+        pass
+
+    try:
+        from services.conversation_scope import (
+            SCOPE_CHITCHAT,
+            SCOPE_OUT,
+            SCOPE_WELFOG,
+            ai_classify_scope_and_reply,
+            build_scope_reply,
+            _has_definite_welfog_shopping_signal,
+        )
+
+        if not preflight and _has_definite_welfog_shopping_signal(comb):
+            return None
+    except ImportError:
+        return None
+
     try:
         from services.chat_flow_telemetry import get_cached_brain_route
-        from services.account_list_semantics import account_list_route_is_locked
 
         brain = get_cached_brain_route()
-        if account_list_route_is_locked(brain):
-            return None
         if isinstance(brain, dict):
             ch = (brain.get("data_channel") or "").strip().lower()
-            intent = (brain.get("intent") or "").strip().lower()
-            if ch in ("live_api", "catalog", "kb") and intent not in ("general", ""):
-                return None
-            if intent in ("order_history", "wishlist", "order", "refund", "product"):
+            if ch in ("live_api", "catalog", "kb"):
                 return None
     except ImportError:
         pass
 
-    # Obvious transactional turns — never run greeting/KB/shopping guard graphs here.
-    if re.search(r"\b[0-9]{6,20}\b", comb) and re.search(
-        r"\b(order|invoice|refund|track|delivery|shipment)\b", comb, re.I
-    ):
+    if not preflight:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+            if should_skip_micro_classifier_llm():
+                return None
+        except ImportError:
+            pass
+
+    from services.conversation_scope import (
+        SCOPE_CHITCHAT,
+        SCOPE_OUT,
+        SCOPE_WELFOG,
+        ai_classify_scope_and_reply,
+        build_scope_reply,
+    )
+
+    rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+    dec = ai_classify_scope_and_reply(
+        original_msg, msg_en, conversation_context, rl, preflight=preflight
+    )
+    if not dec or dec.scope == SCOPE_WELFOG:
+        return None
+    if dec.scope not in (SCOPE_CHITCHAT, SCOPE_OUT):
+        return None
+    if dec.confidence < 0.48 and not (dec.reply or "").strip():
         return None
 
-    if _chitchat_lane_skips_transactional_guards(
-        original_msg, msg_en, conversation_context
-    ):
-        rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-        tmpl = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
-        if not tmpl:
-            return None
-        body = finalize_customer_reply(tmpl, original_msg or msg_en, rl)
-        if not body:
-            return None
-        route_data = {
-            "intent": "general",
-            "conversation_scope": "general_chitchat",
-            "data_channel": "none",
-            "meta_kind": "conversational",
-            "is_welfog_related": True,
-            "run_catalog_search": False,
-            "needs_order_id": False,
-            "user_meaning": "Casual greeting or closing",
-            "route_handler": "warm_feedback",
-        }
-        log_reasoning(
-            "Conversational structural fast path — template reply (zero LLM)."
-        )
-        return body, route_data
+    body = build_scope_reply(
+        dec, original_msg, msg_en, rl, prefer_llm=False
+    )
+    if not body:
+        return None
 
-    return None
+    is_chitchat = dec.scope == SCOPE_CHITCHAT
+    route_data = {
+        "intent": "general" if is_chitchat else "out_of_domain",
+        "conversation_scope": dec.scope,
+        "data_channel": "none",
+        "meta_kind": "conversational",
+        "is_welfog_related": is_chitchat,
+        "run_catalog_search": False,
+        "needs_order_id": False,
+        "user_meaning": (dec.user_meaning or "")[:200],
+        "route_handler": "warm_feedback" if is_chitchat else "off_topic",
+        "scope_reply": (dec.reply or "")[:500],
+    }
+    log_reasoning(
+        f"Early scope AI ({dec.scope}) — natural reply before brain."
+    )
+    return body, route_data

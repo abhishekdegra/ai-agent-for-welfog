@@ -323,19 +323,17 @@ def top_customer_kb_file_match(
     if not query.strip():
         return "", 0.0
 
-    best_key = ""
-    best_score = 0.0
-    for k in get_customer_kb_keys():
-        if k.startswith("welfog_api"):
-            continue
-        hit = best_kb_hit(query, keys=[k], min_score=min_score)
-        if not hit:
-            continue
-        score = float(hit.get("score") or 0)
-        if score > best_score:
-            best_score = score
-            best_key = k
-    return best_key, best_score
+    keys = [
+        k
+        for k in get_customer_kb_keys()
+        if k and not str(k).startswith("welfog_api")
+    ]
+    if not keys:
+        return "", 0.0
+    hit = best_kb_hit(query, keys=keys, min_score=min_score)
+    if not hit:
+        return "", 0.0
+    return str(hit.get("source") or "").strip(), float(hit.get("score") or 0.0)
 
 
 def infer_kb_query_category(

@@ -323,6 +323,8 @@ def build_pincode_missing_or_invalid_reply(
     msg_en: str = "",
     conversation_context: str = "",
     reply_lang: str = "en",
+    *,
+    allow_ai: bool = True,
 ) -> str:
     """
     Prefer AI contextual reply; deterministic sysmsg only when LLM unavailable.
@@ -354,14 +356,16 @@ def build_pincode_missing_or_invalid_reply(
 
     scenario, bad = _pincode_reply_scenario(comb, conversation_context)
 
-    ai_body = ai_pincode_conversational_reply(
-        original_msg,
-        msg_en,
-        conversation_context,
-        reply_lang,
-        scenario=scenario,
-        malformed_pin=bad,
-    )
+    ai_body = ""
+    if allow_ai:
+        ai_body = ai_pincode_conversational_reply(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang,
+            scenario=scenario,
+            malformed_pin=bad,
+        )
     if ai_body:
         return ai_body
 
@@ -561,7 +565,7 @@ def run_delivery_location_check(
             )
             return OrderFlowResult(handled=False)
         body = build_pincode_missing_or_invalid_reply(
-            original_msg, msg_en, conversation_context, reply_lang=rl
+            original_msg, msg_en, conversation_context, reply_lang=rl, allow_ai=allow_llm
         )
         if body:
             return OrderFlowResult(handled=True, reply_html=body, intent="pincode_check")

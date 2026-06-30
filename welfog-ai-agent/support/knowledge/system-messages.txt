@@ -50,6 +50,8 @@ deals_link_clarify_hinglish = <div style="color:#333;line-height:1.55;">Neeche j
 deals_carousel_footer = <div style="margin-top:10px;color:#555;font-size:13px;">Har card par <b>View Deal</b> se product kholo, ya <a href="https://welfog.com" target="_blank" rel="noopener noreferrer">welfog.com</a> par browse karo.</div>
 deals_carousel_footer_hinglish = <div style="margin-top:10px;color:#555;font-size:13px;">Har card par <b>View Deal</b> dabao — yahi product link hai. Poori site: <a href="https://welfog.com" target="_blank" rel="noopener noreferrer">welfog.com</a></div>
 cancelled = Okay, cancelled. How else can I help you?
+chat_in_flight = <div style="color:#333;line-height:1.55;">Your last message is still being processed. Please wait a moment — I will reply shortly. If nothing appears, send your question again.</div>
+chat_in_flight_hinglish = <div style="color:#333;line-height:1.55;">Bhai, pehla message abhi process ho raha hai. Thoda wait karo — jawab jaldi aa jayega. Agar kuch na dikhe to wahi sawal dubara bhej dena.</div>
 
 ask_order_id_generic = Please paste a valid <b>Order ID</b> (numbers only or mixed letters/numbers, <b>4–20 characters</b> — as shown in your order confirmation or My Orders). Or type <b>cancel</b> to ask something else.
 ask_order_id_generic_hinglish = Kripya apna sahi <b>Order ID</b> paste karein (sirf numbers ya letters+numbers, <b>4–20 characters</b> — jaise order confirmation / My Orders mein dikhta hai). Ya <b>cancel</b> likh kar kuch aur poochh sakte ho.
@@ -71,8 +73,8 @@ product_not_found_hinglish = Sorry bhai — <b>{query}</b> ke liye abhi koi prod
 products_view_more = View more products
 products_view_more_hinglish = Aur products dikhao
 product_id_lookup_title = Product ID {pro_id}
-products_filtered_not_found = Sorry — we don't have any products matching <b>{query}</b> on Welfog right now. Try a different colour, price range, or search without the SKU code.
-products_filtered_not_found_hinglish = Sorry bhai — <b>{query}</b> ke hisaab se abhi koi product nahi mila. Colour / price thoda change karke ya alag SKU try karo.
+products_filtered_not_found = Sorry — we don't have any products matching <b>{query}</b> on Welfog right now. Try a different colour, brand, or price range.
+products_filtered_not_found_hinglish = Sorry bhai — <b>{query}</b> ke hisaab se abhi koi product nahi mila. Colour / brand / price thoda change karke dubara try karo.
 products_partial_missing = <div style="margin-top:12px;color:#555;font-size:13px;">We couldn't find exact matches for {items} on Welfog right now. Other items you asked for are shown above.</div>
 products_partial_missing_hinglish = <div style="margin-top:12px;color:#555;font-size:13px;">{items} ke liye abhi Welfog par exact match nahi mila. Jo products available the, woh upar dikha diye hain — baaki ke liye alag search try kar sakte ho.</div>
 products_partial_missing_named = <div style="margin-top:12px;color:#555;font-size:13px;">We couldn't find <b>{missing}</b> on Welfog right now. Products shown above are for <b>{found}</b>.</div>
@@ -162,10 +164,10 @@ order_history_help = <div style="color:#333;line-height:1.55;"><b>How to view yo
 order_history_help_hinglish = <div style="color:#333;line-height:1.55;"><b>App mein order history kaise dekhein (Welfog)</b><br><br>1) Welfog <b>app</b> ya <b>website</b> par login karo.<br>2) <b>My Orders</b> section kholo — saari purani purchases wahan list hoti hain.<br>3) Kisi bhi order par tap karke details, tracking aur invoice dekh sakte ho.<br>4) Status ya date se filter karke order dhundh sakte ho.<br><br><span style="color:#555;">Yahan chat mein list bhejne se alag — app ke andar <b>My Orders</b> par jaoge to poori history milti hai.</span></div>
 support_escalation = <div style="color:#333;line-height:1.55;">Sorry — we could not fully resolve this issue from here (payment, account, seller panel, or a technical block may need a human check).<br><br>Please contact our official customer care with your registered mobile/email and a short description of the problem:</div>
 support_escalation_hinglish = <div style="color:#333;line-height:1.55;">Sorry bhai — yahan se poora issue trace/solve nahi ho pa raha (payment atak gaya, account/ID block, seller panel upload, ya koi technical bug ho sakta hai).<br><br>Apna registered mobile/email aur problem ka short note le kar official customer care se baat kar lo:</div>
-welfog_social_links_intro = <div style="color:#333;line-height:1.55;"><b>Official Welfog social media</b> (from our knowledge base):</div>
-welfog_social_links_intro_hinglish = <div style="color:#333;line-height:1.55;"><b>Welfog ke official social media links</b> (hamari company knowledge se):</div>
-welfog_social_not_available = <div style="color:#333;line-height:1.55;">Sorry — we don't have official social media URLs in our current knowledge file right now. Please check the Welfog app or <a href="https://welfog.com" target="_blank" rel="noopener">welfog.com</a>.</div>
-welfog_social_not_available_hinglish = <div style="color:#333;line-height:1.55;">Sorry bhai — abhi hamari knowledge file mein official social media link update nahi hai. Welfog <b>app</b> ya <a href="https://welfog.com" target="_blank" rel="noopener">welfog.com</a> check kar lo.</div>
+welfog_social_links_intro = <div style="color:#333;line-height:1.55;"><b>Official Welfog social media</b>:</div>
+welfog_social_links_intro_hinglish = <div style="color:#333;line-height:1.55;"><b>Welfog ke official social media links</b>:</div>
+welfog_social_not_available = <div style="color:#333;line-height:1.55;">Sorry — we don't have that official social link right now. Please check the Welfog app or <a href="https://welfog.com" target="_blank" rel="noopener">welfog.com</a>.</div>
+welfog_social_not_available_hinglish = <div style="color:#333;line-height:1.55;">Sorry bhai — abhi official social media link update nahi hai. Welfog <b>app</b> ya <a href="https://welfog.com" target="_blank" rel="noopener">welfog.com</a> check kar lo.</div>
 other_company_social_decline = <div style="color:#333;line-height:1.55;">I can only share <b>Welfog's</b> official social media links. For other brands (Myntra, Amazon, etc.), please check their own app or website.</div>
 other_company_social_decline_hinglish = <div style="color:#333;line-height:1.55;">Main sirf <b>Welfog</b> ke official social media links de sakta hoon. Myntra / Amazon / doosri company ke liye unki app ya website dekho.</div>
 

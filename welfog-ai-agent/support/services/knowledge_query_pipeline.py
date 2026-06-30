@@ -21,6 +21,19 @@ from typing import Any, Optional
 from services.answer_router import AnswerRouteDecision, try_deterministic_kb_reply
 from utils.reasoning_log import log_reasoning
 
+_last_kb_vector_score: float = 0.0
+
+_KB_VECTOR_FAST_ACTIVE: bool = False
+
+
+def kb_vector_fast_lane_active() -> bool:
+    return _KB_VECTOR_FAST_ACTIVE
+
+
+def _set_kb_vector_fast_lane(active: bool) -> None:
+    global _KB_VECTOR_FAST_ACTIVE
+    _KB_VECTOR_FAST_ACTIVE = bool(active)
+
 _KB_HANDLERS = frozenset(
     {
         "dynamic_kb",
@@ -54,6 +67,25 @@ _ACTION_INTENTS = frozenset(
 _SEMANTIC_MIN = float(os.getenv("KNOWLEDGE_SEMANTIC_MIN_SCORE", "0.16") or "0.16")
 _SEMANTIC_STRONG = float(os.getenv("KNOWLEDGE_SEMANTIC_STRONG_SCORE", "0.22") or "0.22")
 _LLM_CLASSIFY_MIN = float(os.getenv("KNOWLEDGE_LLM_CLASSIFY_MIN_CONF", "0.72") or "0.72")
+
+
+def _skip_kb_borderline_llm(*, embedding_only: bool = False) -> bool:
+    """Avoid extra LLM loops when brain owns routing or budget is tight."""
+    if embedding_only:
+        return True
+    try:
+        from services.chat_flow_telemetry import (
+            llm_budget_exceeded,
+            should_defer_micro_classifiers_to_brain,
+        )
+
+        if llm_budget_exceeded():
+            return True
+        if should_defer_micro_classifiers_to_brain():
+            return True
+    except ImportError:
+        pass
+    return False
 
 
 @dataclass
@@ -398,6 +430,35 @@ def _ai_route_suggests_kb_read(ai_route: dict | None) -> tuple[bool, float, str]
     return False, 0.0, ""
 
 
+def _kb_vector_lane_allowed(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    KB vector fast lane — block only explicit live-data turns (order/PIN/pro id).
+    Intent (catalog vs KB) is decided by ai_classify_kb_turn, not keyword lists.
+    """
+    import re
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return False
+    if _turn_has_live_order_id(original_msg, msg_en):
+        return False
+    try:
+        from utils.helpers import extract_order_id, extract_product_id
+
+        comb_low = comb.lower()
+        if extract_product_id(comb_low) or extract_order_id(comb_low):
+            return False
+        if re.search(r"\b[1-9]\d{5}\b", comb):
+            return False
+    except ImportError:
+        pass
+    return True
+
+
 def _semantic_kb_match(
     retrieval_query: str,
     *,
@@ -406,6 +467,8 @@ def _semantic_kb_match(
     msg_en: str = "",
     conversation_context: str = "",
     ai_route: dict | None = None,
+    wide_search: bool = False,
+    fast_lane: bool = False,
 ) -> dict[str, Any] | None:
     """Embedding + topic-scoped search across customer KB files (semantic only)."""
     q = (retrieval_query or "").strip()
@@ -418,22 +481,35 @@ def _semantic_kb_match(
         retrieve_best_kb_chunk,
         top_kb_hits,
     )
-    from services.query_understanding import infer_kb_query_category, scoped_kb_keys_for_retrieval
 
     floor = min_score if min_score is not None else _SEMANTIC_MIN
-    category = infer_kb_query_category(
-        original_msg or q,
-        msg_en,
-        ai_route=ai_route,
-        conversation_context=conversation_context,
-    )
-    keys = scoped_kb_keys_for_retrieval(category, ai_route=ai_route, user_meaning=q)
-    if not keys:
+    if wide_search:
+        category = "general"
         keys = get_customer_kb_keys()
-    hits = top_kb_hits(q, keys=keys, min_score=floor, top_n=6, log_retrieval=False)
-    hit = _pick_best_semantic_kb_hit(q, hits, query_category=category)
-    if not hit:
-        hit = retrieve_best_kb_chunk(q, keys=keys, ai_route=ai_route, min_score=floor)
+        hit = retrieve_best_kb_chunk(
+            q,
+            keys=keys,
+            ai_route=ai_route,
+            min_score=floor,
+            conflict_check=True,
+        )
+        hits = [hit] if hit else []
+    else:
+        from services.query_understanding import infer_kb_query_category, scoped_kb_keys_for_retrieval
+
+        category = infer_kb_query_category(
+            original_msg or q,
+            msg_en,
+            ai_route=ai_route,
+            conversation_context=conversation_context,
+        )
+        keys = scoped_kb_keys_for_retrieval(category, ai_route=ai_route, user_meaning=q)
+        if not keys:
+            keys = get_customer_kb_keys()
+        hits = top_kb_hits(q, keys=keys, min_score=floor, top_n=8, log_retrieval=False)
+        hit = _pick_best_semantic_kb_hit(q, hits, query_category=category)
+        if not hit:
+            hit = retrieve_best_kb_chunk(q, keys=keys, ai_route=ai_route, min_score=floor)
     meaning = ((ai_route or {}).get("user_meaning") or "").strip()
     if hit or hits:
         log_kb_retrieval(
@@ -569,6 +645,7 @@ KB_TOPIC_KEYS: dict[str, list[str]] = {
     "refund_return_policy": ["refund", "faqs", "shipping"],
     "payment_fees": ["payment", "faqs"],
     "company_faq": ["company", "faqs"],
+    "welfog_social": ["company"],
     "seller": ["seller", "support"],
     "contact_support": ["support", "faqs"],
     "privacy_terms": ["privacy", "terms", "faqs"],
@@ -585,6 +662,7 @@ def ai_classify_kb_turn(
     *,
     reply_lang: str = "",
     ai_route: dict | None = None,
+    preflight: bool = False,
 ) -> dict[str, Any] | None:
     """
     Primary micro-LLM for KB vs live-API — infers meaning in ANY language (no keyword lists).
@@ -599,16 +677,17 @@ def ai_classify_kb_turn(
     if not enabled:
         return None
 
-    try:
-        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+    if not preflight:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
 
-        if should_skip_micro_classifier_llm():
-            log_reasoning(
-                "KB-turn LLM: defer/skip — universal brain route owns classification."
-            )
-            return None
-    except ImportError:
-        pass
+            if should_skip_micro_classifier_llm():
+                log_reasoning(
+                    "KB-turn LLM: defer/skip — universal brain route owns classification."
+                )
+                return None
+        except ImportError:
+            pass
 
     try:
         from services.ai_service import (
@@ -629,6 +708,24 @@ def ai_classify_kb_turn(
     if not comb:
         return None
 
+    try:
+        from services.turn_intent_coordinator import (
+            _KB_CACHE_UNSET,
+            peek_kb_turn_classification,
+            store_kb_turn_classification,
+        )
+
+        cached = peek_kb_turn_classification(
+            original_msg, msg_en, conversation_context, reply_lang
+        )
+        if cached is not _KB_CACHE_UNSET:
+            if cached is None:
+                return None
+            log_reasoning("KB-turn LLM: reuse cached classification (same turn).")
+            return cached
+    except ImportError:
+        pass
+
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
     compact_ctx = _compact_conversation_context(conversation_context or "", 1400)
     meaning_hint = ((ai_route or {}).get("user_meaning") or "").strip()
@@ -646,7 +743,7 @@ Return ONLY valid JSON:
   "is_informational_kb": true/false,
   "is_refund_or_return": true/false,
   "needs_live_api": true/false,
-  "kb_topic": "none"|"delivery_shipping"|"refund_return_policy"|"payment_fees"|"company_faq"|"seller"|"contact_support"|"privacy_terms"|"order_howto"|"general_faq",
+  "kb_topic": "none"|"delivery_shipping"|"refund_return_policy"|"payment_fees"|"company_faq"|"welfog_social"|"seller"|"contact_support"|"privacy_terms"|"order_howto"|"general_faq",
   "live_api_kind": "none"|"pincode"|"order_track"|"order_details"|"wishlist"|"order_history"|"refund_status"|"product_search",
   "confidence": 0.0-1.0
 }
@@ -656,6 +753,7 @@ is_informational_kb=true — user wants to READ Welfog FAQ/policy/how-it-works (
 • Refund/return POLICY or general steps → refund_return_policy, is_refund_or_return=true
 • Payment methods, fees, COD → payment_fees
 • What is Welfog, company info → company_faq
+• Welfog official social media / Instagram / YouTube / Facebook links → welfog_social
 • Seller registration/login on Welfog → seller
 • Customer care phone/email → contact_support
 • Privacy, terms → privacy_terms
@@ -668,7 +766,8 @@ needs_live_api=true — personal or live data NOW:
 • MY refund status / money not received for MY order → refund_status
 • Find/buy/show products → product_search
 
-is_informational_kb=false: greetings, thanks, jokes, other companies, off-topic.
+is_informational_kb=false: greetings, thanks, jokes, other companies' offers/policies/social
+handles, off-topic — infer semantically in ANY language (never keyword lists).
 
 Critical: general "how long does delivery take" = informational_kb + delivery_shipping.
 Checking if Welfog delivers to pincode 302012 = needs_live_api + pincode."""
@@ -708,7 +807,7 @@ Checking if Welfog delivers to pincode 302012 = needs_live_api + pincode."""
         f"KB-turn LLM: info={bool(data.get('is_informational_kb'))} "
         f"live={bool(data.get('needs_live_api'))} topic={topic} conf={conf:.2f} — {um[:90]}"
     )
-    return {
+    result = {
         "user_meaning_en": um,
         "is_informational_kb": bool(data.get("is_informational_kb")),
         "is_refund_or_return": bool(data.get("is_refund_or_return")),
@@ -717,6 +816,19 @@ Checking if Welfog delivers to pincode 302012 = needs_live_api + pincode."""
         "live_api_kind": live,
         "confidence": conf,
     }
+    try:
+        from services.turn_intent_coordinator import store_kb_turn_classification
+
+        store_kb_turn_classification(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang,
+            result,
+        )
+    except ImportError:
+        pass
+    return result
 
 
 def ai_classify_informational_kb_turn(
@@ -823,6 +935,7 @@ def analyze_informational_knowledge_turn(
     *,
     ai_route: dict | None = None,
     route_decision: AnswerRouteDecision | None = None,
+    embedding_only: bool = False,
 ) -> SemanticKnowledgeDecision:
     """
     Multilingual semantic analysis — keywords optional, not required.
@@ -833,43 +946,72 @@ def analyze_informational_knowledge_turn(
         )
     )
 
+    if embedding_only:
+        if _turn_has_live_order_id(original_msg, msg_en):
+            out.reason = "Order ID in message — live API lane."
+            return out
+        hit = _semantic_kb_match(
+            out.retrieval_query,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conversation_context,
+            ai_route=ai_route,
+            wide_search=True,
+            fast_lane=True,
+        )
+        if hit:
+            score = float(hit.get("score") or 0)
+            if score >= _SEMANTIC_MIN:
+                out.is_informational = True
+                out.confidence = min(0.93, 0.55 + score * 0.38)
+                out.source = "embedding"
+                out.kb_hit = hit
+                src = (hit.get("source") or "").strip()
+                out.kb_keys = [src] if src else []
+                out.handler = "kb_grounded_ai" if score >= 0.28 else "dynamic_kb"
+                out.reason = f"KB vector lane (score={score:.2f})."
+                return out
+        out.reason = "No KB embedding match (vector lane)."
+        return out
+
     try:
         from services.turn_intent_coordinator import (
             get_kb_turn_ai_classification,
             kb_turn_is_informational,
         )
 
-        kb_cls = get_kb_turn_ai_classification(
-            original_msg, msg_en, conversation_context, ai_route=ai_route
-        )
-        if kb_turn_is_informational(kb_cls):
-            topic = (kb_cls.get("kb_topic") or "general_faq").strip().lower()
-            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
-            um = (kb_cls.get("user_meaning_en") or "").strip()
-            if um:
-                out.retrieval_query = build_semantic_retrieval_query(
+        if not embedding_only:
+            kb_cls = get_kb_turn_ai_classification(
+                original_msg, msg_en, conversation_context, ai_route=ai_route
+            )
+            if kb_turn_is_informational(kb_cls):
+                topic = (kb_cls.get("kb_topic") or "general_faq").strip().lower()
+                keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+                um = (kb_cls.get("user_meaning_en") or "").strip()
+                if um:
+                    out.retrieval_query = build_semantic_retrieval_query(
+                        original_msg,
+                        msg_en,
+                        conversation_context,
+                        ai_route={"user_meaning": um, **(ai_route or {})},
+                    )
+                out.is_informational = True
+                out.confidence = float(kb_cls.get("confidence") or 0.0)
+                out.source = "kb_turn_llm"
+                out.user_meaning_en = um
+                out.kb_keys = keys
+                out.handler = "kb_grounded_ai"
+                out.reason = f"KB-turn LLM: {topic} (any language)."
+                faq_early = _try_strong_faq_informational_decision(
                     original_msg,
                     msg_en,
                     conversation_context,
-                    ai_route={"user_meaning": um, **(ai_route or {})},
+                    ai_route={"user_meaning": um} if um else ai_route,
+                    retrieval_query=out.retrieval_query,
                 )
-            out.is_informational = True
-            out.confidence = float(kb_cls.get("confidence") or 0.0)
-            out.source = "kb_turn_llm"
-            out.user_meaning_en = um
-            out.kb_keys = keys
-            out.handler = "kb_grounded_ai"
-            out.reason = f"KB-turn LLM: {topic} (any language)."
-            faq_early = _try_strong_faq_informational_decision(
-                original_msg,
-                msg_en,
-                conversation_context,
-                ai_route={"user_meaning": um} if um else ai_route,
-                retrieval_query=out.retrieval_query,
-            )
-            if faq_early:
-                return faq_early
-            return out
+                if faq_early:
+                    return faq_early
+                return out
     except ImportError:
         pass
 
@@ -1133,13 +1275,17 @@ def analyze_informational_knowledge_turn(
                     skip_borderline_llm = True
             except ImportError:
                 pass
-            if skip_borderline_llm:
+            if skip_borderline_llm or _skip_kb_borderline_llm(
+                embedding_only=embedding_only
+            ):
                 out.is_informational = True
                 out.confidence = min(0.9, 0.62 + score * 0.25)
                 out.source = "embedding"
                 src = (hit.get("source") or "").strip()
                 out.kb_keys = [src] if src else []
-                out.reason = f"KB embedding + router KB-read (skip borderline LLM, score={score:.2f})."
+                out.reason = (
+                    f"KB embedding (skip borderline LLM, score={score:.2f})."
+                )
                 if score >= 0.28:
                     out.handler = "kb_grounded_ai"
                 return out
@@ -1406,6 +1552,368 @@ def resolve_informational_kb_route(
     )
 
 
+def try_knowledge_vector_only_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    ai_route: dict | None = None,
+    embedding_only: bool = True,
+    allow_no_answer: bool = False,
+) -> Optional[str]:
+    """
+    Vector retrieval → rerank → KB excerpt (no kb_turn / answer-rewrite LLM).
+    Primary fast path for Welfog knowledge Q&A.
+    """
+    import time
+
+    t0 = time.perf_counter()
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+
+    if not _kb_vector_lane_allowed(original_msg, msg_en, conversation_context):
+        return None
+
+    from services.translation_service import customer_reply_language, resolve_customer_reply_lang
+
+    rl = reply_lang or resolve_customer_reply_lang(original_msg)
+
+    body = try_knowledge_reply_before_interference(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=rl,
+        ai_route=ai_route,
+        embedding_only=embedding_only,
+        skip_answer_llm=True,
+    )
+
+    elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    if body:
+        try:
+            from services.kb_service import log_kb_pipeline_complete
+
+            log_kb_pipeline_complete(
+                query=comb,
+                language=rl,
+                intent="general",
+                route="kb_vector_only",
+                retrieved_chunks=1,
+                similarity_score=_last_kb_vector_score,
+                response_time_ms=elapsed_ms,
+                source="embedding",
+            )
+        except ImportError:
+            pass
+        return body
+
+    if allow_no_answer:
+        try:
+            from services.kb_service import format_kb_no_information_reply, log_kb_pipeline_complete
+
+            log_kb_pipeline_complete(
+                query=comb,
+                language=rl,
+                intent="general",
+                route="kb_no_match",
+                retrieved_chunks=0,
+                similarity_score=0.0,
+                response_time_ms=elapsed_ms,
+                source="none",
+            )
+            return format_kb_no_information_reply(original_msg, reply_lang=rl)
+        except ImportError:
+            pass
+    return None
+
+
+def try_ai_first_kb_early_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    ai_route: dict | None = None,
+    preflight: bool = False,
+) -> Optional[str]:
+    """
+    Early /chat KB: one AI classifier infers meaning + topic (any language/script),
+    then vector KB retrieval. No keyword-list routing.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+
+    try:
+        from services.conversation_zero_llm_fallback import _zero_llm_kb_turn_blocked
+
+        if not preflight and _zero_llm_kb_turn_blocked(
+            original_msg, msg_en, conversation_context
+        ):
+            return None
+    except ImportError:
+        pass
+
+    if preflight:
+        try:
+            from services.turn_intent_coordinator import (
+                kb_classified_as_live_api,
+                kb_turn_is_informational,
+                store_kb_turn_classification,
+                structural_skip_kb_turn_classifier,
+            )
+            from services.kb_service import (
+                KB_DIRECT_MIN_SCORE,
+                best_kb_hit,
+                format_direct_reply_from_kb_hit,
+            )
+            from services.translation_service import resolve_customer_reply_lang
+
+            if structural_skip_kb_turn_classifier(
+                original_msg, msg_en, conversation_context
+            ):
+                return None
+
+            classified = ai_classify_kb_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang=reply_lang,
+                ai_route=ai_route,
+                preflight=True,
+            )
+            store_kb_turn_classification(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang,
+                classified,
+            )
+
+            if not classified:
+                log_reasoning(
+                    "KB preflight — AI classify unavailable; defer to brain/catalog."
+                )
+                return None
+            if kb_classified_as_live_api(classified):
+                log_reasoning(
+                    "KB preflight — AI: live API/catalog turn; skip vector KB."
+                )
+                return None
+            if not kb_turn_is_informational(classified):
+                log_reasoning(
+                    "KB preflight — AI: not informational KB; skip vector KB."
+                )
+                return None
+
+            topic = (classified.get("kb_topic") or "general_faq").strip().lower()
+            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+            um = (classified.get("user_meaning_en") or "").strip()
+            rq = um or comb
+            rl = reply_lang or resolve_customer_reply_lang(original_msg)
+
+            kb_body = ""
+            hit = best_kb_hit(rq, keys=keys, min_score=KB_DIRECT_MIN_SCORE)
+            if hit and float(hit.get("score") or 0) >= KB_DIRECT_MIN_SCORE:
+                kb_body = format_direct_reply_from_kb_hit(
+                    hit,
+                    original_msg,
+                    reply_lang=rl,
+                    retrieval_query=rq,
+                    fast_lane=True,
+                ) or ""
+            if kb_body:
+                log_reasoning(
+                    f"KB preflight — AI topic={topic} + scoped vector ({keys[:3]})."
+                )
+                return kb_body
+
+            log_reasoning(
+                f"KB preflight — AI topic={topic} but no scoped KB hit; defer."
+            )
+            return None
+        except ImportError:
+            return None
+
+    if not preflight:
+        try:
+            from services.chat_flow_telemetry import get_cached_brain_route
+
+            brain = ai_route or get_cached_brain_route()
+            if isinstance(brain, dict):
+                ch = (brain.get("data_channel") or "").strip().lower()
+                if ch in ("live_api", "catalog"):
+                    return None
+        except ImportError:
+            pass
+
+        try:
+            from services.chat_flow_telemetry import get_cached_brain_route
+
+            brain = ai_route if isinstance(ai_route, dict) else get_cached_brain_route()
+            if isinstance(brain, dict) and not brain.get("llm_unavailable"):
+                ch = (brain.get("data_channel") or "").strip().lower()
+                scope = (brain.get("conversation_scope") or "").strip().lower()
+                intent = (brain.get("intent") or "").strip().lower()
+                if ch in ("live_api", "catalog"):
+                    return None
+                if ch == "kb" or (brain.get("data_channel") or "").strip().lower() == "kb":
+                    meaning = (brain.get("user_meaning") or "").strip()
+                    keys = list(brain.get("kb_keys") or [])
+                    from services.kb_service import KB_DIRECT_MIN_SCORE, direct_kb_search
+
+                    kb_body = direct_kb_search(
+                        meaning or comb,
+                        keys=keys or None,
+                        min_score=KB_DIRECT_MIN_SCORE,
+                        zero_llm_fast=True,
+                    )
+                    if kb_body:
+                        log_reasoning("KB vector from brain channel=kb (zero extra LLM).")
+                        return kb_body
+                if scope in ("out_of_domain", "general_chitchat", "harm_sensitive"):
+                    return None
+                if intent == "out_of_domain":
+                    return None
+                meaning = (brain.get("user_meaning") or "").strip()
+                keys = list(brain.get("kb_keys") or [])
+                rh = (brain.get("route_handler") or "").strip().lower()
+                from services.kb_service import (
+                    KB_DIRECT_MIN_SCORE,
+                    direct_kb_search,
+                    format_welfog_social_media_reply_from_kb,
+                )
+
+                if "social" in rh:
+                    social = format_welfog_social_media_reply_from_kb(
+                        original_msg,
+                        msg_en,
+                        reply_lang=reply_lang,
+                        conversation_context=conversation_context,
+                        user_meaning_en=meaning,
+                        ai_confirmed=True,
+                    )
+                    if social:
+                        return social
+                query = meaning or comb
+                body = direct_kb_search(
+                    query,
+                    keys=keys or None,
+                    min_score=KB_DIRECT_MIN_SCORE,
+                    zero_llm_fast=True,
+                )
+                if body:
+                    log_reasoning(
+                        "KB vector from brain meaning — no duplicate kb_turn LLM."
+                    )
+                    return body
+        except ImportError:
+            pass
+
+    vec_body = try_knowledge_vector_only_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ai_route=ai_route,
+        embedding_only=True,
+    )
+    if vec_body:
+        log_reasoning("KB early — vector retrieval first (no kb_turn LLM).")
+        return vec_body
+
+    cls: dict[str, Any] | None = None
+    try:
+        from services.chat_flow_telemetry import llm_budget_exceeded
+
+        if not llm_budget_exceeded():
+            cls = ai_classify_kb_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang=reply_lang,
+                ai_route=ai_route,
+                preflight=preflight,
+            )
+    except ImportError:
+        cls = ai_classify_kb_turn(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang=reply_lang,
+            ai_route=ai_route,
+            preflight=preflight,
+        )
+
+    from services.kb_service import KB_DIRECT_MIN_SCORE, direct_kb_search
+
+    if isinstance(cls, dict):
+        conf = float(cls.get("confidence") or 0.0)
+        meaning = (cls.get("user_meaning_en") or "").strip()
+        needs_live = bool(cls.get("needs_live_api"))
+        is_info = bool(cls.get("is_informational_kb"))
+
+        if needs_live and conf >= 0.48:
+            log_reasoning(
+                f"AI-first KB skip — live API turn (conf={conf:.2f}): {meaning[:90]}"
+            )
+            return None
+        if not is_info and conf >= 0.50:
+            log_reasoning(
+                f"AI-first KB skip — not Welfog KB (conf={conf:.2f}): {meaning[:90]}"
+            )
+            return None
+
+        if is_info and conf >= 0.42:
+            topic = (cls.get("kb_topic") or "general_faq").strip().lower()
+            if topic == "none":
+                topic = "general_faq"
+            retrieval_q = meaning or comb
+
+            if topic == "welfog_social":
+                from services.kb_service import format_welfog_social_media_reply_from_kb
+
+                social_body = format_welfog_social_media_reply_from_kb(
+                    original_msg,
+                    msg_en,
+                    reply_lang=reply_lang,
+                    conversation_context=conversation_context,
+                    user_meaning_en=meaning,
+                    ai_confirmed=True,
+                )
+                if social_body:
+                    return social_body
+
+            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+            body = direct_kb_search(
+                retrieval_q,
+                keys=keys,
+                min_score=KB_DIRECT_MIN_SCORE,
+                zero_llm_fast=True,
+            )
+            if body:
+                return body
+            body = direct_kb_search(
+                retrieval_q,
+                keys=None,
+                min_score=KB_DIRECT_MIN_SCORE,
+                zero_llm_fast=True,
+            )
+            if body:
+                return body
+
+    return try_knowledge_vector_only_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ai_route=ai_route,
+        embedding_only=True,
+    )
+
+
 def try_knowledge_reply_before_interference(
     original_msg: str,
     msg_en: str = "",
@@ -1414,6 +1922,40 @@ def try_knowledge_reply_before_interference(
     reply_lang: str = "",
     route_decision: AnswerRouteDecision | None = None,
     ai_route: dict | None = None,
+    embedding_only: bool = False,
+    skip_answer_llm: bool = False,
+) -> Optional[str]:
+    """
+    KB reply before catalog / live API interference — semantic layers only.
+    """
+    if embedding_only:
+        _set_kb_vector_fast_lane(True)
+    try:
+        return _try_knowledge_reply_before_interference_impl(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang=reply_lang,
+            route_decision=route_decision,
+            ai_route=ai_route,
+            embedding_only=embedding_only,
+            skip_answer_llm=skip_answer_llm,
+        )
+    finally:
+        if embedding_only:
+            _set_kb_vector_fast_lane(False)
+
+
+def _try_knowledge_reply_before_interference_impl(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    route_decision: AnswerRouteDecision | None = None,
+    ai_route: dict | None = None,
+    embedding_only: bool = False,
+    skip_answer_llm: bool = False,
 ) -> Optional[str]:
     """
     Answer informational questions from live admin KB before chitchat / pincode hijack.
@@ -1422,15 +1964,14 @@ def try_knowledge_reply_before_interference(
     try:
         from services.early_live_dispatch import turn_blocks_kb_pre_scope
 
-        kb_block = turn_blocks_kb_pre_scope(
+        if not embedding_only and turn_blocks_kb_pre_scope(
             original_msg,
             msg_en,
             conversation_context,
             ai_route=ai_route,
             route_decision=route_decision,
-        )
-        if kb_block:
-            log_reasoning(f"Skip KB pre-scope — {kb_block} (live API / personal data).")
+        ):
+            log_reasoning(f"Skip KB pre-scope — live API / personal data.")
             return None
     except ImportError:
         pass
@@ -1441,14 +1982,16 @@ def try_knowledge_reply_before_interference(
         conversation_context,
         ai_route=ai_route,
         route_decision=route_decision,
+        embedding_only=embedding_only,
     )
 
     if not semantic.is_informational:
         return None
 
-    from services.kb_service import ensure_knowledge_cache_fresh
+    if not embedding_only:
+        from services.kb_service import ensure_knowledge_cache_fresh
 
-    ensure_knowledge_cache_fresh()
+        ensure_knowledge_cache_fresh()
 
     decision = resolve_informational_kb_route(
         original_msg,
@@ -1458,6 +2001,48 @@ def try_knowledge_reply_before_interference(
         semantic=semantic,
         ai_route=ai_route,
     )
+
+    if decision.kb_hit:
+        from services.kb_service import format_direct_reply_from_kb_hit
+
+        direct = format_direct_reply_from_kb_hit(
+            decision.kb_hit,
+            original_msg,
+            reply_lang=reply_lang,
+            retrieval_query=semantic.retrieval_query,
+            fast_lane=embedding_only,
+        )
+        if direct:
+            log_reasoning(
+                f"Pre-scope KB direct chunk (score={float(decision.kb_hit.get('score') or 0):.2f})."
+            )
+            try:
+                global _last_kb_vector_score
+                _last_kb_vector_score = float(decision.kb_hit.get("score") or 0)
+            except Exception:
+                pass
+            return direct
+
+    if embedding_only:
+        return None
+
+    reply = try_deterministic_kb_reply(
+        decision,
+        original_msg,
+        semantic.user_meaning_en or msg_en,
+        reply_lang,
+        conversation_context,
+        ai_route=ai_route,
+    )
+    if reply:
+        log_reasoning(
+            f"Pre-scope KB reply: handler={decision.handler} "
+            f"via={semantic.source or 'heuristic'} conf={semantic.confidence:.2f}"
+        )
+        return reply
+
+    if skip_answer_llm:
+        return None
 
     if decision.handler == "kb_grounded_ai" and decision.kb_hit:
         src = (decision.kb_hit.get("source") or "").strip().lower()
@@ -1502,21 +2087,6 @@ def try_knowledge_reply_before_interference(
                 f"Pre-scope semantic KB+AI: {semantic.source} conf={semantic.confidence:.2f}"
             )
             return reply
-
-    reply = try_deterministic_kb_reply(
-        decision,
-        original_msg,
-        semantic.user_meaning_en or msg_en,
-        reply_lang,
-        conversation_context,
-        ai_route=ai_route,
-    )
-    if reply:
-        log_reasoning(
-            f"Pre-scope KB reply: handler={decision.handler} "
-            f"via={semantic.source or 'heuristic'} conf={semantic.confidence:.2f}"
-        )
-        return reply
 
     if decision.kb_hit:
         from services.answer_router import try_kb_ai_reply

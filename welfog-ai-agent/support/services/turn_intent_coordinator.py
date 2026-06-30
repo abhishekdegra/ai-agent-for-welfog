@@ -248,6 +248,60 @@ def resolve_account_list_action_ai_first(
 
 _KB_TURN_CACHE = threading.local()
 _KB_AI_CONF_MIN = 0.52
+_KB_CACHE_UNSET = object()
+
+
+def peek_kb_turn_classification(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+):
+    """Return cached KB-turn classify for this message, or _KB_CACHE_UNSET if not cached."""
+    key = _turn_cache_key(
+        original_msg, msg_en, conversation_context, reply_lang or "", "kb_turn"
+    )
+    if getattr(_KB_TURN_CACHE, "key", None) != key:
+        return _KB_CACHE_UNSET
+    return getattr(_KB_TURN_CACHE, "result", _KB_CACHE_UNSET)
+
+
+def store_kb_turn_classification(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    result: dict | None = None,
+) -> None:
+    key = _turn_cache_key(
+        original_msg, msg_en, conversation_context, reply_lang or "", "kb_turn"
+    )
+    _KB_TURN_CACHE.key = key
+    _KB_TURN_CACHE.result = result
+
+
+def kb_classified_as_live_api(classified: dict | None, *, min_conf: float = 0.48) -> bool:
+    if not isinstance(classified, dict):
+        return False
+    return bool(classified.get("needs_live_api")) and float(
+        classified.get("confidence") or 0.0
+    ) >= min_conf
+
+
+def kb_classified_as_product_catalog(
+    classified: dict | None,
+    *,
+    min_conf: float = 0.48,
+) -> bool:
+    """KB-turn micro-LLM locked product_search — OpenSearch, not KB/brain stack."""
+    if not isinstance(classified, dict):
+        return False
+    if not bool(classified.get("needs_live_api")):
+        return False
+    if float(classified.get("confidence") or 0.0) < min_conf:
+        return False
+    live = (classified.get("live_api_kind") or "none").strip().lower()
+    return live == "product_search"
 
 
 def structural_skip_kb_turn_classifier(

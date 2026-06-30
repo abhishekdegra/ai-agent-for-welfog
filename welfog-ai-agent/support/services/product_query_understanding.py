@@ -95,6 +95,15 @@ _FILLER_WORDS = frozenset(
         "color", "colour", "rang", "size", "sizes", "product", "products",
         "girlfriend", "boyfriend", "meri", "mera", "mere", "gf", "bf", "wife", "husband",
         "offtopic", "topic", "kese", "kaise", "ese", "galat", "wrong", "theek", "complaint",
+        "mast", "si", "jayga", "jayega", "jayega", "kyaaa", "kyaa", "mil", "jayegi", "bahi",
+        "keliye", "lene", "lena", "id", "is", "the", "need",
+    }
+)
+
+_LIFESTYLE_BRANDS = frozenset(
+    {
+        "nike", "adidas", "puma", "reebok", "milton", "cello", "borosil", "gucci", "prada",
+        "woodland", "redtape", "bata", "skechers", "fila", "uspolo", "levis", "hrx",
     }
 )
 
@@ -104,6 +113,8 @@ _PHONE_BRANDS = frozenset(
         "oneplus", "poco", "nothing", "google", "motorola", "nokia", "honor", "infinix",
     }
 )
+
+_ALL_KNOWN_BRANDS = _PHONE_BRANDS | _LIFESTYLE_BRANDS
 
 _PRODUCT_NOUNS = (
     "cover", "case", "charger", "cable", "adapter", "protector", "glass", "bumper",
@@ -220,6 +231,14 @@ _PRODUCT_TYPO_MAP = {
     "tshrt": "tshirt",
     "tshert": "tshirt",
     "polo": "polo",
+    "inifinix": "infinix",
+    "infinx": "infinix",
+    "infenix": "infinix",
+    "nobile": "mobile",
+    "moblie": "mobile",
+    "mobil": "mobile",
+    "shoe": "shoes",
+    "shoese": "shoes",
 }
 
 
@@ -312,7 +331,18 @@ def dedupe_search_terms(text: str) -> str:
     return " ".join(words[:8]).strip()
 
 
-def is_noisy_search_query(text: str) -> bool:
+def is_noisy_search_query(text: str, **kwargs) -> bool:
+    """
+    Legacy alias — prefer catalog_title_unusable(..., ai_route=..., entities=...)
+    when brain context is available (entity-aware, no phrase lists).
+    """
+    if kwargs:
+        try:
+            from services.catalog_spec_semantics import catalog_title_unusable
+
+            return catalog_title_unusable(text, **kwargs)
+        except ImportError:
+            pass
     if not text or len(text.strip()) < 2:
         return True
     low = text.lower()
@@ -613,6 +643,7 @@ def understand_product_query(
         if llm and llm.get("action") != "not_shopping" and llm.get("is_shopping", True):
             ai_payload = dict(llm)
             ai_payload["_ai_first"] = True
+            ai_payload["_product_nlu_from_ai"] = True
             ai_payload["is_shopping"] = True
 
             requests = llm.get("product_requests")
@@ -635,6 +666,7 @@ def understand_product_query(
             )
             if ai_payload:
                 ai_payload["_ai_first"] = True
+                ai_payload["_product_nlu_from_ai"] = True
         except Exception:
             ai_payload = None
 
@@ -691,6 +723,8 @@ def display_label_for_product_search(
     original_msg: str = "",
 ) -> str:
     """Clean label for chat replies — always like 'basmati wheat', never 'gehu dikhana wheat'."""
+    if spec.get("pro_id") is not None:
+        return f"Product ID {spec['pro_id']}"
     label = ""
     if llm and llm.get("search_terms"):
         st = str(llm["search_terms"]).strip().lower()
@@ -700,6 +734,8 @@ def display_label_for_product_search(
             )
     if not label:
         label = clean_product_part_label(spec.get("title_query") or "", original_msg)
+    if label and is_noisy_search_query(label, understanding=llm or {}, entities=spec):
+        label = ""
     if (not label or label.lower() in ("products", "product")) and spec.get("brand"):
         tq = clean_product_part_label(spec.get("title_query") or "cover", original_msg)
         label = f"{spec['brand']} {tq}".strip()

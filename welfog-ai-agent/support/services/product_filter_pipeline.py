@@ -157,6 +157,8 @@ def brain_search_query_is_noisy(sq: str) -> bool:
         r"\b(rs|₹|rupee|rupees|inr|budget|price|kam|sasta)\b", low
     ):
         return True
+    if re.search(r"\bdetails\s+of\b", low) and re.search(r"\bid\b", low):
+        return True
     return False
 
 
@@ -216,7 +218,86 @@ def _enrich_brain_entities_structural(
         except ImportError:
             pass
 
+    # Brand / colour / product_name — product NLU LLM only (no keyword brand lists).
+
+    if e.get("rating_min") is None and e.get("rating_max") is None:
+        try:
+            from services.opensearch_products import _extract_rating_bounds_from_text
+
+            rmin, rmax = _extract_rating_bounds_from_text(comb.lower())
+            if rmin is not None:
+                e["rating_min"] = rmin
+            if rmax is not None:
+                e["rating_max"] = rmax
+        except ImportError:
+            pass
+
     return e
+
+
+def _should_merge_session_catalog(
+    understanding: dict | None,
+    ai_route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    try:
+        from services.catalog_spec_semantics import should_merge_session_catalog
+
+        return should_merge_session_catalog(
+            understanding,
+            ai_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+    except ImportError:
+        return bool((ai_route or {}).get("continue_previous_topic"))
+
+
+def merge_session_product_understanding(
+    understanding: dict,
+    *,
+    original_msg: str,
+    msg_en: str = "",
+    ctx=None,
+    ai_route: Optional[dict] = None,
+) -> dict:
+    """Reuse last catalog spec when user sends a thin continuation (not a new product)."""
+    out = dict(understanding or {})
+    if not isinstance(ctx, dict):
+        return out
+    last = dict((ctx.get("data") or {}).get("last_os_spec") or {})
+    if not last:
+        return out
+    route = ai_route if isinstance(ai_route, dict) else {}
+    if not _should_merge_session_catalog(
+        out, route, original_msg=original_msg, msg_en=msg_en
+    ):
+        return out
+    if last.get("title_query") and not (out.get("search_terms") or "").strip():
+        out["search_terms"] = str(last["title_query"]).strip()
+    for src, dst in (
+        ("brand", "brand"),
+        ("color", "color"),
+        ("size", "size"),
+        ("category_id", "category_id"),
+        ("product_type", "product_type"),
+    ):
+        if last.get(src) and not out.get(dst):
+            out[dst] = last[src]
+    for src, dst in (
+        ("purchase_price_min", "min_price"),
+        ("purchase_price_max", "max_price"),
+        ("rating_min", "rating_min"),
+        ("rating_max", "rating_max"),
+    ):
+        if last.get(src) is not None and out.get(dst) is None and out.get(src) is None:
+            out[dst] = last[src]
+    out["_ai_first"] = True
+    out.setdefault("action", "search_products")
+    out["is_shopping"] = True
+    return out
 
 
 def _structural_gap_ai_from_message(
@@ -315,31 +396,34 @@ def _locked_catalog_spec_ready(
     *,
     brain_search_query: str = "",
 ) -> bool:
-    """True when AI already extracted product filters — skip duplicate product NLU LLM."""
+    """True only when product NLU already ran — never skip for bare search_query text."""
     route = ai_route or {}
-    if route.get("_product_catalog_locked"):
-        entities = route.get("_product_entities") or {}
-        if isinstance(entities, dict) and entities:
-            return True
-        locked = dict(locked_understanding or {})
-        if locked.get("pro_id") or locked.get("sku"):
-            return True
-        if (locked.get("search_terms") or "").strip():
-            return True
-        if (route.get("search_query") or brain_search_query or "").strip():
-            return True
     locked = dict(locked_understanding or {})
-    if locked.get("_ai_first") and (
-        locked.get("search_terms")
-        or locked.get("pro_id")
-        or locked.get("sku")
-        or locked.get("brand")
-        or locked.get("color")
-        or locked.get("max_price") is not None
-        or locked.get("min_price") is not None
-        or locked.get("rating_min") is not None
-    ):
+
+    if locked.get("pro_id") or locked.get("sku"):
         return True
+    if route.get("numeric_context") == "product_id":
+        return True
+
+    if locked.get("_product_nlu_from_ai") or route.get("_product_nlu_from_ai"):
+        return True
+
+    if locked.get("_ai_first") and locked.get("_product_nlu_from_ai"):
+        if (
+            locked.get("search_terms")
+            or locked.get("brand")
+            or locked.get("color")
+            or locked.get("pro_id")
+            or locked.get("sku")
+            or locked.get("max_price") is not None
+            or locked.get("min_price") is not None
+            or locked.get("rating_min") is not None
+        ):
+            return True
+
+    if route.get("_needs_product_nlu_llm"):
+        return False
+
     return False
 
 
@@ -383,11 +467,12 @@ def _build_catalog_spec_from_locked_entities(
         pass
 
     if sq and not merge_ai.get("search_terms") and not merge_ai.get("pro_id"):
-        try:
-            if not brain_search_query_is_noisy(sq):
+        if not (ai_route or {}).get("_needs_product_nlu_llm"):
+            try:
+                if not brain_search_query_is_noisy(sq):
+                    merge_ai["search_terms"] = sq
+            except Exception:
                 merge_ai["search_terms"] = sq
-        except Exception:
-            merge_ai["search_terms"] = sq
 
     try:
         merge_ai = apply_understanding_sku_pro_id_fixes(
@@ -399,6 +484,31 @@ def _build_catalog_spec_from_locked_entities(
     merge_ai["_ai_first"] = True
     merge_ai["is_shopping"] = True
     merge_ai.setdefault("action", "search_products")
+    merge_ai = merge_session_product_understanding(
+        merge_ai,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        ctx=ctx,
+        ai_route=ai_route,
+    )
+    try:
+        from services.catalog_spec_semantics import catalog_title_unusable
+
+        st = (merge_ai.get("search_terms") or "").strip()
+        if st and catalog_title_unusable(
+            st,
+            entities=(ai_route or {}).get("_product_entities"),
+            understanding=merge_ai,
+            ai_route=ai_route,
+        ):
+            last_spec = ((ctx or {}).get("data") or {}).get("last_os_spec") or {}
+            last_tq = str(last_spec.get("title_query") or "").strip()
+            if last_tq:
+                merge_ai["search_terms"] = last_tq
+            else:
+                merge_ai.pop("search_terms", None)
+    except ImportError:
+        pass
     spec = build_catalog_search_spec(
         original_msg,
         msg_en,
@@ -494,6 +604,7 @@ def build_catalog_spec_for_product_turn(
             )
             if nlu:
                 nlu["_ai_first"] = True
+                nlu["_product_nlu_from_ai"] = True
         except ImportError:
             spec = {}
     elif skip_nlu:
@@ -1003,6 +1114,12 @@ def log_product_search_pipeline(
     api_params = spec_to_api_params(spec or {})
     filtered_count = len(products) if products is not None else None
     lang_hint = (reply_lang or "").strip() or "auto"
+    try:
+        from services.chat_flow_telemetry import response_time_sec
+
+        resp_s = response_time_sec()
+    except ImportError:
+        resp_s = 0.0
     entities = dict(product_entities or {})
     if not entities and ai_understanding:
         for k in (
@@ -1033,10 +1150,13 @@ def log_product_search_pipeline(
     elif not _os_ok():
         selected_api = "rest_catalog"
     debug_line = (
-        f"[product-search] detected_entities={entities!r} "
-        f"selected_existing_api={selected_api!r} "
-        f"request_payload={api_params!r} filters_sent={flt!r} "
-        f"result_count={filtered_count}"
+        f"[product-search] user_query={original_msg[:120]!r} "
+        f"detected_language={lang_hint} "
+        f"extracted_entities={entities!r} "
+        f"filters={flt!r} "
+        f"opensearch_query={api_params!r} "
+        f"result_count={filtered_count} "
+        f"response_time={resp_s:.2f}s"
     )
     line = (
         f"[product-search] original_query={original_msg[:120]!r} "
@@ -1060,6 +1180,7 @@ def log_product_search_pipeline(
             entities=entities,
             selected_tool=selected_route or selected_api,
             opensearch_query=api_params,
+            total_time_sec=resp_s,
         )
     except ImportError:
         pass

@@ -37,7 +37,7 @@ _KB_REFRESH_LOCK = threading.RLock()
 # Unified semantic thresholds (env-tunable; cosine similarity 0–1)
 KB_SEMANTIC_MIN_SCORE = float(os.getenv("KB_SEMANTIC_MIN_SCORE", "0.22") or "0.22")
 KB_CONTEXT_MIN_SCORE = float(os.getenv("KB_CONTEXT_MIN_SCORE", "0.18") or "0.18")
-KB_DIRECT_MIN_SCORE = float(os.getenv("KB_DIRECT_MIN_SCORE", "0.28") or "0.28")
+KB_DIRECT_MIN_SCORE = float(os.getenv("KB_DIRECT_MIN_SCORE", "0.22") or "0.22")
 KB_STRONG_MATCH_SCORE = float(os.getenv("KB_STRONG_MATCH_SCORE", "0.32") or "0.32")
 KB_ANSWER_MIN_CONFIDENCE = float(os.getenv("KB_ANSWER_MIN_CONFIDENCE", "0.26") or "0.26")
 KB_RETRIEVAL_STRONG_SCORE = float(os.getenv("KB_RETRIEVAL_STRONG_SCORE", "0.38") or "0.38")
@@ -46,6 +46,18 @@ KB_RETRIEVAL_STRONG_SCORE = float(os.getenv("KB_RETRIEVAL_STRONG_SCORE", "0.38")
 def get_kb_vector_status() -> str:
     """Debug: last index rebuild / embedding state."""
     return _KB_VECTOR_STATUS
+
+
+def get_knowledge_version() -> str:
+    """MD5 snapshot id — changes when admin updates knowledge files."""
+    global _KB_SNAPSHOT
+    if not _KB_SNAPSHOT:
+        try:
+            ensure_knowledge_cache_fresh()
+        except Exception:
+            pass
+    snap = (_KB_SNAPSHOT or "").strip()
+    return snap[:48] if snap else "unknown"
 
 
 def _plain_chunk_for_embed(chunk: str) -> str:
@@ -229,6 +241,28 @@ def _looks_like_faq_question_line(line: str) -> bool:
     return False
 
 
+def _chunk_is_agent_instruction_blob(chunk: str) -> bool:
+    """Admin/routing instructions in KB files — never show to customers."""
+    plain = re.sub(r"<br\s*/?>", "\n", chunk or "")
+    low = plain.lower()
+    if "support rules" in low or "social media links — support rules" in low:
+        return True
+    if re.search(
+        r"\bnever invent\b|\bonly share welfog\b|\bpolitely decline\b|\brouting rule\b",
+        low,
+    ):
+        return True
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+    agent_bullets = sum(
+        1
+        for ln in lines
+        if re.match(r"^-\s+if user", ln, re.I) or re.match(r"^-\s+follow-up", ln, re.I)
+    )
+    if agent_bullets >= 2:
+        return True
+    return False
+
+
 def _looks_like_kb_metadata_label(line: str) -> bool:
     """SEO-style KB labels (e.g. support.txt keyword headings) — not customer-facing prose."""
     s = (line or "").strip().lower()
@@ -357,7 +391,11 @@ def load_knowledge_index(runtime_files=None, *, build_vectors: bool = True):
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
 
-            chunks = _split_kb_chunks(content, file_key=k)
+            chunks = [
+                c
+                for c in _split_kb_chunks(content, file_key=k)
+                if not _chunk_is_agent_instruction_blob(c)
+            ]
             chunks_by_key[k] = chunks
             if chunks:
                 if build_vectors and not embeddings_disabled():
@@ -471,15 +509,85 @@ def refresh_knowledge_cache(*, build_vectors: bool = True):
         except Exception:
             pass
 
+_KB_VECTORS_STALE = False
+
+
 def ensure_knowledge_cache_fresh():
-    """Reload KB text + embeddings when admin/files change — chat always uses latest index."""
-    global _KB_SNAPSHOT, _kb_vectors_built
+    """
+    Reload KB text immediately when admin/files change (deleted chunks vanish at once).
+    Rebuild embeddings asynchronously — never block /chat on full encode.
+    """
+    global _KB_SNAPSHOT, _kb_vectors_built, _KB_VECTORS_STALE
     runtime_files = get_runtime_knowledge_files()
     latest_snapshot = _compute_kb_snapshot(runtime_files)
-    if latest_snapshot != _KB_SNAPSHOT:
-        log_reasoning("[kb-vector] knowledge snapshot changed — rebuilding index")
-        refresh_knowledge_cache(build_vectors=True)
+    if latest_snapshot == _KB_SNAPSHOT:
+        return
+    log_reasoning(
+        "[kb-vector] knowledge snapshot changed — text reload now, vectors async"
+    )
+    acquired = _KB_REFRESH_LOCK.acquire(timeout=2.0)
+    if not acquired:
+        log_reasoning("[kb-vector] text reload skipped — refresh lock busy")
+        _KB_VECTORS_STALE = True
+        return
+    try:
+        refresh_knowledge_cache(build_vectors=False)
+    finally:
+        _KB_REFRESH_LOCK.release()
+    _KB_VECTORS_STALE = True
+    try:
         _cache.clear()
+    except Exception:
+        pass
+    _schedule_kb_vector_rebuild_async()
+
+
+_KB_REFRESH_SCHEDULED = False
+
+
+def _schedule_kb_vector_rebuild_async() -> None:
+    """Background embedding rebuild after admin KB file add/update/delete."""
+    global _KB_REFRESH_SCHEDULED, _KB_VECTORS_STALE
+    if _KB_REFRESH_SCHEDULED or not _KB_VECTORS_STALE:
+        return
+    _KB_REFRESH_SCHEDULED = True
+    log_reasoning("[kb-vector] async vector rebuild scheduled")
+
+    def _bg_refresh():
+        global _KB_REFRESH_SCHEDULED, _KB_VECTORS_STALE
+        try:
+            with _KB_REFRESH_LOCK:
+                refresh_knowledge_cache(build_vectors=True)
+            _KB_VECTORS_STALE = False
+            try:
+                _cache.clear()
+            except Exception:
+                pass
+            log_reasoning("[kb-vector] async vector rebuild complete")
+        except Exception as exc:
+            log_reasoning(f"[kb-vector] async vector rebuild failed: {exc}")
+        finally:
+            _KB_REFRESH_SCHEDULED = False
+
+    try:
+        import threading
+
+        threading.Thread(
+            target=_bg_refresh, daemon=True, name="kb-vector-rebuild"
+        ).start()
+    except Exception:
+        _KB_REFRESH_SCHEDULED = False
+        try:
+            with _KB_REFRESH_LOCK:
+                refresh_knowledge_cache(build_vectors=True)
+            _KB_VECTORS_STALE = False
+        except Exception as exc:
+            log_reasoning(f"[kb-vector] sync vector rebuild fallback failed: {exc}")
+
+
+def _schedule_kb_refresh_if_stale() -> None:
+    """Non-blocking KB sync — text index first, vectors in background."""
+    ensure_knowledge_cache_fresh()
 
 
 _SYSTEM_MESSAGES = {}
@@ -501,6 +609,90 @@ INTERNAL_KB_KEYS = {
 
 def get_customer_kb_keys():
     return [k for k in get_runtime_knowledge_files().keys() if not _is_internal_kb_key(k)]
+
+
+def build_kb_catalog_for_brain_prompt(*, max_files: int = 32, blurb_chars: int = 140) -> str:
+    """
+    Auto-built catalog of admin knowledge files for the routing LLM.
+    Any .txt added/updated via admin panel appears here — no code change for new topics.
+    """
+    _schedule_kb_refresh_if_stale()
+    lines: list[str] = []
+    for k in get_customer_kb_keys()[:max_files]:
+        blurb = ""
+        for chunk in (kb_chunks_by_key.get(k) or [])[:2]:
+            plain = _plain_chunk_for_embed(chunk).strip()
+            if plain:
+                blurb = re.sub(r"\s+", " ", plain)[:blurb_chars]
+                break
+        if not blurb:
+            path = get_runtime_knowledge_files().get(k)
+            if path and os.path.isfile(path):
+                try:
+                    with open(path, "r", encoding="utf-8") as f:
+                        blurb = re.sub(r"\s+", " ", f.read().strip())[:blurb_chars]
+                except OSError:
+                    blurb = ""
+        lines.append(f'  "{k}": {blurb or "(admin knowledge — read file at answer time)"}')
+    return "\n".join(lines)
+
+
+def resolve_brain_kb_keys(
+    route: dict | None,
+    original_msg: str = "",
+    msg_en: str = "",
+    *,
+    max_files: int = 4,
+    conversation_context: str = "",
+) -> list[str]:
+    """
+    Pick admin KB files: validate brain kb_keys, else semantic search across all customer .txt files.
+    Works for any language — admin panel CRUD on knowledge needs no deploy.
+    """
+    ensure_knowledge_cache_fresh()
+    route = route or {}
+    customer = set(get_customer_kb_keys())
+    brain_keys = [
+        k
+        for k in (route.get("kb_keys") or [])
+        if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS and k in customer
+    ]
+    if brain_keys:
+        return list(dict.fromkeys(brain_keys))[:max_files]
+
+    intent = (route.get("intent") or "").strip().lower()
+    _intent_files = {
+        "payment": ["payment"],
+        "refund": ["refund"],
+        "general": ["company"],
+        "seller": ["company", "faqs"],
+    }
+    intent_keys = [
+        k
+        for k in _intent_files.get(intent, [])
+        if k not in INTERNAL_KB_KEYS and k in customer
+    ]
+    if not intent_keys:
+        files_map = get_runtime_knowledge_files()
+        intent_keys = [
+            k
+            for k in _intent_files.get(intent, [])
+            if k in files_map and k not in INTERNAL_KB_KEYS
+        ]
+    if intent_keys:
+        return list(dict.fromkeys(intent_keys))[:max_files]
+
+    keys = resolve_kb_keys_for_question(
+        original_msg or (route.get("user_meaning") or ""),
+        msg_en or (route.get("user_meaning") or ""),
+        suggested_keys=None,
+        max_files=max_files,
+        conversation_context=conversation_context,
+        ai_route=route,
+    )
+    if keys:
+        return keys[:max_files]
+    return list(customer)[: min(3, max_files)]
 
 
 def get_support_contact_kb_keys():
@@ -1183,6 +1375,99 @@ def log_kb_retrieval(
     chat_log(msg)
 
 
+def log_kb_pipeline_complete(
+    *,
+    query: str = "",
+    language: str = "",
+    intent: str = "",
+    route: str = "",
+    retrieved_chunks: int = 0,
+    similarity_score: float = 0.0,
+    response_time_ms: float = 0.0,
+    source: str = "",
+) -> None:
+    """Structured KB pipeline metrics — query, retrieval, route, latency."""
+    from utils.reasoning_log import chat_log
+
+    msg = (
+        f"[kb-pipeline] query={(query or '-')[:120]!r} "
+        f"language={language or '-'} intent={intent or '-'} "
+        f"route={route or '-'} retrieved_chunks={retrieved_chunks} "
+        f"similarity_score={similarity_score:.3f} "
+        f"response_time_ms={response_time_ms:.0f} source={source or '-'}"
+    )
+    log_reasoning(msg)
+    chat_log(msg)
+
+
+def format_direct_reply_from_kb_hit(
+    hit: dict,
+    original_msg: str,
+    *,
+    reply_lang: str = "",
+    retrieval_query: str = "",
+    fast_lane: bool = False,
+) -> str:
+    """
+    Answer from one retrieved KB chunk — no answer-rewrite LLM.
+    Translates to customer language when needed.
+    """
+    if not isinstance(hit, dict):
+        return ""
+    chunk = (hit.get("chunk") or "").strip()
+    if not chunk:
+        return ""
+    from services.translation_service import customer_reply_language
+
+    rl = reply_lang or customer_reply_language(original_msg)
+    score = float(hit.get("score") or 0)
+    src = str(hit.get("source") or "general")
+    if not fast_lane:
+        log_kb_retrieval(
+            query_intent=src,
+            retrieval_query=_normalize_retrieval_query(retrieval_query or original_msg),
+            matched_file=src,
+            selected_category=src,
+            similarity_score=score,
+            selected_chunks=[hit],
+        )
+    excerpt = _kb_plain_excerpt(
+        _faq_answer_text_from_chunk(re.sub(r"<br\s*/?>", "\n", chunk)),
+        max_chars=_infer_kb_answer_budget(retrieval_query or original_msg)[0],
+    )
+    if not excerpt.strip():
+        return ""
+    body = _plain_text_to_html_body(excerpt)
+    if not body:
+        return ""
+    if fast_lane:
+        body = polish_faq_reply_for_customer(body, original_msg)
+        from services.translation_service import finalize_customer_reply, is_hinglish_message
+
+        if rl in ("en", "hinglish") or is_hinglish_message(original_msg):
+            return body
+        plain = re.sub(r"<[^>]+>", " ", body)
+        plain = re.sub(r"\s+", " ", plain).strip()
+        if len(plain) > 520:
+            plain = plain[:517].rsplit(" ", 1)[0] + "..."
+            body = _plain_text_to_html_body(plain) or plain
+        return finalize_customer_reply(body, original_msg, rl)
+    body = polish_faq_reply_for_customer(body, original_msg)
+    return _finalize_kb_customer_reply(body, original_msg, rl)
+
+
+def format_kb_no_information_reply(original_msg: str, *, reply_lang: str = "") -> str:
+    """Honest fallback when KB has no matching chunk."""
+    from services.translation_service import customer_reply_language, finalize_customer_reply
+
+    rl = reply_lang or customer_reply_language(original_msg)
+    en = (
+        "I couldn't find this in Welfog's current knowledge base. "
+        "Please contact customer support if you need more help."
+    )
+    return finalize_customer_reply(en, original_msg, rl)
+
+
 def _keyword_hit_as_semantic(kw: dict | None) -> dict | None:
     """Map keyword fallback hit-count to a 0–1 pseudo score (never mix raw counts with cosine)."""
     if not kw:
@@ -1227,6 +1512,28 @@ def _scoped_kb_index(keys: list[str] | None, *, customer_only: bool = True):
     return scoped_chunks, scoped_vectors, scoped_sources
 
 
+def _cached_encode_query(q: str):
+    """Per-turn query embedding cache — avoids repeated encode under /chat deadline."""
+    try:
+        from services.chat_flow_telemetry import _TLS
+
+        if getattr(_TLS, "kb_query_embed_key", None) == q:
+            cached = getattr(_TLS, "kb_query_embed_vec", None)
+            if cached is not None:
+                return cached
+    except ImportError:
+        pass
+    qv = encode_texts([q])
+    try:
+        from services.chat_flow_telemetry import _TLS
+
+        _TLS.kb_query_embed_key = q
+        _TLS.kb_query_embed_vec = qv
+    except ImportError:
+        pass
+    return qv
+
+
 def semantic_kb_search(
     query: str,
     *,
@@ -1254,7 +1561,7 @@ def semantic_kb_search(
     out: list[dict] = []
 
     if _embeddings_ready() and scoped_vectors is not None and len(scoped_vectors) > 0:
-        query_vec = encode_texts([q])
+        query_vec = _cached_encode_query(q)
         if query_vec is not None:
             scores = cosine_similarity(query_vec, scoped_vectors)[0]
             indexed = [
@@ -1275,9 +1582,11 @@ def semantic_kb_search(
                 if len(out) >= top_n:
                     break
 
-    if not out and embeddings_disabled():
+    if not out:
         kw = keyword_kb_hit(
-            q, keys=keys or (get_customer_kb_keys() if customer_only else None), min_hits=2
+            q,
+            keys=keys or (get_customer_kb_keys() if customer_only else None),
+            min_hits=2,
         )
         hit = _keyword_hit_as_semantic(kw)
         if hit and float(hit.get("score") or 0) >= floor:
@@ -1303,6 +1612,7 @@ def retrieve_best_kb_chunk(
     keys: list[str] | None = None,
     ai_route: dict | None = None,
     min_score: float | None = None,
+    conflict_check: bool = True,
 ) -> dict | None:
     """Semantic search + rerank; None when confidence is below answer threshold."""
     floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
@@ -1311,7 +1621,11 @@ def retrieve_best_kb_chunk(
         query, keys=keys, top_n=8, min_score=search_floor, log_retrieval=False
     )
     return _pick_best_kb_hit_for_query(
-        query, hits, ai_route=ai_route, min_rerank_score=floor
+        query,
+        hits,
+        ai_route=ai_route,
+        min_rerank_score=floor,
+        conflict_check=conflict_check,
     )
 
 
@@ -1421,40 +1735,48 @@ def resolve_kb_keys_for_question(
         pass
 
     ranked: list[tuple[float, str]] = []
-    search_keys = scoped_keys if scoped_keys else customer_keys
+    search_keys = [k for k in (scoped_keys if scoped_keys else customer_keys) if k in customer_keys]
     file_rank_floor = min(0.12, KB_CONTEXT_MIN_SCORE)
     cat_l = (category or "general").strip().lower()
     effective_cat = cat_l
-    for k in search_keys:
-        if k not in customer_keys:
-            continue
-        hit = best_kb_hit(query, keys=[k], min_score=file_rank_floor)
-        if hit:
-            score = float(hit.get("score") or 0)
-            kl = k.lower()
-            if effective_cat not in ("", "general"):
-                if kl == effective_cat or effective_cat in kl:
-                    score += 0.1
-                elif effective_cat in ("refund", "return") and "refund" in kl:
-                    score += 0.08
-                elif effective_cat == "payment" and "payment" in kl:
-                    score += 0.08
-                elif effective_cat == "shipping" and "shipping" in kl:
-                    score += 0.08
-                elif effective_cat == "seller" and "seller" in kl:
-                    score += 0.08
-            ranked.append((score, k))
+    best_per_key: dict[str, float] = {}
+    if search_keys:
+        hits = semantic_kb_search(
+            query,
+            keys=search_keys,
+            top_n=min(32, max(len(search_keys) * 4, max_files * 6)),
+            min_score=file_rank_floor,
+            customer_only=False,
+            log_retrieval=False,
+        )
+        for h in hits:
+            src = str(h.get("source") or "")
+            sc = float(h.get("score") or 0)
+            if src in search_keys and sc >= file_rank_floor:
+                best_per_key[src] = max(best_per_key.get(src, 0.0), sc)
+    for k, score in best_per_key.items():
+        kl = k.lower()
+        if effective_cat not in ("", "general"):
+            if kl == effective_cat or effective_cat in kl:
+                score += 0.1
+            elif effective_cat in ("refund", "return") and "refund" in kl:
+                score += 0.08
+            elif effective_cat == "payment" and "payment" in kl:
+                score += 0.08
+            elif effective_cat == "shipping" and "shipping" in kl:
+                score += 0.08
+            elif effective_cat == "seller" and "seller" in kl:
+                score += 0.08
+        ranked.append((score, k))
     ranked.sort(key=lambda x: x[0], reverse=True)
     keys_from_embed = [k for _, k in ranked[:max_files]]
     if effective_cat not in ("", "general"):
         prim = next((k for k in customer_keys if k == effective_cat), "")
         if not prim:
             prim = next((k for k in customer_keys if effective_cat in k), "")
-        if prim:
-            prim_hit = best_kb_hit(query, keys=[prim], min_score=file_rank_floor)
-            if prim_hit and float(prim_hit.get("score") or 0) >= file_rank_floor:
-                keys_from_embed = [prim] + [k for k in keys_from_embed if k != prim]
-                keys_from_embed = keys_from_embed[:max_files]
+        if prim and best_per_key.get(prim, 0.0) >= file_rank_floor:
+            keys_from_embed = [prim] + [k for k in keys_from_embed if k != prim]
+            keys_from_embed = keys_from_embed[:max_files]
 
     if keys_from_embed:
         try:
@@ -1873,6 +2195,39 @@ def resolve_best_faq_chunk_for_question(
     return None
 
 
+def _format_kb_brain_gap_reply(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    reply_lang: str = "",
+) -> str:
+    """Polite KB miss — same language as customer; no invented facts."""
+    from services.translation_service import customer_reply_language, finalize_customer_reply
+
+    rl = reply_lang or customer_reply_language(original_msg)
+    try:
+        from services.ai_service import ai_brain_answer
+
+        ai = ai_brain_answer(
+            original_msg,
+            (
+                "Welfog support knowledge base has no specific answer for this question. "
+                "Reply in the customer's language/script in 1-2 short sentences: politely say "
+                "you do not have that detail right now, and invite Welfog shopping, orders, "
+                "delivery, or payment help. Do not invent policy or fees."
+            ),
+            conversation_context="",
+            reply_lang=rl,
+        )
+        resp = (ai.get("response") or "").strip() if ai else ""
+        if resp and not _ai_response_looks_like_placeholder(resp):
+            body = _plain_text_to_html_body(resp) or resp
+            return finalize_customer_reply(body, original_msg or msg_en, rl)
+    except Exception:
+        pass
+    return ""
+
+
 def format_kb_answer_from_brain_keys(
     original_msg: str,
     msg_en: str,
@@ -1881,6 +2236,8 @@ def format_kb_answer_from_brain_keys(
     reply_lang: str = "",
     conversation_context: str = "",
     title_hint: str = "",
+    user_meaning_en: str = "",
+    ai_route: dict | None = None,
 ) -> str:
     """
     Fast KB path: read only named admin files, filter to the question, reply — no FAQ vector scan, no LLM.
@@ -1898,6 +2255,7 @@ def format_kb_answer_from_brain_keys(
     if not combined or not keys:
         return ""
 
+
     lang = _normalize_language(reply_lang or customer_reply_language(original_msg))
     if lang == "hinglish" or is_hinglish_message(original_msg):
         lang = "hinglish"
@@ -1907,14 +2265,72 @@ def format_kb_answer_from_brain_keys(
         if cc:
             return cc
 
+    try:
+        from utils.helpers import (
+            _text_mentions_social_platform,
+            _text_mentions_welfog_brand,
+            message_asks_welfog_social_media,
+        )
+
+        if message_asks_welfog_social_media(
+            combined, conversation_context=conversation_context
+        ) or (
+            _text_mentions_social_platform(combined.lower())
+            and _text_mentions_welfog_brand(combined.lower())
+        ):
+            social = format_welfog_social_media_reply_from_kb(
+                original_msg,
+                msg_en,
+                reply_lang=lang,
+                conversation_context=conversation_context,
+                ai_confirmed=True,
+            )
+            if social:
+                return social
+    except ImportError:
+        pass
+
     valid = [k for k in keys if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS][:3]
+    if not valid and keys:
+        files_map = get_runtime_knowledge_files()
+        valid = [
+            k for k in keys if k in files_map and k not in INTERNAL_KB_KEYS
+        ][:3]
     if not valid:
         return ""
 
     budget = _infer_kb_answer_budget(combined)[0]
     filtered = ""
+    brain_locked_keys = bool(keys)
+    filter_q = (
+        (user_meaning_en or "").strip()
+        or ((ai_route or {}).get("user_meaning") or "").strip()
+        or (msg_en or "").strip()
+        or (original_msg or "").strip()
+    )
 
-    if "faqs" in valid:
+    # Brain-locked files — filter to the question; never dump whole admin file.
+    if valid:
+        live_raw = read_concatenated_kb_file_contents(valid)
+        if live_raw:
+            blob = re.sub(r"<br\s*/?>", "\n", live_raw)
+            filtered = _filter_kb_blob_for_question(blob, filter_q, max_chars=budget)
+            if not filtered.strip():
+                filtered = _kb_plain_excerpt(
+                    _faq_answer_text_from_chunk(blob), max_chars=budget
+                )
+
+    if not filtered.strip() and not brain_locked_keys:
+        best = retrieve_best_kb_chunk(
+            combined, keys=valid, min_score=KB_ANSWER_MIN_CONFIDENCE
+        )
+        if best and best.get("chunk"):
+            filtered = _faq_answer_text_from_chunk(
+                re.sub(r"<br\s*/?>", "\n", best.get("chunk") or "")
+            )
+            filtered = _kb_plain_excerpt(filtered, max_chars=budget)
+
+    if not filtered.strip() and len(valid) == 1 and not brain_locked_keys:
         faq_hit = resolve_best_faq_chunk_for_question(
             original_msg, msg_en, conversation_context
         )
@@ -1925,17 +2341,21 @@ def format_kb_answer_from_brain_keys(
             filtered = _kb_plain_excerpt(filtered, max_chars=budget)
 
     if not filtered.strip():
-        best = retrieve_best_kb_chunk(
-            combined, keys=valid, min_score=KB_ANSWER_MIN_CONFIDENCE
-        )
-        if best and best.get("chunk"):
-            filtered = _faq_answer_text_from_chunk(
-                re.sub(r"<br\s*/?>", "\n", best.get("chunk") or "")
-            )
-            filtered = _kb_plain_excerpt(filtered, max_chars=budget)
-
-    if not filtered.strip():
+        gap = _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang)
+        if gap:
+            return gap
         return ""
+
+    if filtered.strip():
+        grounded = _ground_kb_excerpt_for_customer(
+            original_msg,
+            filtered,
+            conversation_context=conversation_context,
+            reply_lang=reply_lang or lang,
+            kb_sources=valid,
+        )
+        if grounded:
+            return grounded
 
     filtered = polish_faq_reply_for_customer(
         _strip_leading_faq_question(filtered), original_msg
@@ -2455,23 +2875,23 @@ def format_customer_care_reply_from_kb(original_msg: str, msg_en: str) -> str:
     if phones and channel in ("phone_only", "both", "unspecified"):
         if hinglish:
             lines.append(
-                "Official customer-care number (hamari knowledge file se): "
+                "Official customer-care number: "
                 + ", ".join(f"<b>{p}</b>" for p in phones)
             )
         else:
             lines.append(
-                "Official customer-care number (from our current knowledge article): "
+                "Official customer-care number: "
                 + ", ".join(f"<b>{p}</b>" for p in phones)
             )
     if emails and channel in ("email_only", "both", "unspecified"):
         if hinglish:
             lines.append(
-                "Support email (hamari knowledge file se): "
+                "Support email: "
                 + ", ".join(f"<b>{e}</b>" for e in emails)
             )
         else:
             lines.append(
-                "Support email (from our current knowledge article): "
+                "Support email: "
                 + ", ".join(f"<b>{e}</b>" for e in emails)
             )
 
@@ -2828,7 +3248,7 @@ def _social_platforms_requested(
                 out.append(slug)
 
     if (
-        re.search(r"\binsta(?:gram|grm|gr?am)?\b", tl)
+        re.search(r"\b(?:i?n?stagram|insta(?:gram|grm|gr?am)?)\b", tl)
         or re.search(r"\binstr?gr?am\b", tl)
         or " insta " in tl
         or re.search(r"\binsta\b", tl)
@@ -2899,9 +3319,11 @@ def format_welfog_social_media_reply_from_kb(
     msg_en: str,
     reply_lang: str = "",
     conversation_context: str = "",
+    *,
+    user_meaning_en: str = "",
+    ai_confirmed: bool = False,
 ) -> str:
     """Official Welfog social URLs from company knowledge."""
-    from utils.helpers import message_asks_welfog_social_media
     from services.translation_service import (
         _normalize_language,
         customer_reply_language,
@@ -2909,13 +3331,20 @@ def format_welfog_social_media_reply_from_kb(
     )
 
     combined = f"{original_msg} {msg_en}"
-    from utils.helpers import _is_welfog_social_followup
 
-    if not (
-        message_asks_welfog_social_media(combined, conversation_context=conversation_context)
-        or _is_welfog_social_followup(combined, conversation_context)
-    ):
-        return ""
+    if not ai_confirmed:
+        from utils.helpers import (
+            _is_welfog_social_followup,
+            message_asks_welfog_social_media,
+        )
+
+        if not (
+            message_asks_welfog_social_media(
+                combined, conversation_context=conversation_context
+            )
+            or _is_welfog_social_followup(combined, conversation_context)
+        ):
+            return ""
 
     lang = _normalize_language(reply_lang or customer_reply_language(original_msg))
     all_entries = get_welfog_social_links_from_kb()
@@ -2943,7 +3372,7 @@ def format_welfog_social_media_reply_from_kb(
     def _pick_slugs(keys: list[str]) -> list[str]:
         return [k for k in keys if k in all_links]
 
-    turn = (combined or "").strip()
+    turn = f"{user_meaning_en or ''} {combined}".strip()
     requested = _social_platforms_requested(turn, known_links=all_links)
     wants_all = _wants_all_welfog_social_links(turn)
 
@@ -3000,24 +3429,24 @@ def format_welfog_social_media_reply_from_kb(
         if lang == "hinglish" or is_hinglish_message(original_msg):
             intro = (
                 f"<div style='color:#333;line-height:1.55;margin-bottom:10px;'>"
-                f"<b>Welfog {html_escape(only)}</b> (hamari knowledge file se):</div>"
+                f"<b>Welfog {html_escape(only)}</b>:</div>"
             )
         else:
             intro = (
                 f"<div style='color:#333;line-height:1.55;margin-bottom:10px;'>"
-                f"<b>Official Welfog {html_escape(only)}</b> (from our knowledge base):</div>"
+                f"<b>Official Welfog {html_escape(only)}</b>:</div>"
             )
     elif lang == "hinglish" or is_hinglish_message(original_msg):
         intro = (
             sysmsg("welfog_social_links_intro_hinglish")
             or "<div style='color:#333;line-height:1.55;margin-bottom:10px;'>"
-            "<b>Welfog ke official social media links</b> (hamari knowledge file se):</div>"
+            "<b>Welfog ke official social media links</b>:</div>"
         )
     else:
         intro = (
             sysmsg("welfog_social_links_intro")
             or "<div style='color:#333;line-height:1.55;margin-bottom:10px;'>"
-            "<b>Official Welfog social media</b> (from our knowledge base):</div>"
+            "<b>Official Welfog social media</b>:</div>"
         )
     return f"{intro}<div style='margin-top:8px;'>{''.join(parts)}</div>"
 
@@ -3059,7 +3488,8 @@ def _strip_kb_blob_for_display(blob: str) -> str:
     drop_line = re.compile(
         r"^\s*[A-Z]\)\s+.*$|^\s*→\s*action\s+.*$|"
         r"^\s*action\s*:\s*(ask_order_id|track_live|check_pin).*$|"
-        r"EXAMPLES FOR GROQ|wants status but NO id|playbook|specialist",
+        r"EXAMPLES FOR GROQ|wants status but NO id|playbook|specialist|"
+        r"support rules|never invent|only share welfog|politely decline",
         re.I | re.M,
     )
     lines = [ln for ln in cleaned.splitlines() if not drop_line.match(ln.strip())]
@@ -3376,6 +3806,7 @@ def best_kb_hit(query, keys=None, min_score=None):
     """
     Returns the best matching KB chunk (raw HTML chunk) with its score and source.
     Use this to prefer KB-first answers without hardcoding filenames.
+    Skips agent-only instruction chunks (e.g. company.txt support rules).
     """
     if not (query or "").strip() or not all_chunks:
         return None
@@ -3383,12 +3814,17 @@ def best_kb_hit(query, keys=None, min_score=None):
     hits = semantic_kb_search(
         query,
         keys=keys,
-        top_n=1,
+        top_n=8,
         min_score=floor,
         customer_only=not bool(keys),
         log_retrieval=False,
     )
-    return hits[0] if hits else None
+    for hit in hits:
+        chunk = hit.get("chunk") or ""
+        if _chunk_is_agent_instruction_blob(chunk):
+            continue
+        return hit
+    return None
 
 
 def top_kb_hits(
@@ -3473,7 +3909,32 @@ def keyword_kb_hit(query: str, keys=None, min_hits: int = 2):
     return None
 
 
-def direct_kb_search(query, keys=None, min_score=None):
+def direct_kb_search(query, keys=None, min_score=None, *, zero_llm_fast: bool = False):
+    if not all_chunks:
+        return None
+    floor = float(min_score if min_score is not None else KB_DIRECT_MIN_SCORE)
+
+    if zero_llm_fast:
+        try:
+            from utils.helpers import _text_asks_customer_care_contact
+
+            qcomb = (query or "").strip()
+            if _text_asks_customer_care_contact(qcomb):
+                cc = format_customer_care_reply_from_kb(qcomb, "")
+                if cc:
+                    return cc
+        except ImportError:
+            pass
+        hit = best_kb_hit(query, keys=keys, min_score=floor)
+        if not hit or float(hit.get("score") or 0) < floor:
+            return None
+        body = format_direct_reply_from_kb_hit(
+            hit,
+            query,
+            retrieval_query=query,
+        )
+        return body if body else None
+
     try:
         from services.query_intent_classifier import query_intent_allows_kb
 
@@ -3481,9 +3942,6 @@ def direct_kb_search(query, keys=None, min_score=None):
             return None
     except ImportError:
         pass
-    if not all_chunks:
-        return None
-    floor = float(min_score if min_score is not None else KB_DIRECT_MIN_SCORE)
     try:
         from utils.helpers import (
             _text_asks_customer_care_contact,
@@ -3505,12 +3963,7 @@ def direct_kb_search(query, keys=None, min_score=None):
     if not hit or float(hit.get("score") or 0) < floor:
         return None
 
-    try:
-        from services.query_understanding import infer_kb_query_category
-
-        category = infer_kb_query_category(query, "")
-    except ImportError:
-        category = "general"
+    category = str(hit.get("source") or "general")
 
     log_kb_retrieval(
         query_intent=category,
@@ -3531,6 +3984,8 @@ def direct_kb_search(query, keys=None, min_score=None):
     body = _plain_text_to_html_body(excerpt)
     if not body:
         return None
+    if zero_llm_fast:
+        return body
     body = polish_faq_reply_for_customer(body, query)
     try:
         from services.translation_service import customer_reply_language

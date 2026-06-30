@@ -9,33 +9,24 @@ from __future__ import annotations
 import os
 import threading
 import time
+import uuid
 from typing import Any, Callable, Optional
 
 from utils.reasoning_log import chat_log, log_reasoning
 
 CHAT_MAX_SECONDS = float(os.getenv("CHAT_MAX_SECONDS") or "70")
 CHAT_IN_FLIGHT_STALE_SEC = float(
-    os.getenv("CHAT_IN_FLIGHT_STALE_SEC")
-    or str(max(45.0, CHAT_MAX_SECONDS + 10.0))
+    os.getenv("CHAT_IN_FLIGHT_STALE_SEC") or "1"
 )
 CHAT_IN_FLIGHT_MAX_SEC = float(
     os.getenv("CHAT_IN_FLIGHT_MAX_SEC")
-    or str(max(CHAT_IN_FLIGHT_STALE_SEC, CHAT_MAX_SECONDS + 15.0))
+    or str(max(CHAT_IN_FLIGHT_STALE_SEC + 5.0, min(CHAT_MAX_SECONDS + 5.0, 45.0)))
 )
 _LLM_FAILURE = threading.local()
-_CHAT_LOCKS: dict[str, threading.Lock] = {}
 _CHAT_LOCKS_GUARD = threading.Lock()
 _CHAT_IN_FLIGHT: set[str] = set()
 _CHAT_IN_FLIGHT_AT: dict[str, float] = {}
-
-
-def _chat_turn_lock(chat_id: str) -> threading.Lock:
-    key = (chat_id or "").strip()
-    with _CHAT_LOCKS_GUARD:
-        if key not in _CHAT_LOCKS:
-            _CHAT_LOCKS[key] = threading.Lock()
-        return _CHAT_LOCKS[key]
-
+_CHAT_IN_FLIGHT_TOKEN: dict[str, str] = {}
 
 _USER_IN_FLIGHT: set[str] = set()
 _USER_IN_FLIGHT_AT: dict[str, float] = {}
@@ -61,6 +52,7 @@ def _force_clear_in_flight(
     age = _in_flight_age(key, bucket, times)
     bucket.discard(key)
     times.pop(key, None)
+    _CHAT_IN_FLIGHT_TOKEN.pop(key, None)
     log_reasoning(f"In-flight force-cleared ({age:.1f}s) — {reason}")
     return True
 
@@ -83,11 +75,14 @@ def touch_chat_turn_in_flight() -> None:
         return
     uid = (getattr(_TURN_ACQUIRED, "user_id", "") or "").strip()
     key = (getattr(_TURN_ACQUIRED, "chat_id", "") or "").strip()
+    token = (getattr(_TURN_ACQUIRED, "turn_token", "") or "").strip()
     if not uid and not key:
         return
     now = time.monotonic()
     with _CHAT_LOCKS_GUARD:
         if key and key in _CHAT_IN_FLIGHT:
+            if _CHAT_IN_FLIGHT_TOKEN.get(key) != token:
+                return
             age = _in_flight_age(key, _CHAT_IN_FLIGHT, _CHAT_IN_FLIGHT_AT)
             if age >= CHAT_IN_FLIGHT_MAX_SEC:
                 return
@@ -100,17 +95,19 @@ def touch_chat_turn_in_flight() -> None:
 
 
 def force_end_stuck_chat_turn(chat_id: str = "", user_id: str = "") -> None:
-    """Release locks after deadline/timeout so customer can send a fresh question."""
+    """Release in-flight markers after deadline/timeout so customer can send again."""
     key = (chat_id or "").strip()
     uid = str(user_id or "").strip()
+    token = (getattr(_TURN_ACQUIRED, "turn_token", "") or "").strip()
     with _CHAT_LOCKS_GUARD:
         if key:
-            _force_clear_in_flight(
-                key,
-                _CHAT_IN_FLIGHT,
-                _CHAT_IN_FLIGHT_AT,
-                reason="handler ended or deadline",
-            )
+            if not token or _CHAT_IN_FLIGHT_TOKEN.get(key) == token:
+                _force_clear_in_flight(
+                    key,
+                    _CHAT_IN_FLIGHT,
+                    _CHAT_IN_FLIGHT_AT,
+                    reason="handler ended or deadline",
+                )
         if uid:
             _force_clear_in_flight(
                 uid,
@@ -120,59 +117,82 @@ def force_end_stuck_chat_turn(chat_id: str = "", user_id: str = "") -> None:
             )
 
 
-def try_begin_chat_turn(chat_id: str, user_id: str = "") -> bool:
-    """One in-flight /chat per chat_id and per user_id — avoids parallel LLM pile-up."""
-    key = (chat_id or "").strip()
+def force_end_all_user_chat_turns(user_id: str = "") -> None:
+    """New-chat reset — drop every in-flight marker for this user."""
     uid = str(user_id or "").strip()
     with _CHAT_LOCKS_GUARD:
-        if key:
-            if _in_flight_age(key, _CHAT_IN_FLIGHT, _CHAT_IN_FLIGHT_AT) >= CHAT_IN_FLIGHT_MAX_SEC:
+        if uid:
+            _force_clear_in_flight(
+                uid,
+                _USER_IN_FLIGHT,
+                _USER_IN_FLIGHT_AT,
+                reason="user new-chat reset",
+            )
+
+
+def try_begin_chat_turn(chat_id: str, user_id: str = "") -> bool:
+    """
+    One active /chat per chat_id — timestamp only (no threading.Lock).
+
+    A slow/zombie handler cannot block the customer forever: after
+    CHAT_IN_FLIGHT_STALE_SEC a new message is allowed and gets a fresh token.
+    """
+    key = (chat_id or "").strip()
+    uid = str(user_id or "").strip()
+    if not key:
+        _TURN_ACQUIRED.acquired = True
+        _TURN_ACQUIRED.chat_id = ""
+        _TURN_ACQUIRED.user_id = uid
+        _TURN_ACQUIRED.turn_token = ""
+        return True
+
+    with _CHAT_LOCKS_GUARD:
+        if key in _CHAT_IN_FLIGHT:
+            age = _in_flight_age(key, _CHAT_IN_FLIGHT, _CHAT_IN_FLIGHT_AT)
+            if age > CHAT_IN_FLIGHT_STALE_SEC:
                 _force_clear_in_flight(
                     key,
                     _CHAT_IN_FLIGHT,
                     _CHAT_IN_FLIGHT_AT,
-                    reason="hard cap — customer may retry",
+                    reason="stale turn replaced by new message",
                 )
             else:
-                _clear_stale_in_flight(key, _CHAT_IN_FLIGHT, _CHAT_IN_FLIGHT_AT)
-        if uid:
-            if _in_flight_age(uid, _USER_IN_FLIGHT, _USER_IN_FLIGHT_AT) >= CHAT_IN_FLIGHT_MAX_SEC:
+                # Latest customer message wins — preempt slow prior handler (no deadlock).
                 _force_clear_in_flight(
-                    uid,
-                    _USER_IN_FLIGHT,
-                    _USER_IN_FLIGHT_AT,
-                    reason="hard cap — customer may retry",
+                    key,
+                    _CHAT_IN_FLIGHT,
+                    _CHAT_IN_FLIGHT_AT,
+                    reason="latest message preempts in-flight turn",
                 )
-            else:
-                _clear_stale_in_flight(uid, _USER_IN_FLIGHT, _USER_IN_FLIGHT_AT)
-        if key and key in _CHAT_IN_FLIGHT:
-            return False
-        # Same user in two tabs — serialize only while a turn is actively within hard cap.
-        if uid and uid in _USER_IN_FLIGHT:
-            return False
+        token = uuid.uuid4().hex
         now = time.monotonic()
-        if key:
-            _CHAT_IN_FLIGHT.add(key)
-            _CHAT_IN_FLIGHT_AT[key] = now
+        _CHAT_IN_FLIGHT.add(key)
+        _CHAT_IN_FLIGHT_AT[key] = now
+        _CHAT_IN_FLIGHT_TOKEN[key] = token
         if uid:
             _USER_IN_FLIGHT.add(uid)
             _USER_IN_FLIGHT_AT[uid] = now
-        _TURN_ACQUIRED.acquired = True
-        _TURN_ACQUIRED.chat_id = key
-        _TURN_ACQUIRED.user_id = uid
-        return True
+
+    _TURN_ACQUIRED.acquired = True
+    _TURN_ACQUIRED.chat_id = key
+    _TURN_ACQUIRED.user_id = uid
+    _TURN_ACQUIRED.turn_token = token
+    return True
 
 
 def end_chat_turn(chat_id: str, user_id: str = "") -> None:
     key = (chat_id or "").strip()
     uid = str(user_id or "").strip()
+    token = (getattr(_TURN_ACQUIRED, "turn_token", "") or "").strip()
     with _CHAT_LOCKS_GUARD:
-        if key:
+        if key and _CHAT_IN_FLIGHT_TOKEN.get(key) == token:
             _CHAT_IN_FLIGHT.discard(key)
             _CHAT_IN_FLIGHT_AT.pop(key, None)
+            _CHAT_IN_FLIGHT_TOKEN.pop(key, None)
         if uid:
             _USER_IN_FLIGHT.discard(uid)
             _USER_IN_FLIGHT_AT.pop(uid, None)
+    _TURN_ACQUIRED.turn_token = ""
 
 
 def end_chat_turn_if_acquired() -> None:
@@ -191,6 +211,7 @@ def clear_turn_acquire_state() -> None:
     _TURN_ACQUIRED.acquired = False
     _TURN_ACQUIRED.chat_id = ""
     _TURN_ACQUIRED.user_id = ""
+    _TURN_ACQUIRED.turn_token = ""
 
 
 class ChatDeadlineExceeded(Exception):
@@ -248,18 +269,16 @@ def build_in_flight_reply_html(original_msg: str = "", reply_lang: str = "") -> 
         reply_lang,
         wrap_html=True,
         fallback_en=(
-            "Your last message is still being processed. Please wait a few seconds. "
-            "If nothing appears, try again in a moment — you can also send a new question "
-            "after ~20 seconds."
+            "Your last message is still being processed. Please wait a moment — "
+            "I will reply shortly. If nothing appears, send your question again."
         ),
     )
     if body and body.strip():
         return body
     return (
         '<div style="color:#333;line-height:1.55;">'
-        "Your last message is still being processed. Please wait a few seconds. "
-        "If nothing appears, try again in a moment — you can also send a new question "
-        "after ~20 seconds."
+        "Your last message is still being processed. Please wait a moment — "
+        "I will reply shortly. If nothing appears, send your question again."
         "</div>"
     )
 
@@ -337,10 +356,42 @@ def run_with_chat_deadline(
     deadline_sec: float = CHAT_MAX_SECONDS,
 ):
     """
-    Hard wall-clock cap for /chat — return busy to client when exceeded.
-    Background work may continue on a daemon thread but in-flight lock is released.
+    Wall-clock cap for /chat. Default: synchronous handler (no zombie daemon threads
+    contending on encode lock / LLM). Set CHAT_ASYNC_HANDLER=1 for legacy threaded mode.
     """
     limit = float(deadline_sec or CHAT_MAX_SECONDS)
+    use_async = (os.getenv("CHAT_ASYNC_HANDLER") or "0").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+    if not use_async:
+        t0 = time.perf_counter()
+        try:
+            result = fn(*args, **kwargs)
+        except BaseException as exc:
+            raise exc
+        elapsed = time.perf_counter() - t0
+        if elapsed > limit and not _handler_reply_is_usable(result):
+            try:
+                from services.chat_flow_telemetry import record_timeout_point
+
+                record_timeout_point("chat_deadline_exceeded")
+            except ImportError:
+                pass
+            log_reasoning(
+                f"Chat hard deadline ({limit:.0f}s) sync — no usable reply."
+            )
+            raise ChatDeadlineExceeded()
+        if elapsed > limit:
+            log_reasoning(
+                f"Chat over deadline ({elapsed:.1f}s > {limit}s) "
+                "— returning computed reply (sync)."
+            )
+        return result
+
     result_box: dict[str, Any] = {}
     exc_box: dict[str, BaseException] = {}
 

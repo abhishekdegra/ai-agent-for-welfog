@@ -5,7 +5,11 @@ import time
 
 import requests
 
-from services.kb_service import get_runtime_knowledge_files, read_concatenated_kb_file_contents
+from services.kb_service import (
+    build_kb_catalog_for_brain_prompt,
+    get_runtime_knowledge_files,
+    read_concatenated_kb_file_contents,
+)
 from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
 from utils.reasoning_log import log_reasoning
 
@@ -105,15 +109,21 @@ def _llm_classifier_provider_chain() -> list[dict]:
     return chain[:cap] if chain else []
 
 
-def _llm_routing_provider_chain() -> list[dict]:
+def _llm_routing_provider_chain(*, prefer_openai: bool = False) -> list[dict]:
     """
     ai_brain_route — try full env chain (groq→openai→gemini→deepseek by default).
     LLM_ROUTING_MAX_PROVIDERS caps how many keys to try (default 4 = all configured).
+    prefer_openai: Hinglish / long prompts — OpenAI JSON mode is more reliable than Groq.
     """
     from services.llm_providers import get_configured_provider_chain
 
     chain = get_configured_provider_chain()
     cap = max(1, min(4, int(os.getenv("LLM_ROUTING_MAX_PROVIDERS", "4") or "4")))
+    if prefer_openai and chain:
+        openai = [p for p in chain if (p.get("name") or "").strip().lower() == "openai"]
+        rest = [p for p in chain if (p.get("name") or "").strip().lower() != "openai"]
+        chain = openai + rest if openai else list(chain)
+        return chain[:cap]
     prefer_groq = (os.getenv("LLM_ROUTING_PREFER_GROQ", "1") or "1").strip().lower() not in (
         "0",
         "false",
@@ -146,13 +156,19 @@ def _llm_json_with_provider_fallback(
     )
 
 
-def ai_brain_route(user_msg, conversation_context: str = "", reply_lang: str = "en"):
+def ai_brain_route(
+    user_msg,
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    msg_en: str = "",
+):
     """
     Step 1: Use Groq to understand the user message (any language),
     decide intent + which knowledge files should be used for grounding.
     """
     try:
         from services.chat_flow_telemetry import (
+            ensure_brain_route_llm_slot,
             guard_duplicate_brain_route,
             store_brain_route_result,
         )
@@ -160,25 +176,28 @@ def ai_brain_route(user_msg, conversation_context: str = "", reply_lang: str = "
         cached = guard_duplicate_brain_route("ai_brain_route")
         if cached is not None:
             return cached
+        ensure_brain_route_llm_slot()
     except ImportError:
         pass
 
     reply_lang = resolve_customer_reply_lang(user_msg, reply_lang)
     try:
-        providers = _llm_routing_provider_chain()
+        providers = _llm_routing_provider_chain(
+            prefer_openai=bool(
+                (msg_en or "").strip()
+                and (user_msg or "").strip()
+                and (msg_en or "").strip().lower()
+                != (user_msg or "").strip().lower()
+            )
+            or reply_lang not in ("en",)
+        )
         if not providers:
             _safe_print(
                 "ERROR: No AI provider key found — set GROQ/OPENAI/GEMINI/DEEPSEEK API keys."
             )
             return None
 
-        kb_keys_list = ", ".join(
-            [
-                f'"{k}"'
-                for k in get_runtime_knowledge_files().keys()
-                if k != "welfog_api_routing_master"
-            ][:28]
-        )
+        kb_catalog = build_kb_catalog_for_brain_prompt()
         routing_master = _trim_text_mid(_routing_master_for_prompt(), _ROUTING_MASTER_MAX_CHARS)
         system_prompt = f"""You are 'Welfog AI' routing brain. Classify the LATEST user message using MEANING and RECENT CONVERSATION — never keyword lists.
 
@@ -187,8 +206,8 @@ ROUTING PLAYBOOK (topics → intent → API vs KB):
 {routing_master}
 \"\"\"
 
-Customer-facing knowledge keys (kb_keys when intent needs KB):
-[{kb_keys_list}]
+Admin knowledge catalog (pick kb_keys from these keys when data_channel=kb — files are auto-discovered; admin can add/update/delete .txt without code changes):
+{kb_catalog}
 
 JSON SCHEMA (LATEST USER MESSAGE ONLY):
 {{
@@ -235,6 +254,8 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "route_handler": "order_tracking_api" | "order_details_api" | "refund_status_api" | "order_history_api" | "wishlist_api" | "pincode_delivery_api" | "" 
 }}
 
+OUTPUT SIZE (critical for speed): Return MINIMAL JSON only — omit empty strings, null fields, and empty arrays; reasoning max one short sentence; include product_entities ONLY when intent=product.
+
 CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Any Indian language / Hinglish / typos / slang — YOU understand meaning. Write user_meaning as one clear English sentence. NEVER echo the customer message word-for-word.
 - Backend routes ONLY from your JSON (intent, data_channel, order_lookup_kind, route_handler, field_focus, kb_keys) — there is NO keyword fallback on customer text. If a field is wrong or missing, the wrong API runs.
@@ -257,10 +278,11 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - ONE order track/shipment timeline → order_lookup_kind=track, field_focus=timeline. Invoice/bill/receipt/GST → invoice (NOT track). Payment/amount/total/product on ONE order → order_lookup_kind=details with matching field_focus (NOT order_history list, NOT track).
 - Shipping/delivery ADDRESS already saved on an existing order (any language: address kya laga / konsa address / pata kya tha / which address on order) → order_lookup_kind=details, field_focus=delivery, route_handler=order_details_api, needs_order_id=true. NOT order_lookup_kind=track, NOT pincode_check (pincode_check is only for whether Welfog delivers to an area before ordering).
 - "Order ID: 12345 invoice/refund/address/amount" → set order_lookup_kind from what they asked (invoice/refund_status/details), NOT track, NOT purchase_history_in_chat.
-- Saved/liked products IN CHAT ("meri wishlist dikhao", "meri pasand ki cheezein", "saved items", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api, run_catalog_search=false. NOT product catalog search.
+- Saved/liked products IN CHAT ("meri wishlist dikhao", "meri pasand ki cheezein", "saved items", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api, run_catalog_search=false. user_meaning MUST be English like "show the customer's saved or liked products" — NOT a product search query. NOT product catalog search.
 - HOW/WHERE to view wishlist in app (steps, navigation, "wishlist kaise dekhu") → account_list_kind=wishlist_howto, data_channel=kb — NOT pincode_check, NOT product catalog.
 - Saved/liked products → intent=wishlist (NOT order_history). Amazon/Flipkart etc. → out_of_domain.
 - PIN / delivery area / "can you deliver to X" / city name (Jaipur, Kota) / friend lives in an area (ANY language) → pincode_check, data_channel=live_api, needs_order_id=false, order_lookup_kind=none, run_catalog_search=false. This is NOT order tracking — never set intent=order or needs_order_id=true for hypothetical delivery to a place. Clear city → live geocode+API; vague place → ask for 6-digit PIN. Extract PIN when present.
+- Product availability ON Welfog ("welfog pe chawal milega", "do you sell rice on welfog", "kya milta hai welfog par") → intent=product, data_channel=catalog, run_catalog_search=true — NOT pincode_check unless they ask delivery to a named city/PIN/address.
 - Existing order timeline (shipment/courier/status/not received) → order + order_lookup_kind=track, needs_order_id=true. Do not confuse with pincode_check.
 - Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style) → intent=product, data_channel=catalog, run_catalog_search=true. Fill product_entities with ALL filters the user asked for; search_query = product_entities.product_name (product TYPE only in English).
 - PRODUCT ENTITIES (critical — backend uses these for OpenSearch filters, not raw customer text):
@@ -291,9 +313,12 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
 - Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="" unless user also named a product type.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
-- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ROUTING PLAYBOOK. Use user_meaning in English to pick files — do NOT rely on matching Hindi/English keywords in the customer message. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund+kb (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB.
+- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new .txt file is added. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund KB (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB.
+- Personal life, marriage, dating, jokes, homework, politics, sports scores, other apps — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys.
+- General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company → kb company (NOT assistant_intro).
-- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" (ANY language) → conversation_scope=general_chitchat, scope_reply=warm natural reply in customer language, run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
+- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=2-3 sentences mirroring the user's EXACT language, script, and slang (Hinglish stays Hinglish — never default to stiff English "Hi there I'm the Welfog assistant"), run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
+- MIXED messages (hello/bhai/bro/darling/yaar/thanks/jokes PLUS a real request): classify by the REAL goal — ecommerce action beats Welfog KB beats casual chitchat. Ignore conversational filler when shopping/order/KB/support intent is present.
 - run_catalog_search=false for meta_kind other than none.
 - {language_reply_instruction(reply_lang)}
 Return JSON only."""
@@ -301,12 +326,22 @@ Return JSON only."""
 
         msg_for_route = _trim_text_mid(user_msg, _ROUTING_USER_MAX_CHARS)
         compact_ctx = _compact_conversation_context(conversation_context, _ROUTING_CONTEXT_MAX_CHARS)
-        user_payload = msg_for_route
+        en_hint = (msg_en or "").strip()
+        raw_msg = (user_msg or "").strip()
+        latest_block = f"LATEST USER MESSAGE:\n{msg_for_route}"
+        if en_hint and en_hint.lower() != raw_msg.lower():
+            latest_block = (
+                f"LATEST USER MESSAGE:\n{msg_for_route}\n\n"
+                "ENGLISH MEANING (auto-translated — write user_meaning/product_entities/"
+                "search_query from this when the customer message is not English):\n"
+                f"{_trim_text_mid(en_hint, 480)}"
+            )
+        user_payload = latest_block
         if compact_ctx:
             user_payload = (
                 "RECENT CONVERSATION (use to resolve pronouns and follow-ups):\n"
                 f"{compact_ctx}\n\n"
-                f"LATEST USER MESSAGE:\n{msg_for_route}"
+                f"{latest_block}"
             )
 
         messages = [
@@ -321,7 +356,7 @@ Return JSON only."""
         out = _llm_json_with_provider_fallback(
             providers,
             messages,
-            max_tokens=max(420, int(os.getenv("AI_ROUTE_MAX_TOKENS", "520") or 520)),
+            max_tokens=max(720, int(os.getenv("AI_ROUTE_MAX_TOKENS", "960") or 960)),
             timeout_sec=route_timeout,
             max_attempts=max(1, min(3, int(os.getenv("AI_ROUTE_MAX_ATTEMPTS", "2") or 2))),
         )
@@ -333,13 +368,20 @@ Return JSON only."""
 
             kind = get_last_llm_failure() or "all_failed"
             log_reasoning(f"LLM routing returned no JSON — failure={kind}")
-            return {
+            fail = {
                 "llm_unavailable": True,
                 "_llm_failure": kind,
                 "intent": "general",
                 "conversation_scope": "welfog_support",
                 "is_welfog_related": True,
             }
+            try:
+                from services.chat_flow_telemetry import store_brain_route_result
+
+                store_brain_route_result(fail)
+            except ImportError:
+                pass
+            return fail
         if out:
             try:
                 from services.chat_flow_telemetry import store_brain_route_result
@@ -355,7 +397,7 @@ Return JSON only."""
                 )
 
                 out = _normalize_llm_route(out)
-                out = repair_brain_json_quality(out, user_msg)
+                out = repair_brain_json_quality(out, user_msg, msg_en=msg_en)
                 um = (out.get("user_meaning") or "").strip()
                 log_reasoning(
                     um

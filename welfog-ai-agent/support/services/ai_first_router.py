@@ -6,12 +6,256 @@ Deterministic shortcuts ONLY for unambiguous tokens (catalog pro_id in message) 
 from __future__ import annotations
 
 import os
+import re
+import time
 from typing import Optional
 
 from services.answer_router import AnswerRouteDecision
 from services.ai_service import ai_brain_route
 from services.message_understanding import apply_ai_route_corrections
 from utils.reasoning_log import log_reasoning
+
+_MIXED_GREETING_PREFIX_RE = re.compile(
+    r"^(?:"
+    r"(?:hi+|hey+|hello+|helo+|namaste+|namaskar+|oye+|sun+o?|bol+o?|"
+    r"darling|dear|bhai|bro|yaar|dost|ji|please|ram\s*ram|radhe\s*radhe|vanakkam"
+    r")\s*)+",
+    re.IGNORECASE,
+)
+
+
+def _transactional_beats_greeting(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    Mixed turns: order_history / product search / wishlist MUST defeat greeting filler.
+    Structural checks only — no embeddings or extra LLM.
+    """
+    try:
+        from services.conversation_followup import is_deals_request_message
+        from utils.helpers import (
+            _message_looks_like_shopping_query,
+            _text_has_light_order_tracking_markers,
+            _text_is_phone_product_accessory_context,
+            message_asks_welfog_categories_list,
+            message_has_live_pincode_check_intent,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
+            turn_is_obvious_product_shopping_turn,
+            _text_is_live_order_lookup_intent,
+            _text_is_order_tracking_intent,
+            _text_wants_order_history_list_in_chat,
+        )
+
+        comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        if (
+            _message_looks_like_shopping_query(comb)
+            or _text_is_phone_product_accessory_context(comb)
+            or turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conversation_context
+            )
+        ):
+            return True
+        if is_deals_request_message(original_msg, msg_en):
+            return True
+        if message_asks_welfog_categories_list(comb):
+            return True
+        if (
+            message_is_past_purchase_list_request(comb)
+            or _text_wants_order_history_list_in_chat(comb, conversation_context)
+            or message_is_wishlist_like_request(comb)
+        ):
+            return True
+        if _text_has_light_order_tracking_markers(comb) or message_has_live_pincode_check_intent(
+            original_msg, conversation_context, msg_en
+        ):
+            if (
+                _text_is_order_tracking_intent(comb)
+                or _text_is_live_order_lookup_intent(comb, conversation_context)
+                or message_has_live_pincode_check_intent(
+                    original_msg, conversation_context, msg_en
+                )
+            ):
+                return True
+    except ImportError:
+        pass
+    return False
+
+
+def _strip_greeting_filler_from_mixed_turn(
+    original_msg: str,
+    msg_en: str = "",
+) -> tuple[str, str, bool]:
+    """
+    'hi darling order history bta' → route on functional tail only (one semantic pass).
+    """
+    orig = (original_msg or "").strip()
+    en = (msg_en or orig.lower()).strip().lower()
+    if not orig:
+        return orig, en, False
+    if _text_is_obvious_off_topic(f"{orig} {en}".strip()):
+        return orig, en, False
+    if not _transactional_beats_greeting(orig, en, ""):
+        return orig, en, False
+    stripped_orig = _MIXED_GREETING_PREFIX_RE.sub("", orig).strip()
+    stripped_en = (
+        _MIXED_GREETING_PREFIX_RE.sub("", en).strip()
+        if en != orig.lower()
+        else stripped_orig.lower()
+    )
+    if not stripped_orig or stripped_orig == orig:
+        return orig, en, False
+    log_reasoning(
+        f"Mixed turn — greeting stripped; routing functional tail: {stripped_orig[:72]!r}"
+    )
+    return stripped_orig, stripped_en or stripped_orig.lower(), True
+
+
+_OBVIOUS_OOD_SNIPPETS = (
+    "meri gf",
+    "mera bf",
+    "girlfriend banw",
+    "boyfriend banw",
+    "gf banw",
+    "bf banw",
+    "baarish",
+    "barish",
+    "mausam",
+    "mosam",
+    "weather today",
+    "cricket score",
+    "going to trip",
+    "trip plan",
+    "homework",
+    "recipe for",
+    "marry me",
+    "date me",
+    "politics",
+)
+
+
+def _text_is_obvious_off_topic(comb: str) -> bool:
+    """Fast OOD — no embeddings, no vector KB."""
+    low = f" {(comb or '').lower()} "
+    if any(s in low for s in _OBVIOUS_OOD_SNIPPETS):
+        return True
+    try:
+        from utils.helpers import message_is_casual_offtopic_not_shopping
+
+        return message_is_casual_offtopic_not_shopping(comb)
+    except ImportError:
+        return False
+
+
+def _try_obvious_out_of_domain_route(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    reply_lang: str = "en",
+) -> Optional[dict]:
+    """
+    Obvious off-topic — intent=out_of_domain, data_channel=none, no vector/KB scan.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+    obvious_ood = _text_is_obvious_off_topic(comb)
+    if not obvious_ood and _transactional_beats_greeting(original_msg, msg_en, ""):
+        return None
+    if not obvious_ood:
+        try:
+            from services.conversation_scope import _has_definite_welfog_shopping_signal
+            from utils.helpers import (
+                message_is_knowledge_information_request,
+                message_is_welfog_about_request,
+                _text_mentions_welfog_brand,
+            )
+
+            if (
+                message_is_knowledge_information_request(comb, "")
+                or message_is_welfog_about_request(comb)
+                or _has_definite_welfog_shopping_signal(comb)
+                or _text_mentions_welfog_brand(comb)
+            ):
+                return None
+            if not _text_is_obvious_off_topic(comb):
+                return None
+        except ImportError:
+            if not _text_is_obvious_off_topic(comb):
+                return None
+
+    scope_reply = ""
+    try:
+        from services.kb_service import sysmsg
+        from services.translation_service import (
+            finalize_customer_reply,
+            is_hinglish_message,
+            resolve_customer_reply_lang,
+        )
+
+        rl = resolve_customer_reply_lang(original_msg, reply_lang)
+        key = (
+            "out_of_domain_hinglish"
+            if is_hinglish_message(original_msg) or rl == "hinglish"
+            else "out_of_domain"
+        )
+        scope_reply = finalize_customer_reply(
+            sysmsg(key) or sysmsg("out_of_domain") or "",
+            original_msg,
+            rl,
+        )
+    except ImportError:
+        pass
+
+    log_reasoning(
+        "Single-pass OOD — obvious off-topic; data_channel=none (no vector/KB)."
+    )
+    return {
+        "user_meaning": f"Off-topic unrelated to Welfog ({comb[:120]})",
+        "reasoning": "Obvious out-of-domain — template refusal (no KB/vector).",
+        "intent": "out_of_domain",
+        "data_channel": "none",
+        "conversation_scope": "out_of_domain",
+        "is_welfog_related": False,
+        "scope_reply": scope_reply,
+        "needs_order_id": False,
+        "run_catalog_search": False,
+        "kb_keys": [],
+        "_universal_brain_route": True,
+        "_turn_promotions_done": True,
+        "_zero_llm_fast": True,
+        "_obvious_ood": True,
+    }
+
+
+def _kb_keys_for_route(
+    route_data: dict,
+    original_msg: str = "",
+    msg_en: str = "",
+    *,
+    conv_for_llm: str = "",
+) -> list[str]:
+    """Admin-panel KB keys from brain JSON or embedding — no hardcoded topic file names."""
+    keys = [k for k in (route_data or {}).get("kb_keys") or [] if str(k).strip()]
+    if keys:
+        return keys
+    try:
+        from services.kb_service import resolve_brain_kb_keys
+
+        resolved = resolve_brain_kb_keys(
+            route_data,
+            original_msg,
+            msg_en,
+            conversation_context=conv_for_llm,
+        )
+        if resolved:
+            return resolved
+    except ImportError:
+        pass
+    return []
+
 
 # Existing handlers only — maps route_handler → (source, default_intent). No new APIs.
 _EXISTING_HANDLER_SOURCES: dict[str, tuple[str, str]] = {
@@ -67,7 +311,12 @@ def _decision_from_existing_handler(
         resolved_intent = intent
     keys = list(kb_keys or route_data.get("kb_keys") or [])
     if src in ("kb", "kb_ai") and not keys:
-        keys = ["faqs"]
+        try:
+            from services.kb_service import resolve_brain_kb_keys
+
+            keys = resolve_brain_kb_keys(route_data, "", route_data.get("user_meaning") or "")
+        except ImportError:
+            keys = []
     sq = (search_query or route_data.get("search_query") or "").strip()
     return AnswerRouteDecision(
         source=src,
@@ -126,7 +375,7 @@ def _quick_decision_from_locked_brain_route(
     reasoning = (route_data.get("reasoning") or "")[:200]
     intent = (route_data.get("intent") or "general").strip().lower()
     rh = (route_data.get("route_handler") or "").strip().lower()
-    kb_keys = list(route_data.get("kb_keys") or ["faqs"])
+    kb_keys = _kb_keys_for_route(route_data, original_msg, msg_en)
     alk = _norm_account_list_kind(route_data.get("account_list_kind") or "")
 
     olk = (route_data.get("order_lookup_kind") or "").strip().lower()
@@ -198,7 +447,7 @@ def _quick_decision_from_locked_brain_route(
             source="kb",
             intent="general",
             handler="wishlist_howto_kb",
-            kb_keys=kb_keys or ["faqs", "welfog_api_wishlist"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Brain wishlist how-to (meaning) — {reasoning}",
         )
@@ -215,7 +464,7 @@ def _quick_decision_from_locked_brain_route(
             source="kb",
             intent="general",
             handler="wishlist_howto_kb",
-            kb_keys=kb_keys or ["faqs", "welfog_api_wishlist"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Brain wishlist how-to — {reasoning}",
         )
@@ -232,7 +481,7 @@ def _quick_decision_from_locked_brain_route(
             source="kb",
             intent="general",
             handler="order_history_howto_kb",
-            kb_keys=kb_keys or ["welfog_api_order_history", "faqs"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Brain order history how-to — {reasoning}",
         )
@@ -302,7 +551,7 @@ def _wishlist_answer_route_decision(
             source="kb",
             intent="general",
             handler="wishlist_howto_kb",
-            kb_keys=["faqs", "welfog_api_wishlist"],
+            kb_keys=_kb_keys_for_route(route_data, "", comb_hist, conv_for_llm=conv_for_llm),
             is_welfog_related=True,
             reason=f"Wishlist navigation — {reasoning}",
         )
@@ -319,10 +568,26 @@ def _wishlist_answer_route_decision(
         return None
 
     ai_i = (route_data.get("intent") or "").strip().lower()
+    if ai_i == "order_history":
+        return None
     meaning_blob = (
         f" {(route_data.get('user_meaning') or '').lower()} "
         f" {(route_data.get('reasoning') or '').lower()} "
     )
+    if any(
+        x in meaning_blob
+        for x in (
+            "order history",
+            "purchase history",
+            "past order",
+            "orders placed",
+            "order placed",
+            "my orders",
+            "bought",
+            "purchase list",
+        )
+    ):
+        return None
     ai_describes_wishlist = any(
         x in meaning_blob
         for x in (
@@ -356,7 +621,7 @@ def _wishlist_answer_route_decision(
             source="kb",
             intent="general",
             handler="wishlist_howto_kb",
-            kb_keys=["faqs", "welfog_api_wishlist"],
+            kb_keys=_kb_keys_for_route(route_data, "", comb_hist, conv_for_llm=conv_for_llm),
             is_welfog_related=True,
             reason=f"Wishlist navigation — {reasoning}",
         )
@@ -398,7 +663,7 @@ def _kb_channel_brain_decision(
         from services.product_catalog_resolver import turn_requests_product_catalog
 
         if turn_requests_product_catalog(
-            original_msg, msg_en, "", ai_route=route_data, allow_llm=True
+            original_msg, msg_en, "", ai_route=route_data, allow_llm=False
         ):
             return None
     except ImportError:
@@ -445,7 +710,7 @@ def _kb_channel_brain_decision(
             source="kb",
             intent="general",
             handler="welfog_about_kb",
-            kb_keys=kb_keys or ["company", "faqs"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Welfog company/platform — {reasoning}",
         )
@@ -495,7 +760,9 @@ def _decision_from_ai_route(
     """Map Groq routing JSON → handler. Trust AI intent; no keyword list overrides here."""
     intent = (route_data.get("intent") or "general").strip()
     is_welfog = bool(route_data.get("is_welfog_related", True))
-    kb_keys = list(route_data.get("kb_keys") or [])
+    kb_keys = _kb_keys_for_route(
+        route_data, original_msg, msg_en, conv_for_llm=conv_for_llm
+    )
     search_query = (route_data.get("search_query") or "").strip()
     needs_order_id = bool(route_data.get("needs_order_id", False))
     reasoning = (route_data.get("reasoning") or "")[:200]
@@ -534,7 +801,11 @@ def _decision_from_ai_route(
 
     from utils.helpers import should_use_warm_conversational_reply
 
-    if should_use_warm_conversational_reply(original_msg, msg_en, comb_hist, route_data):
+    if should_use_warm_conversational_reply(
+        original_msg, msg_en, comb_hist, route_data
+    ) and not _transactional_beats_greeting(
+        original_msg, msg_en, conv_for_llm
+    ):
         if (
             intent in ("general", "out_of_domain")
             and not needs_order_id
@@ -744,7 +1015,7 @@ def _decision_from_ai_route(
             source="kb",
             intent="refund",
             handler="policy_structured_kb",
-            kb_keys=["faqs", "refund", "shipping"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Return/refund policy — {reasoning}",
         )
@@ -873,7 +1144,7 @@ def _decision_from_ai_route(
             source="kb",
             intent="general",
             handler="wishlist_howto_kb",
-            kb_keys=["faqs", "welfog_api_wishlist"],
+            kb_keys=_kb_keys_for_route(route_data, "", comb_hist, conv_for_llm=conv_for_llm),
             is_welfog_related=True,
             reason=f"Wishlist where/how in app — {reasoning}",
         )
@@ -1001,7 +1272,7 @@ def _decision_from_ai_route(
             source="kb",
             intent="general",
             handler="order_id_help_kb",
-            kb_keys=["faqs", "shipping", "welfog_api_order_id"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Order ID location help — {reasoning}",
         )
@@ -1029,7 +1300,7 @@ def _decision_from_ai_route(
             source="kb",
             intent="general",
             handler="order_history_howto_kb",
-            kb_keys=["welfog_api_order_history", "faqs"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"Order history where/how in app — {reasoning}",
         )
@@ -1323,7 +1594,7 @@ def _decision_from_ai_route(
             source=src,
             intent=intent,
             handler=rh_kb,
-            kb_keys=kb_keys or ["faqs"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"AI KB answer ({plan.answer_strategy}) — {reasoning}",
         )
@@ -1344,7 +1615,7 @@ def _decision_from_ai_route(
                     source="kb_ai",
                     intent="general",
                     handler="ai_route_and_answer",
-                    kb_keys=kb_keys or ["faqs", "support"],
+                    kb_keys=kb_keys,
                     is_welfog_related=True,
                     reason=f"Ambiguous product intent; ask user to clarify exact need — {reasoning}",
                 )
@@ -1368,7 +1639,7 @@ def _decision_from_ai_route(
             source="kb",
             intent="seller",
             handler="seller_kb",
-            kb_keys=kb_keys or ["seller", "faqs", "support"],
+            kb_keys=kb_keys,
             is_welfog_related=True,
             reason=f"AI route → seller KB — {reasoning}",
         )
@@ -1383,7 +1654,7 @@ def _decision_from_ai_route(
                 intent="general",
                 handler="order_placement_kb",
                 is_welfog_related=True,
-                kb_keys=kb_keys or ["faqs", "shipping"],
+                kb_keys=kb_keys,
                 reason=f"How to place order (not tracking) — {reasoning}",
             )
         if needs_order_id:
@@ -1544,7 +1815,7 @@ def _decision_from_ai_route(
                 intent="general",
                 handler="order_tracking_howto_kb",
                 is_welfog_related=True,
-                kb_keys=kb_keys or ["shipping", "faqs"],
+                kb_keys=kb_keys,
                 reason=f"AI: order help / how-to track — {reasoning}",
             )
         try:
@@ -1583,7 +1854,7 @@ def _decision_from_ai_route(
         intent="general",
         handler="ai_route_and_answer",
         search_query=search_query,
-        kb_keys=kb_keys or ["faqs", "company"],
+        kb_keys=kb_keys,
         is_welfog_related=True,
         reason=f"AI: general / KB-grounded — {reasoning}",
     )
@@ -1666,6 +1937,26 @@ def _try_account_list_fast_path(
     combined = f"{original_msg} {msg_en}".strip()
     if not combined:
         return None
+
+    try:
+        from utils.helpers import _text_is_welfog_payment_info_question
+
+        if _text_is_welfog_payment_info_question(combined):
+            return None
+    except ImportError:
+        pass
+
+    try:
+        import re
+
+        from services.semantic_intent import should_skip_order_history_list_for_turn
+
+        if re.search(r"\b\d{4,20}\b", combined) or should_skip_order_history_list_for_turn(
+            original_msg, msg_en, ""
+        ):
+            return None
+    except ImportError:
+        pass
 
     if (
         _text_asks_wishlist(combined)
@@ -1887,9 +2178,7 @@ def _try_policy_kb_preflight(
     if top_key == "company" and top_score < _MIN_COMPANY_PREFLIGHT:
         return None
 
-    keys = resolve_kb_keys_for_question(original_msg, msg_en, max_files=3)
-    if not keys:
-        keys = [top_key]
+    keys = [top_key]
     cat = infer_kb_query_category(original_msg, msg_en)
     if cat == "payment" and "payment" in keys:
         keys = ["payment"]
@@ -1905,7 +2194,7 @@ def _try_policy_kb_preflight(
             "reasoning": "Welfog company/platform — embedding KB preflight.",
             "intent": "general",
             "data_channel": "kb",
-            "kb_keys": ["company", "faqs"],
+            "kb_keys": ["company"],
             "answer_strategy": "kb_then_ai",
             "conversation_scope": "welfog_support",
             "is_welfog_related": True,
@@ -1921,7 +2210,7 @@ def _try_policy_kb_preflight(
                 source="kb",
                 intent="general",
                 handler="welfog_about_kb",
-                kb_keys=["company", "faqs"],
+                kb_keys=keys,
                 is_welfog_related=True,
                 reason="Welfog company/about — semantic preflight",
             ),
@@ -2015,6 +2304,569 @@ def _brain_route_is_usable(route_data: dict | None) -> bool:
     )
 
 
+def _brain_reasoning_indicates_ood(reasoning: str) -> bool:
+    """Trust brain JSON reasoning field only — not customer text."""
+    r = (reasoning or "").strip().lower()
+    if not r:
+        return False
+    return any(
+        x in r
+        for x in (
+            "out_of_domain",
+            "off-topic",
+            "off topic",
+            "not welfog",
+            "not related to welfog",
+            "unrelated to welfog",
+            "not a welfog",
+            "other company",
+            "other app",
+            "competitor",
+        )
+    )
+
+
+def _brain_um_names_external_marketplace(um: str, reasoning: str = "") -> bool:
+    """
+    Brain user_meaning / reasoning are English written by the routing LLM — if either
+    names another marketplace, treat as OOD (not customer-text keyword matching).
+    """
+    blob = f"{um or ''} {reasoning or ''}".strip().lower()
+    if not blob or "welfog" in blob:
+        return False
+    return bool(
+        re.search(
+            r"\b(amazon|flipkart|myntra|zepto|swiggy|instamart|meesho|snapdeal|ajio|blinkit)\b",
+            blob,
+        )
+    )
+
+
+def _reconcile_off_topic_brain_misroute(
+    route: dict,
+    original_msg: str,
+    *,
+    msg_en: str = "",
+) -> dict:
+    """
+    Fix brain misroutes using ai_brain_route JSON only — never customer-text keyword lists.
+    Trusts: is_welfog_related, conversation_scope, intent, data_channel, kb_keys, user_meaning.
+    """
+    out = dict(route or {})
+    if out.get("_zero_llm_fast") or out.get("_preflight_api") or out.get(
+        "_preflight_catalog_menu"
+    ) or out.get("_pincode_delivery_fast"):
+        return out
+    intent = (out.get("intent") or "").strip().lower()
+    channel = (out.get("data_channel") or "").strip().lower()
+    scope = (out.get("conversation_scope") or "").strip().lower()
+    related = out.get("is_welfog_related")
+    kb_keys = [k for k in (out.get("kb_keys") or []) if str(k).strip()]
+    reasoning = (out.get("reasoning") or "").strip().lower()
+
+    if intent == "kb":
+        out["intent"] = "general"
+        out.setdefault("data_channel", "kb")
+        intent = "general"
+
+    en_blob = (msg_en or "").strip().lower()
+    if en_blob and "welfog" not in en_blob:
+        if re.search(
+            r"\b(amazon|flipkart|myntra|zepto|swiggy|instamart|meesho|snapdeal|ajio|blinkit)\b",
+            en_blob,
+        ):
+            out["intent"] = "out_of_domain"
+            out["data_channel"] = "none"
+            out["conversation_scope"] = "out_of_domain"
+            out["is_welfog_related"] = False
+            out["kb_keys"] = []
+            out["scope_reply"] = ""
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain OOD reconcile — translated English names external marketplace."
+            )
+            return out
+
+    if _brain_reasoning_indicates_ood(reasoning):
+        out["intent"] = "out_of_domain"
+        out["data_channel"] = "none"
+        out["conversation_scope"] = "out_of_domain"
+        out["is_welfog_related"] = False
+        out["kb_keys"] = []
+        out["scope_reply"] = ""
+        out["needs_order_id"] = False
+        out["run_catalog_search"] = False
+        out["_turn_promotions_done"] = True
+        log_reasoning("Brain OOD reconcile — reasoning field indicates off-topic.")
+        return out
+
+    if intent == "out_of_domain" or scope == "out_of_domain":
+        out["is_welfog_related"] = False
+        out["data_channel"] = "none"
+        out["conversation_scope"] = "out_of_domain"
+        out["_turn_promotions_done"] = True
+        return out
+
+    if related is False:
+        out["intent"] = "out_of_domain"
+        out["data_channel"] = "none"
+        out["conversation_scope"] = "out_of_domain"
+        out["scope_reply"] = ""
+        out["kb_keys"] = []
+        out["_turn_promotions_done"] = True
+        log_reasoning("Brain OOD reconcile — is_welfog_related=false from ai_brain_route.")
+        return out
+
+    um = (out.get("user_meaning") or "").strip()
+    if um and _brain_um_names_external_marketplace(um, reasoning):
+        out["intent"] = "out_of_domain"
+        out["data_channel"] = "none"
+        out["conversation_scope"] = "out_of_domain"
+        out["is_welfog_related"] = False
+        out["kb_keys"] = []
+        out["scope_reply"] = ""
+        out["_turn_promotions_done"] = True
+        log_reasoning(
+            "Brain OOD reconcile — user_meaning names external marketplace."
+        )
+        return out
+
+    if um and "welfog" not in um.lower():
+        ood_reasoning = _brain_reasoning_indicates_ood(reasoning)
+        platform_kb = set(kb_keys) & {"payment", "refund", "shipping", "seller", "terms", "privacy"}
+        if (
+            ood_reasoning
+            or related is False
+            or (
+                channel == "kb"
+                and intent == "general"
+                and related is not True
+            )
+            or (
+                channel == "kb"
+                and intent in ("refund", "payment", "seller")
+                and related is not True
+                and not platform_kb
+            )
+        ):
+            out["intent"] = "out_of_domain"
+            out["data_channel"] = "none"
+            out["conversation_scope"] = "out_of_domain"
+            out["is_welfog_related"] = False
+            out["kb_keys"] = []
+            out["scope_reply"] = ""
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain OOD reconcile — user_meaning names non-Welfog topic."
+            )
+            return out
+
+    if scope in ("general_chitchat", "harm_sensitive") and channel in (
+        "kb",
+        "live_api",
+        "catalog",
+    ):
+        if scope == "general_chitchat" and channel == "kb":
+            out["data_channel"] = "none"
+            out["kb_keys"] = []
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain scope reconcile — chitchat wins over contradictory kb channel."
+            )
+            return out
+        if channel == "kb":
+            out["conversation_scope"] = "welfog_support"
+            out["is_welfog_related"] = True
+            if not kb_keys:
+                try:
+                    from services.kb_service import resolve_brain_kb_keys
+
+                    resolved = resolve_brain_kb_keys(
+                        out, original_msg, msg_en=msg_en
+                    )
+                    if resolved:
+                        out["kb_keys"] = resolved
+                except ImportError:
+                    pass
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain scope reconcile — kb channel wins over general_chitchat."
+            )
+            return out
+        if channel == "catalog":
+            out["run_catalog_search"] = True
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain scope reconcile — catalog channel wins over general_chitchat."
+            )
+            return out
+        if channel == "live_api":
+            out["conversation_scope"] = "welfog_support"
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain scope reconcile — live_api channel wins over general_chitchat."
+            )
+            return out
+
+    if intent == "general" and channel == "kb" and scope not in ("welfog_support",):
+        um = (out.get("user_meaning") or "").strip()
+        generic_keys = not kb_keys or set(kb_keys) <= {"company", "faqs", "terms"}
+        welfog_topic = bool(um and "welfog" in um.lower())
+        if welfog_topic or (kb_keys and not generic_keys):
+            out["conversation_scope"] = "welfog_support"
+            if not kb_keys:
+                try:
+                    from services.kb_service import resolve_brain_kb_keys
+
+                    resolved = resolve_brain_kb_keys(
+                        out, original_msg, msg_en=msg_en
+                    )
+                    if resolved:
+                        out["kb_keys"] = resolved
+                except ImportError:
+                    pass
+            out["_turn_promotions_done"] = True
+            return out
+        if um or kb_keys:
+            out["intent"] = "out_of_domain"
+            out["conversation_scope"] = "out_of_domain"
+            out["data_channel"] = "none"
+            out["is_welfog_related"] = False
+            out["kb_keys"] = []
+            out["scope_reply"] = ""
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain OOD reconcile — general+kb generic keys, no Welfog in user_meaning."
+            )
+            return out
+        comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        echoed = um and comb and um.lower() == comb.lower()
+        if echoed or scope in ("general_chitchat", ""):
+            out["conversation_scope"] = (
+                "out_of_domain" if related is False else "general_chitchat"
+            )
+            if out["conversation_scope"] == "out_of_domain":
+                out["intent"] = "out_of_domain"
+                out["is_welfog_related"] = False
+            out["data_channel"] = "none"
+            out["kb_keys"] = []
+            out["scope_reply"] = ""
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Brain OOD reconcile — general+kb without kb_keys or user_meaning."
+            )
+    return out
+
+
+def _reconcile_delivery_policy_from_brain_json(route: dict) -> dict:
+    """
+    pincode_check without PIN misclassified when brain meant admin KB (policy/timeline).
+    Uses brain JSON + admin-KB embeddings only — never customer-text or English phrase lists.
+    """
+    from services.ai_route_semantics import ai_route_is_kb_read
+    from services.kb_service import resolve_brain_kb_keys
+    from services.query_understanding import top_customer_kb_file_match
+
+    out = dict(route or {})
+    intent = (out.get("intent") or "").strip().lower()
+    if intent != "pincode_check":
+        return out
+
+    # Live delivery API lock — never downgrade to static FAQ KB.
+    if out.get("_pincode_delivery_fast") or out.get("_pincode_delivery_locked"):
+        return out
+    rh = (out.get("route_handler") or "").strip().lower()
+    if rh == "pincode_delivery_api":
+        return out
+    if (out.get("data_channel") or "").strip().lower() == "live_api":
+        return out
+
+    try:
+        from services.location_delivery_resolver import (
+            resolve_delivery_turn,
+            _DELIVERY_AI_CONF_SERVICEABILITY,
+        )
+
+        um = (out.get("user_meaning") or "").strip()
+        orig = (out.get("_routing_msg") or um).strip()
+        understood = resolve_delivery_turn(
+            orig or um,
+            um,
+            "",
+            ai_route=out,
+            allow_llm=False,
+        )
+        if (
+            understood.is_serviceability
+            and understood.confidence >= _DELIVERY_AI_CONF_SERVICEABILITY
+        ):
+            return out
+        if understood.is_area_followup:
+            return out
+        if understood.location_kind in ("city", "pincode", "ask_pin"):
+            return out
+    except ImportError:
+        pass
+
+    if (out.get("extracted_pincode") or "").strip():
+        return out
+    nc = (out.get("numeric_context") or "").strip().lower()
+    reuse = (out.get("reuse_user_value_from_chat") or "").strip().lower()
+    if nc == "pincode" and reuse == "pincode":
+        return out
+
+    strategy = (out.get("answer_strategy") or "").strip().lower()
+    channel = (out.get("data_channel") or "").strip().lower()
+    keys = [k for k in (out.get("kb_keys") or []) if str(k).strip()]
+    um = (out.get("user_meaning") or "").strip()
+
+    to_kb = (
+        ai_route_is_kb_read(out)
+        or channel == "kb"
+        or strategy in ("kb_only", "kb_then_ai", "api_kb_ai")
+        or bool(keys)
+    )
+    if not to_kb and um:
+        top_key, top_score = top_customer_kb_file_match(um, um, ai_route=out)
+        if top_key and top_score >= 0.30:
+            to_kb = True
+            keys = keys or [top_key]
+    if not to_kb:
+        return out
+
+    resolved = resolve_brain_kb_keys(out, "", um, max_files=4)
+    out["intent"] = "general"
+    out["data_channel"] = "kb"
+    out["kb_keys"] = resolved or keys
+    out["run_catalog_search"] = False
+    out["needs_order_id"] = False
+    out["numeric_context"] = "none"
+    out["order_lookup_kind"] = "none"
+    out["route_handler"] = ""
+    out.pop("_pincode_delivery_locked", None)
+    out["_turn_promotions_done"] = True
+    log_reasoning(
+        "Brain delivery-policy reconcile — admin KB from brain JSON + embeddings."
+    )
+    return out
+
+
+def _try_zero_llm_universal_brain_route(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    ctx: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Obvious wishlist / deals / categories / product browse — skip ai_brain_route (~12s).
+    Uses msg_en (auto-translated) so Tamil/Hindi/Hinglish reach OpenSearch without routing LLM.
+    """
+    api_fast = _try_account_list_fast_path(original_msg, msg_en)
+    if api_fast:
+        _, route_data = api_fast
+        route_data = dict(route_data)
+        route_data["_universal_brain_route"] = True
+        route_data["_turn_promotions_done"] = True
+        route_data["_zero_llm_fast"] = True
+        log_reasoning("Universal brain — zero-LLM wishlist/order-list fast path.")
+        return route_data
+
+    try:
+        from services.ai_route_semantics import (
+            LIVE_API_FROM_GOAL,
+            _structural_details_or_invoice_goal_from_message,
+            _structural_refund_goal_from_message,
+            _structural_track_goal_from_message,
+        )
+        from utils.helpers import extract_order_id
+
+        comb_oid = f"{original_msg or ''} {msg_en or ''}".strip()
+        if comb_oid and extract_order_id(comb_oid, ""):
+            live_goal = (
+                _structural_refund_goal_from_message(original_msg, msg_en)
+                or _structural_details_or_invoice_goal_from_message(
+                    original_msg, msg_en
+                )
+                or _structural_track_goal_from_message(original_msg, msg_en)
+            )
+            if live_goal:
+                olk_map = {
+                    "track": "track",
+                    "order_invoice": "invoice",
+                    "order_details": "details",
+                    "refund_status": "refund_status",
+                    "payment": "details",
+                }
+                route_data = {
+                    "user_meaning": (msg_en or original_msg or "")[:200],
+                    "reasoning": f"Order id + {live_goal} — skip routing LLM.",
+                    "intent": "refund" if live_goal == "refund_status" else "order",
+                    "data_channel": "live_api",
+                    "needs_order_id": True,
+                    "numeric_context": "order_id",
+                    "order_lookup_kind": olk_map.get(live_goal, "details"),
+                    "route_handler": LIVE_API_FROM_GOAL.get(
+                        live_goal, "order_details_api"
+                    ),
+                    "run_catalog_search": False,
+                    "_preflight_api": True,
+                    "_universal_brain_route": True,
+                    "_turn_promotions_done": True,
+                    "_zero_llm_fast": True,
+                }
+                log_reasoning(
+                    f"Universal brain — zero-LLM order live goal={live_goal}."
+                )
+                return route_data
+    except ImportError:
+        pass
+
+    try:
+        from services.pincode_delivery_fast_path import (
+            try_pincode_delivery_fast_route,
+            turn_is_pincode_delivery_fast_path,
+        )
+
+        pin_fast = try_pincode_delivery_fast_route(
+            original_msg, msg_en, conv_for_llm="", ctx=ctx
+        )
+        if pin_fast:
+            _, route_data = pin_fast
+            route_data = dict(route_data)
+            route_data["_universal_brain_route"] = True
+            route_data["_turn_promotions_done"] = True
+            route_data["_zero_llm_fast"] = True
+            log_reasoning("Universal brain — zero-LLM pincode fast path (named PIN).")
+            return route_data
+
+        try:
+            from services.semantic_intent import zero_llm_intent_guess_allowed
+
+            allow_phrase_pin = zero_llm_intent_guess_allowed()
+        except ImportError:
+            allow_phrase_pin = False
+
+        if allow_phrase_pin and turn_is_pincode_delivery_fast_path(
+            original_msg, msg_en, "", ctx
+        ):
+            meaning = (msg_en or original_msg or "").strip()[:200]
+            route_data = {
+                "user_meaning": meaning or "Check Welfog delivery for customer's area or PIN",
+                "reasoning": "Pincode / delivery area — skip routing LLM.",
+                "intent": "pincode_check",
+                "data_channel": "live_api",
+                "needs_order_id": False,
+                "run_catalog_search": False,
+                "numeric_context": "pincode",
+                "order_lookup_kind": "none",
+                "route_handler": "pincode_delivery_api",
+                "_preflight_api": True,
+                "_pincode_delivery_fast": True,
+                "_pincode_delivery_locked": True,
+                "_universal_brain_route": True,
+                "_turn_promotions_done": True,
+                "_zero_llm_fast": True,
+                "_routing_msg": (original_msg or "").strip(),
+            }
+            log_reasoning(
+                "Universal brain — zero-LLM pincode area/thread (skip routing LLM)."
+            )
+            return route_data
+    except ImportError:
+        pass
+
+    catalog_fast = _try_catalog_menu_fast_path(original_msg, msg_en, ctx=ctx)
+    if catalog_fast:
+        _, route_data = catalog_fast
+        route_data = dict(route_data)
+        route_data["_universal_brain_route"] = True
+        route_data["_turn_promotions_done"] = True
+        route_data["_zero_llm_fast"] = True
+        log_reasoning("Universal brain — zero-LLM deals/categories fast path.")
+        return route_data
+
+    try:
+        from services.semantic_intent import zero_llm_intent_guess_allowed
+
+        if not zero_llm_intent_guess_allowed():
+            return None
+        from services.conversation_followup import is_deals_request_message
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+        from utils.helpers import (
+            _message_looks_like_shopping_query,
+            _text_is_phone_product_accessory_context,
+            message_asks_welfog_categories_list,
+            message_is_past_purchase_list_request,
+            message_is_wishlist_like_request,
+            turn_is_obvious_product_shopping_turn,
+        )
+        comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        if comb and (
+            is_deals_request_message(original_msg, msg_en)
+            or message_asks_welfog_categories_list(comb)
+        ):
+            pass
+        elif comb and turn_requests_delivery_serviceability(
+            original_msg, msg_en, "", allow_llm=False
+        ):
+            pass
+        elif comb and (
+            _message_looks_like_shopping_query(comb)
+            or _text_is_phone_product_accessory_context(comb)
+            or turn_is_obvious_product_shopping_turn(original_msg, msg_en, "")
+        ):
+            try:
+                from services.pincode_delivery_fast_path import (
+                    turn_is_pincode_delivery_fast_path,
+                )
+
+                if turn_is_pincode_delivery_fast_path(original_msg, msg_en, "", ctx):
+                    return None
+            except ImportError:
+                pass
+            try:
+                from utils.helpers import _text_is_delivery_serviceability_hypothetical
+
+                if _text_is_delivery_serviceability_hypothetical(comb):
+                    return None
+            except ImportError:
+                pass
+            try:
+                from utils.helpers import (
+                    _naive_six_digit_pin_from_text,
+                    message_has_live_pincode_check_intent,
+                )
+
+                if _naive_six_digit_pin_from_text(comb) and message_has_live_pincode_check_intent(
+                    original_msg, "", msg_en
+                ):
+                    return None
+            except ImportError:
+                pass
+            if message_is_wishlist_like_request(comb) or message_is_past_purchase_list_request(
+                comb
+            ):
+                return None
+            product_route: dict = {
+                "intent": "product",
+                "data_channel": "catalog",
+                "run_catalog_search": True,
+                "_product_catalog_locked": True,
+                "_universal_brain_route": True,
+                "_turn_promotions_done": True,
+                "_zero_llm_fast": True,
+                "_needs_product_nlu_llm": False,
+                "_ai_single_pass": True,
+            }
+            log_reasoning(
+                "Universal brain — zero-LLM product lock (AI NLU → OpenSearch, no keyword sq)."
+            )
+            return product_route
+    except ImportError:
+        pass
+    return None
+
+
 def early_universal_brain_route(
     original_msg: str,
     conv_for_llm: str = "",
@@ -2027,8 +2879,44 @@ def early_universal_brain_route(
     ONE LLM at turn start — meaning + intent for greeting, chitchat, API, KB, product, order.
     Cached for the rest of the HTTP request (no duplicate micro-classifiers).
     """
+    ood_fast = _try_obvious_out_of_domain_route(
+        original_msg, msg_en, reply_lang=reply_lang
+    )
+    if ood_fast:
+        try:
+            from services.chat_flow_telemetry import store_brain_route_result
+
+            store_brain_route_result(ood_fast)
+        except ImportError:
+            pass
+        return ood_fast
+
+    route_msg, route_msg_en, _mixed = _strip_greeting_filler_from_mixed_turn(
+        original_msg, msg_en
+    )
+    if _mixed:
+        original_msg = route_msg
+        msg_en = route_msg_en
+
+    ood_fast = _try_obvious_out_of_domain_route(
+        original_msg, msg_en, reply_lang=reply_lang
+    )
+    if ood_fast:
+        try:
+            from services.chat_flow_telemetry import store_brain_route_result
+
+            store_brain_route_result(ood_fast)
+        except ImportError:
+            pass
+        return ood_fast
+
+    route_data: dict | None = None
     try:
-        from services.chat_flow_telemetry import get_cached_brain_route
+        from services.chat_flow_telemetry import (
+            get_cached_brain_route,
+            guard_duplicate_brain_route,
+            store_brain_route_result,
+        )
 
         cached = get_cached_brain_route()
         if _brain_route_is_usable(cached) and cached.get("_turn_promotions_done"):
@@ -2037,31 +2925,186 @@ def early_universal_brain_route(
                 f"scope={cached.get('conversation_scope')}"
             )
             return cached
+        dup = guard_duplicate_brain_route("early_universal_brain_route")
+        if dup is not None:
+            if dup.get("llm_unavailable"):
+                log_reasoning("Universal brain route (reuse): LLM unavailable this turn.")
+                return dup
+            if _brain_route_is_usable(dup):
+                if dup.get("_turn_promotions_done"):
+                    log_reasoning(
+                        f"Universal brain route (reuse): intent={dup.get('intent')} "
+                        f"scope={dup.get('conversation_scope')}"
+                    )
+                    return dup
+                route_data = dict(dup)
     except ImportError:
         pass
 
-    route_data = ai_brain_route(original_msg, conv_for_llm, reply_lang=reply_lang)
-    if not _brain_route_is_usable(route_data):
-        return route_data if isinstance(route_data, dict) else None
-
-    route_data = dict(route_data)
-    route_data["_universal_brain_route"] = True
-    try:
-        from services.ai_route_semantics import enrich_universal_brain_route
-
-        route_data = enrich_universal_brain_route(
-            route_data,
-            original_msg,
-            msg_en,
-            conv_for_llm,
-            reply_lang=reply_lang,
-            ctx=ctx,
+    _t_enrich_gate = time.perf_counter()
+    if route_data is None:
+        route_data = _try_zero_llm_universal_brain_route(
+            original_msg, msg_en, ctx=ctx
         )
+        if isinstance(route_data, dict):
+            try:
+                from services.chat_flow_telemetry import store_brain_route_result
+
+                store_brain_route_result(route_data)
+            except ImportError:
+                pass
+
+    if route_data is None:
+        try:
+            from services.chat_flow_telemetry import ensure_brain_route_llm_slot
+
+            ensure_brain_route_llm_slot()
+        except ImportError:
+            pass
+        log_reasoning("Universal brain — ai_brain_route starting (one LLM).")
+        route_data = ai_brain_route(
+            original_msg, conv_for_llm, reply_lang=reply_lang, msg_en=msg_en
+        )
+        if isinstance(route_data, dict):
+            try:
+                from services.chat_flow_telemetry import store_brain_route_result
+
+                store_brain_route_result(route_data)
+            except ImportError:
+                pass
+        if not _brain_route_is_usable(route_data):
+            return route_data if isinstance(route_data, dict) else None
+        route_data = dict(route_data)
+
+    try:
+        from services.ai_route_semantics import repair_brain_json_quality
+
+        route_data = repair_brain_json_quality(route_data, original_msg, msg_en=msg_en)
+    except ImportError:
+        pass
+    route_data["_universal_brain_route"] = True
+    route_data = _reconcile_off_topic_brain_misroute(
+        route_data, original_msg, msg_en=msg_en
+    )
+    route_data = _reconcile_delivery_policy_from_brain_json(route_data)
+    intent_ub = (route_data.get("intent") or "").strip().lower()
+    try:
+        from services.account_list_semantics import reconcile_account_list_from_brain_meaning
+
+        route_data = reconcile_account_list_from_brain_meaning(route_data)
+        if (route_data.get("intent") or "").strip().lower() == "wishlist":
+            route_data["data_channel"] = "live_api"
+            route_data.setdefault("account_list_kind", "wishlist_in_chat")
+            route_data["run_catalog_search"] = False
+            route_data["_turn_promotions_done"] = True
+    except ImportError:
+        pass
+    intent_ub = (route_data.get("intent") or "").strip().lower()
+    if intent_ub == "order_history":
+        route_data["data_channel"] = "live_api"
+        route_data["needs_order_id"] = False
+        route_data.setdefault("account_list_kind", "purchase_history_in_chat")
+        route_data["run_catalog_search"] = False
+        route_data["_turn_promotions_done"] = True
+    elif intent_ub == "wishlist":
+        route_data["data_channel"] = "live_api"
+        route_data.setdefault("account_list_kind", "wishlist_in_chat")
+        route_data["run_catalog_search"] = False
+        route_data["_turn_promotions_done"] = True
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+        from services.ai_route_semantics import brain_route_indicates_account_list_live
+
+        if account_list_route_is_locked(
+            route_data
+        ) or brain_route_indicates_account_list_live(route_data):
+            route_data["_turn_promotions_done"] = True
+            route_data.setdefault("data_channel", "live_api")
+            route_data["needs_order_id"] = False
+            route_data["run_catalog_search"] = False
+            log_reasoning(
+                "Universal brain — account-list from AI JSON; skip enrich/product/pincode stack."
+            )
+            try:
+                from services.chat_flow_telemetry import store_brain_route_result
+
+                store_brain_route_result(route_data)
+            except ImportError:
+                pass
+            return route_data
+    except ImportError:
+        pass
+    try:
+        from services.ai_route_semantics import (
+            brain_route_skip_heavy_enrich,
+            enrich_universal_brain_route,
+        )
+
+        if brain_route_skip_heavy_enrich(route_data):
+            route_data["_turn_promotions_done"] = True
+            if isinstance(ctx, dict) and ctx.get("last"):
+                route_data["_ctx_last"] = ctx.get("last")
+            log_reasoning(
+                "Universal brain — raw OOD/KB route; skip enrich before dispatch."
+            )
+        else:
+            route_data = enrich_universal_brain_route(
+                route_data,
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang=reply_lang,
+                ctx=ctx,
+            )
     except ImportError:
         if isinstance(ctx, dict) and ctx.get("last"):
             route_data["_ctx_last"] = ctx.get("last")
 
     um = (route_data.get("user_meaning") or "").strip()
+    if not route_data.get("_turn_promotions_done"):
+        try:
+            from services.query_understanding import score_routing_confidence
+
+            route_conf = score_routing_confidence(
+                route_data,
+                original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            )
+            from services.chat_flow_telemetry import record_routing_confidence
+
+            record_routing_confidence(route_conf)
+        except ImportError:
+            route_conf = None
+        try:
+            from services.chat_flow_telemetry import (
+                extract_turn_entities,
+                log_routing_decision,
+            )
+
+            ent_map = extract_turn_entities(
+                route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            )
+            log_routing_decision(
+                query=original_msg,
+                language=reply_lang or "",
+                intent=(route_data.get("intent") or ""),
+                confidence=route_conf,
+                entities=ent_map,
+                selected_route=(route_data.get("data_channel") or ""),
+                selected_tool=(
+                    route_data.get("route_handler") or route_data.get("data_channel") or ""
+                ),
+            )
+        except ImportError:
+            pass
+        except Exception as tele_exc:
+            log_reasoning(f"Universal brain telemetry skip: {tele_exc}")
+    else:
+        route_conf = None
     log_reasoning(
         f"Universal brain route: intent={route_data.get('intent')} "
         f"channel={route_data.get('data_channel')} "
@@ -2085,7 +3128,6 @@ def _finalize_brain_route_decision(
     ctx: Optional[dict] = None,
 ) -> tuple[AnswerRouteDecision, dict]:
     """Enrich cached brain JSON → locked handler decision (no extra routing LLM)."""
-    from utils.debug_session_log import dbg
     from services.ai_route_semantics import _normalize_llm_route
 
     route_data = _normalize_llm_route(dict(route_data))
@@ -2135,27 +3177,33 @@ def _finalize_brain_route_decision(
                 intent_ub = (route_data.get("intent") or "").strip().lower()
                 ch_ub = (route_data.get("data_channel") or "").strip().lower()
                 if intent_ub == "product" and ch_ub == "catalog":
-                    sq_ub = (route_data.get("search_query") or "").strip()
-                    if not sq_ub:
-                        try:
-                            from utils.helpers import extract_product_search_query
-
-                            sq_ub = extract_product_search_query(
-                                original_msg,
-                                msg_en,
-                                route_data.get("search_query"),
-                                ai_route=route_data,
-                            ) or comb_ub
-                        except ImportError:
-                            sq_ub = comb_ub
-                    route_data["search_query"] = sq_ub
                     route_data["run_catalog_search"] = True
                     route_data["_product_catalog_locked"] = True
                     route_data["needs_order_id"] = False
                     route_data["numeric_context"] = "none"
+                    try:
+                        from services.ai_route_semantics import (
+                            _brain_product_entities_from_route,
+                        )
+
+                        ent_ub = _brain_product_entities_from_route(
+                            route_data,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                        )
+                        if ent_ub:
+                            route_data["_product_entities"] = ent_ub
+                    except ImportError:
+                        ent_ub = {}
+                    if not (
+                        ent_ub.get("pro_id")
+                        or ent_ub.get("sku")
+                        or ent_ub.get("product_id")
+                    ):
+                        route_data["_needs_product_nlu_llm"] = True
                     fast_locked = True
                     log_reasoning(
-                        f"Universal brain fast path: product catalog sq={sq_ub!r}."
+                        "Universal brain fast path: product catalog lock → AI product NLU."
                     )
                 else:
                     try:
@@ -2358,12 +3406,6 @@ def _finalize_brain_route_decision(
     decision = _decision_from_ai_route(
         route_data, original_msg, msg_en, conv_for_llm, ctx=ctx
     )
-    dbg(
-        "H1",
-        "ai_first_router.py:return",
-        "route decision ready",
-        {"intent": decision.intent, "handler": decision.handler},
-    )
     try:
         from services.chat_flow_telemetry import store_turn_analysis
 
@@ -2400,6 +3442,32 @@ def resolve_answer_route_ai_first(
         _text_is_product_id_lookup_context,
     )
 
+    route_msg, route_msg_en, _mixed = _strip_greeting_filler_from_mixed_turn(
+        original_msg, msg_en
+    )
+    if _mixed:
+        original_msg = route_msg
+        msg_en = route_msg_en
+
+    ood_obvious = _try_obvious_out_of_domain_route(
+        original_msg, msg_en, reply_lang=reply_lang
+    )
+    if ood_obvious:
+        try:
+            from services.chat_flow_telemetry import store_brain_route_result
+
+            store_brain_route_result(ood_obvious)
+        except ImportError:
+            pass
+        return _finalize_brain_route_decision(
+            ood_obvious,
+            original_msg,
+            msg_en,
+            conv_for_llm=conv_for_llm,
+            reply_lang=reply_lang,
+            ctx=ctx,
+        )
+
     combined = f"{original_msg} {msg_en}".strip()
     comb_norm = _normalize_order_chat_text(combined)
     comb_low = comb_norm.lower()
@@ -2409,6 +3477,7 @@ def resolve_answer_route_ai_first(
         "no",
         "off",
     )
+    _txn_turn = _transactional_beats_greeting(original_msg, msg_en, conv_for_llm)
 
     if extract_product_id(comb_low) and _text_is_product_id_lookup_context(comb_low):
         pid = extract_product_id(comb_low)
@@ -2576,9 +3645,11 @@ def resolve_answer_route_ai_first(
     except ImportError:
         pass
 
-    conv_fast = _try_conversational_fast_path(
-        original_msg, msg_en, conv_for_llm, reply_lang
-    )
+    conv_fast = None
+    if not _txn_turn:
+        conv_fast = _try_conversational_fast_path(
+            original_msg, msg_en, conv_for_llm, reply_lang
+        )
     if conv_fast:
         decision, route_data = conv_fast
         try:
@@ -2614,7 +3685,9 @@ def resolve_answer_route_ai_first(
             pass
         return decision, route_data
 
-    preflight = _try_policy_kb_preflight(original_msg, msg_en, reply_lang)
+    preflight = None
+    if not _txn_turn:
+        preflight = _try_policy_kb_preflight(original_msg, msg_en, reply_lang)
     if preflight:
         decision, route_data = preflight
         try:
@@ -2640,20 +3713,18 @@ def resolve_answer_route_ai_first(
             pass
         return decision, route_data
 
-    # === LLM routing for API/catalog/ambiguous turns ===
-    from utils.debug_session_log import dbg
+    # === ONE semantic evaluation — universal brain (no duplicate ai_brain_route) ===
 
-    dbg("H1", "ai_first_router.py:pre_brain", "before ai_brain_route", {"msg_len": len(original_msg or "")})
-    route_data = ai_brain_route(original_msg, conv_for_llm, reply_lang=reply_lang)
+    route_data = early_universal_brain_route(
+        original_msg,
+        conv_for_llm,
+        reply_lang=reply_lang,
+        msg_en=msg_en,
+        ctx=ctx,
+    )
     if route_data and isinstance(ctx, dict) and ctx.get("last"):
         route_data = dict(route_data)
         route_data["_ctx_last"] = ctx.get("last")
-    dbg(
-        "H1",
-        "ai_first_router.py:post_brain",
-        "after ai_brain_route",
-        {"has_route": bool(route_data), "intent": (route_data or {}).get("intent")},
-    )
 
     if route_data:
         return _finalize_brain_route_decision(

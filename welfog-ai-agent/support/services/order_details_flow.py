@@ -1381,6 +1381,38 @@ def understand_single_order_request(
     Primary classifier for one-order flows. Cached per request thread to avoid duplicate LLM calls.
     Returns goal: '' | order_invoice | order_details | track_single_order
     """
+    try:
+        from services.knowledge_query_pipeline import kb_vector_fast_lane_active
+
+        if kb_vector_fast_lane_active():
+            return {
+                "goal": "",
+                "action": "not_order_topic",
+                "field_focus": "summary",
+                "order_id": "",
+                "confidence": "high",
+                "source": "kb_vector_lane",
+                "reasoning": "KB vector fast lane — skip order-intent classifier.",
+                "is_welfog_related": True,
+            }
+    except Exception:
+        pass
+    try:
+        from services.chat_flow_telemetry import should_defer_micro_classifiers_to_brain
+
+        if should_defer_micro_classifiers_to_brain() and not isinstance(ai_route, dict):
+            return {
+                "goal": "",
+                "action": "not_order_topic",
+                "field_focus": "summary",
+                "order_id": "",
+                "confidence": "medium",
+                "source": "awaiting_brain_route",
+                "reasoning": "Universal ai_brain_route classifies first — skip order-intent stack.",
+                "is_welfog_related": True,
+            }
+    except ImportError:
+        pass
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     cache_key = f"{hash(comb)}|{hash((conversation_context or '')[-500:])}"
     if (
@@ -1870,6 +1902,13 @@ def message_wants_order_details_or_invoice(
     ai_route: dict | None = None,
 ) -> str:
     """'' | 'order_invoice' | 'order_details' — blocks live tracking shortcuts."""
+    try:
+        from services.knowledge_query_pipeline import kb_vector_fast_lane_active
+
+        if kb_vector_fast_lane_active():
+            return ""
+    except Exception:
+        pass
     comb = _combined(original_msg, msg_en)
     try:
         from utils.helpers import message_is_general_delivery_policy_question

@@ -363,6 +363,150 @@ JSON only."""
     return finalize_customer_reply(_wrap_ack_html(raw), original_msg or msg_en, rl)
 
 
+def ai_ood_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+) -> str:
+    """Out-of-domain reply — AI only, mirrors user language/style."""
+    if (os.getenv("CHITCHAT_AI_REPLY", "1") or "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return ""
+
+    from services.ai_service import (
+        _compact_conversation_context,
+        _llm_json_with_provider_fallback,
+        _llm_classifier_provider_chain,
+        _trim_text_mid,
+    )
+    from services.translation_service import (
+        finalize_customer_reply,
+        language_reply_instruction,
+        resolve_customer_reply_lang,
+    )
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+
+    rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+    compact_ctx = _compact_conversation_context(conversation_context or "", 1800)
+    user_line = _trim_text_mid(comb, 240)
+
+    system_prompt = f"""You are Welfog's shopping support assistant in live chat.
+
+The user's message is OUT OF DOMAIN — not about Welfog shopping, orders, delivery, or support.
+
+Return ONLY JSON: {{"reasoning":"1 line","response":"reply"}}
+
+RULES:
+- "response" in the SAME language, script, and tone as the user's LATEST message.
+- 1-3 short sentences: briefly acknowledge their topic in their style, say you only help
+  with Welfog shopping/orders/delivery, invite a Welfog question.
+- Do NOT answer off-topic facts (weather, cricket, recipes, homework, etc.).
+- Warm and human — not a stiff corporate template.
+{language_reply_instruction(rl)}
+JSON only."""
+
+    user_payload = ""
+    if compact_ctx:
+        user_payload += f"RECENT CONVERSATION:\n{compact_ctx}\n\n"
+    user_payload += f"LATEST USER MESSAGE (off-topic):\n{user_line}"
+
+    providers = _llm_classifier_provider_chain()
+    if not providers:
+        return ""
+
+    data = _llm_json_with_provider_fallback(
+        providers,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ],
+        max_tokens=200,
+        timeout_sec=8,
+        max_attempts=1,
+        temperature=0.35,
+    )
+    if not data:
+        return ""
+    raw = (data.get("response") or "").strip()
+    if not raw:
+        return ""
+    log_reasoning(f"OOD AI reply: {(data.get('reasoning') or '')[:100]}")
+    return finalize_customer_reply(_wrap_ack_html(raw), original_msg or msg_en, rl)
+
+
+def ai_natural_scope_reply(
+    scope: str,
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    ctx: dict | None = None,
+) -> str:
+    """AI-generated chitchat or OOD reply — never static KB templates."""
+    scope_l = (scope or "").strip().lower()
+    if scope_l == "out_of_domain":
+        return ai_ood_reply(
+            original_msg, msg_en, conversation_context, reply_lang=reply_lang
+        )
+    return ai_chitchat_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ctx=ctx,
+    )
+
+
+def resolve_brain_scope_customer_reply(
+    brain_route: dict | None,
+    scope: str,
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    ctx: dict | None = None,
+) -> str:
+    """
+    Use brain scope_reply when present; otherwise one AI reply call (no templates).
+    """
+    from services.conversation_scope import finalize_scope_reply_html
+
+    try:
+        from services.brain_direct_dispatch import _scope_reply_is_placeholder
+    except ImportError:
+
+        def _scope_reply_is_placeholder(text: str) -> bool:  # type: ignore
+            return not (text or "").strip()
+
+    scope_reply = ""
+    if isinstance(brain_route, dict):
+        scope_reply = (brain_route.get("scope_reply") or "").strip()
+    if scope_reply and not _scope_reply_is_placeholder(scope_reply):
+        return finalize_scope_reply_html(
+            scope_reply, original_msg, reply_lang=reply_lang
+        )
+
+    body = ai_natural_scope_reply(
+        scope,
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ctx=ctx,
+    )
+    if body:
+        log_reasoning(f"Brain scope AI reply ({scope}) — no template fallback.")
+    return body or ""
+
+
 def resolve_natural_conversational_reply(
     original_msg: str,
     msg_en: str = "",
@@ -405,7 +549,7 @@ def resolve_natural_conversational_reply(
             )
             if scope_dec and scope_dec.scope == SCOPE_OUT:
                 body = build_scope_reply(
-                    scope_dec, original_msg, msg_en, rl, prefer_llm=False
+                    scope_dec, original_msg, msg_en, rl, prefer_llm=True
                 )
                 if body:
                     log_reasoning("Natural conversational reply — out-of-domain scope LLM.")
@@ -420,20 +564,6 @@ def resolve_natural_conversational_reply(
     if body:
         log_reasoning("Natural conversational reply — chitchat AI.")
         return body
-
-    from utils.helpers import (
-        fast_warm_reply_html,
-        should_send_warm_greeting_reply,
-    )
-
-    if should_send_warm_greeting_reply(original_msg, msg_en, conversation_context):
-        warm = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
-        if warm:
-            return finalize_customer_reply(warm, original_msg or msg_en, rl)
-    tmpl = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
-    if tmpl:
-        log_reasoning("Natural conversational reply — template fallback.")
-        return finalize_customer_reply(tmpl, original_msg or msg_en, rl)
     return ""
 
 

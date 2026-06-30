@@ -136,10 +136,29 @@ def _structural_message_live_goal_no_id(
     msg_en: str = "",
     conversation_context: str = "",
 ) -> str:
-    """Zero-LLM single-order goal from customer text when no order id in message."""
+    """Zero-LLM single-order goal — LLM-unavailable failsafe only (not primary router)."""
+    try:
+        from services.semantic_intent import zero_llm_intent_guess_allowed
+
+        if not zero_llm_intent_guess_allowed():
+            return ""
+    except ImportError:
+        pass
     comb = _combined(original_msg, msg_en)
     if not comb or re.search(r"\b[0-9]{4,20}\b", comb):
         return ""
+    try:
+        from utils.helpers import (
+            _text_wants_order_history_list_in_chat,
+            message_is_past_purchase_list_request,
+        )
+
+        if _text_wants_order_history_list_in_chat(
+            comb, conversation_context
+        ) or message_is_past_purchase_list_request(comb):
+            return ""
+    except ImportError:
+        pass
     if re.search(
         r"\b(?:invoice|invoic\w*|bill|receipt|gst|chalan|challan)\b",
         comb,
@@ -162,6 +181,16 @@ def _structural_message_live_goal_no_id(
         if not any(m in tl for m in track_markers):
             return "order_invoice"
     try:
+        from services.order_details_flow import _lightweight_details_or_invoice_signal
+
+        light = (_lightweight_details_or_invoice_signal(comb) or "").strip()
+        if light == "order_invoice":
+            return "order_invoice"
+        if light == "order_details":
+            return "order_details"
+    except ImportError:
+        pass
+    try:
         from utils.helpers import (
             _text_is_order_tracking_intent_leaf,
             _text_is_undelivered_order_complaint,
@@ -173,16 +202,6 @@ def _structural_message_live_goal_no_id(
                 comb
             ) or _text_is_undelivered_order_complaint(comb):
                 return "track"
-    except ImportError:
-        pass
-    try:
-        from services.order_details_flow import _lightweight_details_or_invoice_signal
-
-        light = (_lightweight_details_or_invoice_signal(comb) or "").strip()
-        if light == "order_invoice":
-            return "order_invoice"
-        if light == "order_details":
-            return "order_details"
     except ImportError:
         pass
     try:
@@ -857,32 +876,16 @@ def try_order_live_intent_fast_reply(
                 intent=intent,
             )
             if body and isinstance(ctx, dict):
-                ctx["order_id"] = None
-                ctx["awaiting"] = "order_id"
-                ctx["last"] = intent
-                ctx.setdefault("data", {})["pending_action"] = goal
-                ctx["data"]["topic_mode"] = f"order_{goal}"
                 try:
-                    from services.ai_route_semantics import LIVE_API_FROM_GOAL
+                    from services.order_id_handoff_fast_path import lock_order_id_ask_session
 
-                    handler = LIVE_API_FROM_GOAL.get(goal, "")
-                    olk_map = {
-                        "track": "track",
-                        "order_invoice": "invoice",
-                        "order_details": "details",
-                        "payment": "details",
-                        "refund_status": "refund_status",
-                    }
-                    ctx["data"]["ai_route"] = {
-                        "intent": "refund" if goal == "refund_status" else "order",
-                        "data_channel": "live_api",
-                        "needs_order_id": True,
-                        "numeric_context": "order_id",
-                        "order_lookup_kind": olk_map.get(goal, ""),
-                        "route_handler": handler,
-                    }
+                    lock_order_id_ask_session(ctx, goal, intent_label=intent)
                 except ImportError:
-                    pass
+                    ctx["order_id"] = None
+                    ctx["awaiting"] = "order_id"
+                    ctx["last"] = intent
+                    ctx.setdefault("data", {})["pending_action"] = goal
+                    ctx["data"]["topic_mode"] = f"order_{goal}"
             try:
                 from services.chat_flow_telemetry import log_order_dispatch
 

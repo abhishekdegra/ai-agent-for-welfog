@@ -7,6 +7,7 @@ Supported:
 - hi, mr: Devanagari (Hindi / Marathi — disambiguated when possible)
 - pa: Punjabi (Gurmukhi), gu: Gujarati, ta: Tamil, te: Telugu, kn: Kannada, ml: Malayalam, bn: Bengali, ur: Urdu
 """
+import os
 import re
 from langdetect import detect
 from deep_translator import GoogleTranslator
@@ -358,6 +359,39 @@ def to_en(text):
     except Exception as e:
         log_reasoning(f"Translation error (to_en): {e}. Using original text for processing.")
     return text
+
+
+def to_en_for_routing(text: str, lang: str = "") -> str:
+    """
+    English hint for ai_brain_route / OpenSearch — includes Hinglish and native scripts.
+    Roman Hinglish skips external translate (brain is multilingual); native scripts use
+    a short timeout so /chat never blocks minutes on Google.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    lang = _normalize_language(lang) if lang else resolve_customer_reply_lang(raw)
+    if lang in ("en", "hinglish"):
+        return raw.lower()
+    try:
+        import concurrent.futures
+
+        def _do_translate():
+            return GoogleTranslator(source="auto", target="en").translate(raw)
+
+        timeout = float(os.getenv("ROUTING_TRANSLATE_TIMEOUT_SEC", "4") or "4")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            fut = pool.submit(_do_translate)
+            result = fut.result(timeout=max(1.0, timeout))
+        if result and isinstance(result, str) and len(result.strip()) > 1:
+            return result.strip().lower()
+    except TimeoutError:
+        log_reasoning(
+            f"Routing translate timeout — using original text ({len(raw)} chars)."
+        )
+    except Exception as e:
+        log_reasoning(f"Routing translate (to_en_for_routing): {e}")
+    return raw.lower()
 
 
 def _translate_html(text: str, lang: str) -> str:

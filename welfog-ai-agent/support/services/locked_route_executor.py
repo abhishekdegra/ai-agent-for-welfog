@@ -1125,6 +1125,25 @@ def locked_route_fallback(
         from services.chat_resilience import build_busy_reply_html
 
         log_reasoning("Locked fallback: infra busy reply (last resort).")
+        try:
+            from services.conversation_zero_llm_fallback import (
+                try_zero_llm_customer_reply,
+            )
+
+            recovered = try_zero_llm_customer_reply(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang=lang,
+                ai_route=ai_route,
+            )
+            if recovered:
+                log_reasoning(
+                    "Locked fallback Tier 6 — zero-LLM KB/chitchat instead of busy."
+                )
+                return recovered
+        except ImportError:
+            pass
         return build_busy_reply_html(original_msg, lang)
     except ImportError:
         return None

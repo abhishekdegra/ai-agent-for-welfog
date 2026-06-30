@@ -1,4 +1,5 @@
 import difflib
+import os
 import re
 import threading
 import time
@@ -2585,7 +2586,8 @@ def _ensure_accumulated_rows(uid: str, min_length: int):
     uid = str(uid).strip()
     max_fetch_rounds = 6
     rounds = 0
-    while rounds < max_fetch_rounds:
+    deadline = time.time() + float(os.getenv("PH_FETCH_BUDGET_SEC", "14") or "14")
+    while rounds < max_fetch_rounds and time.time() < deadline:
         rounds += 1
         with _PH_ACCUM_LOCK:
             now = time.time()

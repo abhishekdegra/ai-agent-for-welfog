@@ -151,9 +151,7 @@ function setChatComposerLocked(locked) {
     const input = document.getElementById("chatInput");
     const btn = document.getElementById("chatSendBtn");
     const inner = document.querySelector(".composer__inner");
-    if (input) {
-        input.disabled = !!locked;
-    }
+    // Keep typing while the bot works — only block duplicate sends.
     if (btn) {
         btn.disabled = !!locked;
     }
@@ -236,7 +234,7 @@ async function send(){
         showTyping();
 
         const chatCtrl = new AbortController();
-        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 120000);
+        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 95000);
         let res;
         try {
             res = await fetch(addUserIdToApiPath("/chat"), {
@@ -254,6 +252,8 @@ async function send(){
                 "<div style='color:#333;line-height:1.55;'>Sorry — something went wrong on our side. Please try again in a moment.</div>",
                 "bot"
             );
+            chatAwaitingReply = false;
+            setChatComposerLocked(false);
             return;
         }
         const data = await res.json();
@@ -265,21 +265,41 @@ async function send(){
 
         removeTyping();
         addMessage(data.data, "bot");
+
+        chatAwaitingReply = false;
+        setChatComposerLocked(false);
+
+        if (currentChatId) {
+            fetch(addUserIdToApiPath("/api/chat/unlock"), {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ chat_id: currentChatId, user_id: getUserIdFromUrl() })
+            }).catch(function() {});
+        }
+
         const historyPanel = document.getElementById("historyPanel");
         if (historyPanel && historyPanel.classList.contains("open")) {
-            await refreshHistoryList();
+            refreshHistoryList().catch(function() {});
         } else {
             syncHistoryActive();
         }
     } catch (e) {
         removeTyping();
+        chatAwaitingReply = false;
+        setChatComposerLocked(false);
+        if (e && e.name === "AbortError") {
+            try {
+                await fetch(addUserIdToApiPath("/api/chat/unlock"), {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ chat_id: currentChatId, user_id: getUserIdFromUrl() })
+                });
+            } catch (unlockErr) { /* ignore */ }
+        }
         const busyMsg = (e && e.name === "AbortError")
             ? "<div style='color:#333;line-height:1.55;'>This is taking longer than usual — your reply may still be processing. Please wait a few seconds and send the same message again if nothing appears.</div>"
             : "<div style='color:#333;line-height:1.55;'>Sorry — we could not reach the server. Please check your connection and try again in a moment.</div>";
         addMessage(busyMsg, "bot");
-    } finally {
-        chatAwaitingReply = false;
-        setChatComposerLocked(false);
     }
 }
 
@@ -589,6 +609,13 @@ async function newChat() {
     currentChatId = null;
     setChatIdInUrl(null);
     enterLandingMode();
+    try {
+        await fetch(addUserIdToApiPath("/api/chat/unlock"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ chat_id: null, user_id: getUserIdFromUrl() })
+        });
+    } catch (e) { /* ignore */ }
     await fetch(addUserIdToApiPath("/api/chat/new"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -605,9 +632,20 @@ async function newChat() {
 
 async function refreshHistoryList() {
     const list = document.getElementById("historyList");
+    if (!list) return;
     list.innerHTML = "<div class=\"hist-placeholder\">Loading…</div>";
-    const res = await fetch(addUserIdToApiPath("/api/chats"));
-    const chats = await res.json();
+    const ctrl = new AbortController();
+    const timer = setTimeout(function() { ctrl.abort(); }, 8000);
+    let chats = [];
+    try {
+        const res = await fetch(addUserIdToApiPath("/api/chats"), { signal: ctrl.signal });
+        chats = await res.json();
+    } catch (e) {
+        list.innerHTML = "<div class=\"hist-placeholder\">No recent chats</div>";
+        return;
+    } finally {
+        clearTimeout(timer);
+    }
     list.innerHTML = "";
     if (chats.length === 0) {
         list.innerHTML = "<div class=\"hist-placeholder\">No recent chats</div>";
@@ -623,6 +661,7 @@ async function refreshHistoryList() {
         row.className = "hist-item-row";
 
         const body = document.createElement("div");
+        body.className = "hist-item-body";
         const title = document.createElement("div");
         title.className = "hist-title";
         title.textContent = c.title;

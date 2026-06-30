@@ -81,18 +81,294 @@ def _scope_reply_is_placeholder(text: str) -> bool:
     ):
         return True
     if len(low) < 12:
-        return low in ("warm", "thanks", "ok", "okay", "hi", "hello")
+        return low in ("warm", "thanks", "ok", "okay", "hi", "hello") or (
+            len(low) <= 4 and not any(c.isalpha() for c in low[1:])
+        )
     markers = (
         "warm natural reply",
         "customer language",
         "scope_reply",
         "in the customer",
         "1-3 sentences",
+        "2-3 sentences",
         "2-5 sentences",
+        "mirroring the user",
+        "exact language",
+        "script, and slang",
         "empty when",
         "required when",
     )
     return any(m in low for m in markers)
+
+
+def _try_brain_immediate_scope_or_kb_reply(
+    brain_route: dict,
+    *,
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str,
+    lang: str,
+    ctx: dict,
+    reset_context_fn: Callable | None = None,
+    reply_for_live_order_id_lookup: Callable | None = None,
+) -> Optional[str]:
+    """
+    Brain already classified this turn — answer OOD/chitchat/KB immediately.
+    Skips pincode/product/order stacks and duplicate micro-LLM classifiers.
+    """
+    if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
+        return None
+
+    scope = (brain_route.get("conversation_scope") or "").strip().lower()
+    intent = (brain_route.get("intent") or "").strip().lower()
+    channel = (brain_route.get("data_channel") or "").strip().lower()
+    if intent == "out_of_domain":
+        scope = "out_of_domain"
+    elif not scope and intent in ("general",):
+        scope = "general_chitchat"
+
+    # --- Pure chitchat — never KB/catalog (brain JSON scope wins) ---
+    if scope == "general_chitchat":
+        if channel == "kb":
+            channel = "none"
+        if not _brain_is_pincode_delivery_turn(brain_route) and not _brain_is_product_catalog_turn(
+            brain_route, original_msg, msg_en
+        ):
+            scope_reply = (brain_route.get("scope_reply") or "").strip()
+            if _scope_reply_is_placeholder(scope_reply):
+                scope_reply = ""
+            if not scope_reply:
+                try:
+                    from services.conversational_ack_flow import resolve_brain_scope_customer_reply
+
+                    scope_reply = resolve_brain_scope_customer_reply(
+                        brain_route,
+                        scope,
+                        original_msg,
+                        msg_en=msg_en,
+                        conversation_context=conv_for_llm,
+                        reply_lang=lang,
+                        ctx=ctx,
+                    )
+                except ImportError:
+                    pass
+            if scope_reply:
+                log_reasoning(
+                    "Brain immediate — chitchat scope_reply (skip KB from user_meaning)."
+                )
+                try:
+                    from services.chat_flow_telemetry import mark_routing_complete
+
+                    mark_routing_complete()
+                except ImportError:
+                    pass
+                return scope_reply
+
+    # --- OOD / chitchat before KB or transactional detours ---
+    if scope in ("out_of_domain", "harm_sensitive") or not brain_route.get(
+        "is_welfog_related", True
+    ):
+        scope = scope or "out_of_domain"
+        scope_reply = (brain_route.get("scope_reply") or "").strip()
+        if _scope_reply_is_placeholder(scope_reply):
+            scope_reply = ""
+        if not scope_reply:
+            try:
+                from services.conversational_ack_flow import (
+                    ai_ood_reply,
+                    resolve_brain_scope_customer_reply,
+                )
+
+                scope_reply = resolve_brain_scope_customer_reply(
+                    brain_route,
+                    scope,
+                    original_msg,
+                    msg_en=msg_en,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                    ctx=ctx,
+                ) or ai_ood_reply(
+                    original_msg,
+                    msg_en,
+                    conv_for_llm,
+                    lang,
+                )
+            except ImportError:
+                pass
+        if scope_reply:
+            log_reasoning(f"Brain immediate — OOD/scope ({scope}).")
+            try:
+                from services.chat_flow_telemetry import mark_routing_complete
+
+                mark_routing_complete()
+            except ImportError:
+                pass
+            return scope_reply
+
+    # --- KB policy (refund/shipping/faqs) — must run before product/order stacks ---
+    if channel == "kb" and not brain_route.get("needs_order_id"):
+        if intent not in (
+            "order",
+            "order_history",
+            "wishlist",
+            "product",
+            "pincode_check",
+            "deals",
+            "categories",
+        ):
+            kb_body = _try_brain_kb_locked_reply(
+                brain_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=str((ctx or {}).get("user_id") or ""),
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn or (lambda _u: None),
+                reply_for_live_order_id_lookup=reply_for_live_order_id_lookup
+                or (lambda *a, **k: None),
+            )
+            if kb_body:
+                return kb_body
+            meaning = (brain_route.get("user_meaning") or "").strip()
+            comb = f"{original_msg or ''} {msg_en or ''}".strip()
+            query = meaning or comb
+            keys = list(brain_route.get("kb_keys") or [])
+            rh = (brain_route.get("route_handler") or "").strip().lower()
+            try:
+                from services.kb_service import (
+                    KB_DIRECT_MIN_SCORE,
+                    direct_kb_search,
+                    format_kb_answer_from_brain_keys,
+                    format_welfog_social_media_reply_from_kb,
+                )
+
+                if keys:
+                    file_body = format_kb_answer_from_brain_keys(
+                        original_msg,
+                        msg_en,
+                        keys,
+                        reply_lang=lang,
+                        conversation_context=conv_for_llm,
+                        user_meaning_en=meaning,
+                        ai_route=brain_route,
+                    )
+                    if file_body:
+                        log_reasoning(
+                            "Brain immediate — KB file from brain keys (no vector scan)."
+                        )
+                        return file_body
+                if "social" in rh:
+                    social = format_welfog_social_media_reply_from_kb(
+                        original_msg,
+                        msg_en,
+                        reply_lang=lang,
+                        conversation_context=conv_for_llm,
+                        user_meaning_en=meaning,
+                        ai_confirmed=True,
+                    )
+                    if social:
+                        log_reasoning(
+                            "Brain immediate — Welfog social from KB (no extra LLM)."
+                        )
+                        return social
+                if not keys:
+                    body = direct_kb_search(
+                        query,
+                        keys=keys or None,
+                        min_score=KB_DIRECT_MIN_SCORE,
+                        zero_llm_fast=True,
+                    )
+                    if body:
+                        log_reasoning(
+                            "Brain immediate — vector KB from brain keys (no extra LLM)."
+                        )
+                        return body
+            except ImportError:
+                pass
+
+    # --- Welfog informational KB (welfog_support only — never general_chitchat) ---
+    if (
+        scope in ("welfog_support", "")
+        and brain_route.get("is_welfog_related", True)
+        and (brain_route.get("user_meaning") or "").strip()
+    ):
+        if not _brain_is_pincode_delivery_turn(brain_route) and not _brain_is_product_catalog_turn(
+            brain_route, original_msg, msg_en
+        ):
+            try:
+                from services.kb_service import (
+                    format_kb_answer_from_brain_keys,
+                    resolve_brain_kb_keys,
+                )
+
+                kb_keys = resolve_brain_kb_keys(
+                    brain_route,
+                    original_msg,
+                    msg_en,
+                    conversation_context=conv_for_llm,
+                )
+                if kb_keys:
+                    kb_from_meaning = format_kb_answer_from_brain_keys(
+                        original_msg,
+                        msg_en,
+                        kb_keys,
+                        reply_lang=lang,
+                        conversation_context=conv_for_llm,
+                        user_meaning_en=(brain_route.get("user_meaning") or "").strip(),
+                        ai_route=brain_route,
+                    )
+                    if kb_from_meaning:
+                        log_reasoning(
+                            "Brain immediate — KB from user_meaning (skip chitchat LLM)."
+                        )
+                        try:
+                            from services.chat_flow_telemetry import mark_routing_complete
+
+                            mark_routing_complete()
+                        except ImportError:
+                            pass
+                        return kb_from_meaning
+            except ImportError:
+                pass
+
+    # --- OOD / chitchat (brain scope_reply — no catalog/pincode detours) ---
+    if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+        if _brain_is_pincode_delivery_turn(brain_route) or _brain_is_product_catalog_turn(
+            brain_route, original_msg, msg_en
+        ):
+            return None
+        scope_reply = (brain_route.get("scope_reply") or "").strip()
+        if _scope_reply_is_placeholder(scope_reply):
+            scope_reply = ""
+        if not scope_reply:
+            try:
+                from services.conversational_ack_flow import resolve_brain_scope_customer_reply
+
+                scope_reply = resolve_brain_scope_customer_reply(
+                    brain_route,
+                    scope,
+                    original_msg,
+                    msg_en=msg_en,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                    ctx=ctx,
+                )
+            except ImportError:
+                pass
+        if scope_reply:
+            log_reasoning(
+                f"Brain immediate — scope_reply ({scope}), no duplicate scope LLM."
+            )
+            try:
+                from services.chat_flow_telemetry import mark_routing_complete
+
+                mark_routing_complete()
+            except ImportError:
+                pass
+            return scope_reply
+
+    return None
 
 
 def _try_brain_kb_locked_reply(
@@ -150,13 +426,37 @@ def _try_brain_kb_locked_reply(
         return None
     kb_keys = list(brain_route.get("kb_keys") or [])
     if not kb_keys:
-        kb_keys = (
-            ["refund", "faqs"]
-            if intent == "refund"
-            else ["faqs", "refund"]
-            if "refund" in f"{original_msg} {msg_en}".lower()
-            else ["faqs"]
-        )
+        _brain_intent_kb = {
+            "payment": ["payment"],
+            "refund": ["refund"],
+            "general": ["company"],
+            "seller": ["company", "faqs"],
+        }
+        kb_keys = list(_brain_intent_kb.get(intent, []))
+    if not kb_keys:
+        um = (brain_route.get("user_meaning") or "").strip().lower()
+        if um and any(
+            x in um
+            for x in ("contact", "care", "phone", "number", "email", "support", "helpline")
+        ):
+            try:
+                from services.kb_service import get_support_contact_kb_keys
+
+                kb_keys = get_support_contact_kb_keys()[:2]
+            except ImportError:
+                pass
+    if not kb_keys:
+        try:
+            from services.kb_service import resolve_brain_kb_keys
+
+            kb_keys = resolve_brain_kb_keys(
+                brain_route,
+                original_msg,
+                msg_en,
+                conversation_context=conv_for_llm,
+            )
+        except ImportError:
+            kb_keys = []
     try:
         from services.kb_service import format_kb_answer_from_brain_keys
 
@@ -166,6 +466,8 @@ def _try_brain_kb_locked_reply(
             kb_keys,
             reply_lang=lang,
             conversation_context=conv_for_llm,
+            user_meaning_en=(brain_route.get("user_meaning") or "").strip(),
+            ai_route=brain_route,
         )
         if direct:
             log_reasoning(
@@ -215,18 +517,25 @@ def _brain_is_product_catalog_turn(brain: dict, original_msg: str, msg_en: str) 
     try:
         from services.account_list_semantics import (
             account_list_route_is_locked,
-            reconcile_wishlist_from_brain_meaning,
+            reconcile_account_list_from_brain_meaning,
             _kind_from_meaning_blob,
             _meaning_blob,
+            KIND_PURCHASE_HOWTO,
+            KIND_PURCHASE_IN_CHAT,
             KIND_WISHLIST_HOWTO,
             KIND_WISHLIST_IN_CHAT,
         )
 
-        fixed = reconcile_wishlist_from_brain_meaning(dict(brain))
+        fixed = reconcile_account_list_from_brain_meaning(dict(brain))
         if account_list_route_is_locked(fixed):
             return False
         mk = _kind_from_meaning_blob(_meaning_blob(fixed))
-        if mk in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
+        if mk in (
+            KIND_WISHLIST_IN_CHAT,
+            KIND_WISHLIST_HOWTO,
+            KIND_PURCHASE_IN_CHAT,
+            KIND_PURCHASE_HOWTO,
+        ):
             return False
     except ImportError:
         pass
@@ -312,6 +621,7 @@ def _prepare_brain_product_route(
 
     route["search_query"] = sq
     route["_ai_single_pass"] = True
+    route["_needs_product_nlu_llm"] = False
     return route, sq
 
 
@@ -546,6 +856,9 @@ def _try_brain_product_catalog_fallback_dispatch(
     """
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
+    channel = (brain_route.get("data_channel") or "").strip().lower()
+    if channel == "kb":
+        return None
     if not _brain_is_product_catalog_turn(brain_route, original_msg, msg_en):
         return None
     product_route, sq = _prepare_brain_product_route(
@@ -587,6 +900,32 @@ def _run_product_catalog_flow(
     ctx: dict,
     reset_context_fn: Callable[[dict], None],
 ) -> Optional[str]:
+    try:
+        from utils.helpers import (
+            clear_order_session_for_new_lookup,
+            turn_is_obvious_product_shopping_turn,
+        )
+
+        product_turn = bool(
+            product_route.get("_product_catalog_locked")
+            or (product_route.get("intent") or "").strip().lower() == "product"
+        )
+        if not product_turn:
+            product_turn = turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conv_for_llm
+            )
+        if product_turn and isinstance(ctx, dict) and (
+            ctx.get("awaiting")
+            or (ctx.get("data") or {}).get("pending_action")
+        ):
+            log_reasoning(
+                "Product catalog — sanitize stale order session before OpenSearch."
+            )
+            clear_order_session_for_new_lookup(ctx)
+            ctx["awaiting"] = None
+            ctx["last"] = None
+    except ImportError:
+        pass
     ctx.setdefault("data", {})["ai_route"] = product_route
     try:
         ps = run_product_search_ai_flow(
@@ -634,13 +973,16 @@ def try_explicit_sku_catalog_reply(
     reset_context_fn: Callable[[dict], None],
 ) -> Optional[str]:
     """
-    Explicit warehouse SKU in message → OpenSearch only (zero LLM).
-    e.g. 'is sku ka product bta INFINIX HOT 10 PLAY-EGL-SP'
+    Warehouse SKU in message → OpenSearch only (zero LLM).
+    Handles explicit 'sku' mentions and standalone catalog codes (e.g. SSKKOO).
     """
     comb = f"{original_msg} {msg_en}".strip()
-    if not comb or not re.search(r"\bsku\b", comb, re.I):
+    if not comb:
         return None
+    sku: str | None = None
+    bare = (original_msg or "").strip()
     try:
+        from services.catalog_spec_semantics import user_mentions_sku_this_turn
         from services.opensearch_products import (
             _extract_sku_from_text,
             _sku_token_acceptable,
@@ -653,8 +995,14 @@ def try_explicit_sku_catalog_reply(
         from services.translation_service import localized_sysmsg_for_customer
         from services.welfog_api import build_welfog_product_browse_url
 
-        sku = _extract_sku_from_text(original_msg) or _extract_sku_from_text(msg_en)
-        if not sku or not _sku_token_acceptable(sku, explicit_sku_mention=True):
+        if re.search(r"\bsku\b", comb, re.I):
+            sku = _extract_sku_from_text(original_msg) or _extract_sku_from_text(msg_en)
+            if sku and not _sku_token_acceptable(sku, explicit_sku_mention=True):
+                sku = None
+        elif bare and " " not in bare and user_mentions_sku_this_turn(bare):
+            if _sku_token_acceptable(bare):
+                sku = bare
+        if not sku:
             return None
     except ImportError:
         return None
@@ -831,6 +1179,77 @@ def try_category_browse_catalog_reply(
     return response_text
 
 
+def try_llm_down_product_catalog_recovery(
+    original_msg: str,
+    msg_en: str,
+    *,
+    conv_for_llm: str,
+    user_id: str,
+    lang: str,
+    ctx: dict,
+    reset_context_fn: Callable[[dict], None],
+) -> Optional[str]:
+    """
+    Brain routing LLM failed — one compact product classify (AI) then OpenSearch.
+    Uses translated msg_en so Hinglish/Tamil recover like English.
+    """
+    try:
+        from services.chat_flow_telemetry import reset_llm_budget_for_recovery
+
+        reset_llm_budget_for_recovery()
+    except ImportError:
+        pass
+    try:
+        from services.product_catalog_resolver import (
+            KIND_PRODUCT_SEARCH,
+            ai_classify_product_search_turn,
+        )
+
+        classified = ai_classify_product_search_turn(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            ai_route=None,
+            reply_lang=lang,
+        )
+        if not classified or classified.get("turn_kind") != KIND_PRODUCT_SEARCH:
+            return None
+        sq = (classified.get("search_query") or "").strip()
+        entities = dict(classified.get("entities") or {})
+        if not sq:
+            sq = (entities.get("product_name") or "").strip()
+        if not sq or len(sq) < 2:
+            return None
+        product_route = {
+            "intent": "product",
+            "data_channel": "catalog",
+            "run_catalog_search": True,
+            "_product_catalog_locked": True,
+            "_universal_brain_route": True,
+            "_ai_single_pass": True,
+            "_needs_product_nlu_llm": False,
+            "_product_entities": entities,
+            "search_query": sq,
+            "user_meaning": classified.get("user_meaning") or f"Show {sq}",
+        }
+        log_reasoning(
+            f"LLM-down recovery — compact product classify sq={sq!r} → OpenSearch."
+        )
+        return _run_product_catalog_flow(
+            product_route,
+            sq,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv_for_llm,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            reset_context_fn=reset_context_fn,
+        )
+    except ImportError:
+        return None
+
+
 def try_structural_product_catalog_reply(
     original_msg: str,
     msg_en: str,
@@ -845,9 +1264,41 @@ def try_structural_product_catalog_reply(
     Clear product browse (iphone dikha, samsung cover) — OpenSearch without brain LLM.
     Saves ~30–45s on obvious catalog turns.
     """
+    try:
+        from services.semantic_intent import zero_llm_intent_guess_allowed
+
+        if not zero_llm_intent_guess_allowed():
+            return None
+    except ImportError:
+        pass
     comb = f"{original_msg} {msg_en}".strip()
     if not comb:
         return None
+    _skip_delivery_block = False
+    try:
+        from services.turn_intent_coordinator import (
+            _KB_CACHE_UNSET,
+            kb_classified_as_product_catalog,
+            peek_kb_turn_classification,
+        )
+
+        peeked = peek_kb_turn_classification(original_msg, msg_en, conv_for_llm, "")
+        if peeked is not _KB_CACHE_UNSET and kb_classified_as_product_catalog(peeked):
+            _skip_delivery_block = True
+    except ImportError:
+        pass
+    if not _skip_delivery_block:
+        try:
+            from services.location_delivery_resolver import (
+                turn_requests_delivery_serviceability,
+            )
+
+            if turn_requests_delivery_serviceability(
+                original_msg, msg_en, conv_for_llm, allow_llm=False
+            ):
+                return None
+        except ImportError:
+            pass
     try:
         from utils.helpers import (
             _message_looks_like_shopping_query,
@@ -870,6 +1321,7 @@ def try_structural_product_catalog_reply(
             "_product_catalog_locked": True,
             "_universal_brain_route": True,
             "_ai_single_pass": True,
+            "_needs_product_nlu_llm": False,
         }
         sq = resolve_catalog_search_terms_for_message(
             original_msg, msg_en, ai_route=product_route
@@ -1237,6 +1689,15 @@ def _try_brain_order_live_direct_reply(
             ).strip()
         except ImportError:
             oid = ""
+    else:
+        try:
+            from utils.helpers import coerce_valid_order_id
+
+            oid = coerce_valid_order_id(
+                oid, context=f"{original_msg} {msg_en} {conv_for_llm or ''}"
+            )
+        except ImportError:
+            oid = oid.strip()
 
     tool = _brain_order_tool_for_goal(goal)
     if not tool:
@@ -1260,12 +1721,19 @@ def _try_brain_order_live_direct_reply(
         )
         if not body:
             return None
-        ctx["order_id"] = None
-        ctx["awaiting"] = "order_id"
-        ctx["last"] = intent_label
-        ctx.setdefault("data", {})["pending_action"] = goal
-        ctx["data"]["topic_mode"] = f"order_{goal}"
-        ctx["data"]["ai_route"] = route_for_api
+        try:
+            from services.order_id_handoff_fast_path import lock_order_id_ask_session
+
+            lock_order_id_ask_session(
+                ctx, goal, intent_label=intent_label, ai_route=route_for_api
+            )
+        except ImportError:
+            ctx["order_id"] = None
+            ctx["awaiting"] = "order_id"
+            ctx["last"] = intent_label
+            ctx.setdefault("data", {})["pending_action"] = goal
+            ctx["data"]["topic_mode"] = f"order_{goal}"
+            ctx["data"]["ai_route"] = route_for_api
         try:
             from services.chat_flow_telemetry import log_order_dispatch
 
@@ -1489,6 +1957,45 @@ def _log_pincode_dispatch(
         pass
 
 
+def _try_brain_account_list_live_api_reply(
+    brain_route: dict,
+    *,
+    user_id: str,
+    format_purchase_history_reply: Callable[..., str],
+    format_wishlist_reply: Callable[..., str],
+) -> Optional[str]:
+    """Dispatch account-list live API from brain JSON only — before pincode/product stacks."""
+    if not isinstance(brain_route, dict):
+        return None
+    try:
+        from services.account_list_semantics import reconcile_account_list_from_brain_meaning
+
+        brain_route = reconcile_account_list_from_brain_meaning(dict(brain_route))
+    except ImportError:
+        pass
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+        from services.ai_route_semantics import brain_route_indicates_account_list_live
+    except ImportError:
+        return None
+    if not (
+        account_list_route_is_locked(brain_route)
+        or brain_route_indicates_account_list_live(brain_route)
+    ):
+        return None
+    if brain_route.get("needs_order_id"):
+        return None
+    alk = (brain_route.get("account_list_kind") or "").strip().lower()
+    intent = (brain_route.get("intent") or "").strip().lower()
+    if alk == "purchase_history_in_chat" or intent == "order_history":
+        log_reasoning("Brain dispatch — order history API from AI JSON.")
+        return format_purchase_history_reply(user_id, page=1, append_only=False)
+    if alk == "wishlist_in_chat" or intent == "wishlist":
+        log_reasoning("Brain dispatch — wishlist API from AI JSON.")
+        return format_wishlist_reply(user_id, page=1, append_only=False)
+    return None
+
+
 def _try_brain_pincode_direct_reply(
     brain_route: dict,
     *,
@@ -1502,6 +2009,21 @@ def _try_brain_pincode_direct_reply(
     """Brain intent=pincode_check → existing pincode API (one brain LLM + live check)."""
     if not _brain_is_pincode_delivery_turn(brain_route):
         return None
+
+    try:
+        from utils.helpers import clear_order_session_for_new_lookup
+
+        if isinstance(ctx, dict) and (
+            ctx.get("awaiting") or (ctx.get("data") or {}).get("pending_action")
+        ):
+            log_reasoning(
+                "Pincode dispatch — sanitize stale order session before live API."
+            )
+            clear_order_session_for_new_lookup(ctx)
+            ctx["awaiting"] = None
+            ctx["last"] = None
+    except ImportError:
+        pass
 
     try:
         from services.support_scope import (
@@ -1537,6 +2059,44 @@ def _try_brain_pincode_direct_reply(
         route_for_api["extracted_pincode"] = pin
     if location and not (route_for_api.get("search_query") or "").strip():
         route_for_api["search_query"] = location
+
+    if not pin:
+        try:
+            from services.location_delivery_resolver import (
+                _MAJOR_CITY_PINS,
+                _norm_city_key,
+                extract_place_query_from_delivery_message,
+                geocode_city_to_pincode,
+            )
+
+            comb = f"{original_msg} {msg_en}".strip()
+            city = (location or "").strip()
+            if not city:
+                for word in re.findall(r"[a-z]{3,}", comb.lower()):
+                    if _norm_city_key(word) in _MAJOR_CITY_PINS:
+                        city = word
+                        break
+            if not city:
+                extracted = extract_place_query_from_delivery_message(comb)
+                for part in (extracted or "").split():
+                    if _norm_city_key(part) in _MAJOR_CITY_PINS:
+                        city = part
+                        break
+                if not city and extracted:
+                    city = extracted
+            if city:
+                geo = geocode_city_to_pincode(city)
+                resolved_pin = str(geo.get("pincode") or "")
+                if resolved_pin:
+                    pin = resolved_pin
+                    location = str(geo.get("city_label") or city)
+                    route_for_api["extracted_pincode"] = pin
+                    route_for_api["search_query"] = location
+                    log_reasoning(
+                        f"Brain pincode: city {city!r} → PIN {pin} (offline/geocode, skip ask-PIN)."
+                    )
+        except ImportError:
+            pass
 
     api_called = False
     reply_html = ""
@@ -1600,6 +2160,11 @@ def _try_brain_pincode_direct_reply(
                 msg_en,
                 conv_for_llm,
                 reply_lang=lang,
+                allow_ai=not (
+                    route_for_api.get("_pincode_delivery_locked")
+                    or (route_for_api.get("intent") or "").strip().lower()
+                    == "pincode_check"
+                ),
             )
         except ImportError:
             reply_html = ""
@@ -1646,21 +2211,17 @@ def _try_brain_pincode_direct_reply(
             ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
             ctx.setdefault("data", {})["last_pincode"] = pin
             ctx.setdefault("data", {})["ai_route"] = route_for_api
-    elif reply_html:
+    else:
         reset_context_fn(ctx)
         try:
-            from utils.helpers import mark_pincode_delivery_completed
+            from utils.helpers import set_pincode_await_context
 
-            mark_pincode_delivery_completed(ctx, ai_route=route_for_api)
+            set_pincode_await_context(ctx, route_for_api)
         except ImportError:
-            ctx["awaiting"] = None
-            ctx["last"] = None
+            ctx["awaiting"] = "pincode"
+            ctx["last"] = "pincode"
             ctx.setdefault("data", {})["topic_mode"] = "pincode_check"
             ctx.setdefault("data", {})["ai_route"] = route_for_api
-    else:
-        from utils.helpers import set_pincode_await_context
-
-        set_pincode_await_context(ctx, route_for_api)
     log_reasoning("Brain direct dispatch: pincode delivery API.")
     return reply_html
 
@@ -1682,6 +2243,18 @@ def try_structural_order_live_reply(
     comb = f"{original_msg} {msg_en}".strip()
     if not comb:
         return None
+    try:
+        from utils.helpers import (
+            _message_looks_like_shopping_query,
+            turn_is_obvious_product_shopping_turn,
+        )
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conv_for_llm
+        ) or _message_looks_like_shopping_query(comb):
+            return None
+    except ImportError:
+        pass
     try:
         from utils.helpers import turn_is_catalog_product_lookup
 
@@ -1823,6 +2396,24 @@ def try_brain_direct_dispatch(
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
 
+    channel0 = (brain_route.get("data_channel") or "").strip().lower()
+    intent0 = (brain_route.get("intent") or "").strip().lower()
+    if channel0 == "kb" and not brain_route.get("needs_order_id"):
+        if intent0 in ("refund", "payment", "general", "seller", ""):
+            kb_early = _try_brain_kb_locked_reply(
+                brain_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+                reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+            )
+            if kb_early:
+                return kb_early
+
     try:
         from services.ai_route_semantics import (
             brain_route_indicates_product_catalog,
@@ -1836,10 +2427,20 @@ def try_brain_direct_dispatch(
             msg_en=msg_en,
             conversation_context=conv_for_llm,
         )
+        try:
+            from services.account_list_semantics import (
+                account_list_route_is_locked,
+                reconcile_account_list_from_brain_meaning,
+            )
+
+            brain_route = reconcile_account_list_from_brain_meaning(brain_route)
+            _alk_locked = account_list_route_is_locked(brain_route)
+        except ImportError:
+            _alk_locked = False
         if not (
             brain_route.get("_pincode_delivery_locked")
             or (brain_route.get("intent") or "").strip().lower() == "pincode_check"
-        ):
+        ) and not _alk_locked:
             brain_route = reconcile_product_catalog_from_brain_meaning(
                 brain_route,
                 original_msg=original_msg,
@@ -1929,6 +2530,8 @@ def try_brain_direct_dispatch(
             account_list_route_is_locked,
             _kind_from_meaning_blob,
             _meaning_blob,
+            KIND_PURCHASE_HOWTO,
+            KIND_PURCHASE_IN_CHAT,
             KIND_WISHLIST_HOWTO,
             KIND_WISHLIST_IN_CHAT,
         )
@@ -1937,7 +2540,12 @@ def try_brain_direct_dispatch(
             _account_list_early = True
         else:
             mk = _kind_from_meaning_blob(_meaning_blob(brain_route))
-            if mk in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
+            if mk in (
+                KIND_WISHLIST_IN_CHAT,
+                KIND_WISHLIST_HOWTO,
+                KIND_PURCHASE_IN_CHAT,
+                KIND_PURCHASE_HOWTO,
+            ):
                 _account_list_early = True
     except ImportError:
         pass
@@ -2018,43 +2626,6 @@ def try_brain_direct_dispatch(
         return kb_direct
 
     # --- Product catalog handled above (after pincode) ---
-
-    # Account-list before chitchat — brain already classified meaning (any language).
-    _account_list_early = False
-    try:
-        from services.account_list_semantics import account_list_route_is_locked
-
-        _account_list_early = account_list_route_is_locked(brain_route)
-    except ImportError:
-        pass
-    if brain_intent in ("order_history", "wishlist"):
-        _account_list_early = True
-    if _account_list_early:
-        if _brain_is_order_live_turn(
-            brain_route,
-            original_msg=original_msg,
-            msg_en=msg_en,
-            conv_for_llm=conv_for_llm,
-        ) or brain_route.get("needs_order_id"):
-            log_reasoning(
-                "Skip account-list — brain locked single-order live (invoice/track/refund/details)."
-            )
-            _account_list_early = False
-    if _account_list_early:
-        account_early = _try_brain_account_list_direct_reply(
-            brain_route,
-            original_msg=original_msg,
-            msg_en=msg_en,
-            conv_for_llm=conv_for_llm,
-            user_id=user_id,
-            lang=lang,
-            ctx=ctx,
-            format_purchase_history_reply=format_purchase_history_reply,
-            format_wishlist_reply=format_wishlist_reply,
-            reset_context_fn=reset_context_fn,
-        )
-        if account_early:
-            return account_early
 
     # Scope chitchat only after actionable routes — never when brain locked shopping/delivery.
     if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
@@ -2169,29 +2740,17 @@ def try_brain_direct_dispatch(
             except ImportError:
                 pass
             try:
-                from services.conversation_scope import (
-                    SCOPE_OUT,
-                    _generic_scope_fallback,
-                    finalize_scope_reply_html,
-                )
-                from services.translation_service import is_hinglish_message
-                from utils.helpers import build_warm_conversation_reply
+                from services.conversational_ack_flow import resolve_brain_scope_customer_reply
 
-                if scope == "out_of_domain":
-                    use_h = lang == "hinglish" or is_hinglish_message(
-                        original_msg or msg_en
-                    )
-                    sr = _generic_scope_fallback(SCOPE_OUT, use_h)
-                    scope_reply = finalize_scope_reply_html(
-                        sr, original_msg, reply_lang=lang
-                    )
-                else:
-                    scope_reply = (
-                        build_warm_conversation_reply(
-                            original_msg, msg_en, reply_lang=lang
-                        )
-                        or ""
-                    )
+                scope_reply = resolve_brain_scope_customer_reply(
+                    brain_route,
+                    scope,
+                    original_msg,
+                    msg_en=msg_en,
+                    conversation_context=conv_for_llm,
+                    reply_lang=lang,
+                    ctx=ctx,
+                )
             except ImportError:
                 pass
         if scope_reply:
@@ -2379,4 +2938,196 @@ def try_brain_direct_dispatch(
     if product_fb:
         return product_fb
 
+    return None
+
+
+def try_finish_brain_classified_turn(
+    brain_route: dict,
+    *,
+    original_msg: str,
+    msg_en: str,
+    conv_for_llm: str,
+    user_id: str,
+    lang: str,
+    ctx: dict,
+    format_purchase_history_reply: Callable[..., str],
+    format_wishlist_reply: Callable[..., str],
+    reset_context_fn: Callable[[dict], None],
+    reply_for_live_order_id_lookup: Callable,
+) -> Optional[str]:
+    """
+    Cached brain already classified this turn — dispatch once, never legacy LLM stack.
+    """
+    if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
+        return None
+
+    channel_finish = (brain_route.get("data_channel") or "").strip().lower()
+    if channel_finish == "kb" and not brain_route.get("needs_order_id"):
+        kb_first = _try_brain_immediate_scope_or_kb_reply(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv_for_llm,
+            lang=lang,
+            ctx=ctx,
+            reset_context_fn=reset_context_fn,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+        )
+        if kb_first:
+            log_reasoning("Brain finish — KB first (channel=kb, skip product stack).")
+            return kb_first
+        kb_direct = try_brain_direct_dispatch(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv_for_llm,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            format_purchase_history_reply=format_purchase_history_reply,
+            format_wishlist_reply=format_wishlist_reply,
+            reset_context_fn=reset_context_fn,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+        )
+        if kb_direct:
+            log_reasoning("Brain finish — KB direct dispatch (channel=kb).")
+            return kb_direct
+
+    # Locked product catalog — OpenSearch before KB embed (embed lock caused 60–170s hangs).
+    try:
+        from services.ai_route_semantics import (
+            brain_route_indicates_product_catalog,
+            reconcile_product_catalog_from_brain_meaning,
+        )
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        catalog_route = reconcile_product_catalog_from_brain_meaning(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+        if product_catalog_route_is_locked(catalog_route) or brain_route_indicates_product_catalog(
+            catalog_route
+        ):
+            product_first = _try_brain_product_catalog_fallback_dispatch(
+                catalog_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+            )
+            if product_first:
+                log_reasoning(
+                    "Brain finish — product OpenSearch first (skip KB embed queue)."
+                )
+                return product_first
+    except ImportError:
+        pass
+
+    immediate = _try_brain_immediate_scope_or_kb_reply(
+        brain_route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conv_for_llm=conv_for_llm,
+        lang=lang,
+        ctx=ctx,
+        reset_context_fn=reset_context_fn,
+        reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+    )
+    if immediate:
+        log_reasoning("Brain finish — immediate scope/KB from cached route.")
+        return immediate
+
+    direct = try_brain_direct_dispatch(
+        brain_route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conv_for_llm=conv_for_llm,
+        user_id=user_id,
+        lang=lang,
+        ctx=ctx,
+        format_purchase_history_reply=format_purchase_history_reply,
+        format_wishlist_reply=format_wishlist_reply,
+        reset_context_fn=reset_context_fn,
+        reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+    )
+    if direct:
+        log_reasoning("Brain finish — direct dispatch from cached route.")
+        return direct
+
+    scope = (brain_route.get("conversation_scope") or "").strip().lower()
+    intent = (brain_route.get("intent") or "").strip().lower()
+    if intent == "out_of_domain":
+        scope = "out_of_domain"
+    elif not scope and intent in ("general",):
+        scope = "general_chitchat"
+    if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+        try:
+            from services.conversational_ack_flow import resolve_brain_scope_customer_reply
+
+            body = resolve_brain_scope_customer_reply(
+                brain_route,
+                scope,
+                original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+                reply_lang=lang,
+                ctx=ctx,
+            )
+            if body:
+                log_reasoning(f"Brain finish — scope AI reply ({scope}).")
+                return body
+        except ImportError:
+            pass
+
+    # Product catalog / structural OpenSearch — brain classified but early dispatch missed.
+    try:
+        from services.ai_route_semantics import (
+            brain_route_indicates_product_catalog,
+            reconcile_product_catalog_from_brain_meaning,
+        )
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        catalog_route = reconcile_product_catalog_from_brain_meaning(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+        if product_catalog_route_is_locked(catalog_route) or brain_route_indicates_product_catalog(
+            catalog_route
+        ):
+            product_fb = _try_brain_product_catalog_fallback_dispatch(
+                catalog_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+            )
+            if product_fb:
+                log_reasoning("Brain finish — product catalog OpenSearch from cached route.")
+                return product_fb
+    except ImportError:
+        pass
+
+    try:
+        structural = try_structural_product_catalog_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm=conv_for_llm,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            reset_context_fn=reset_context_fn,
+        )
+        if structural:
+            log_reasoning("Brain finish — structural product OpenSearch (msg_en fallback).")
+            return structural
+    except ImportError:
+        pass
     return None

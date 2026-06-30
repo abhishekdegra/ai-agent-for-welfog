@@ -6,6 +6,207 @@ from __future__ import annotations
 import re
 from typing import Any, Optional
 
+_CATALOG_ENTITY_KEYS = (
+    "product_name",
+    "brand",
+    "color",
+    "size",
+    "sku",
+    "pro_id",
+    "product_id",
+    "category",
+    "model",
+    "category_id",
+    "product_type",
+    "search_terms",
+)
+_CATALOG_NUMERIC_KEYS = (
+    "price_min",
+    "price_max",
+    "min_price",
+    "max_price",
+    "rating_min",
+    "rating_max",
+    "purchase_price_min",
+    "purchase_price_max",
+)
+
+
+def coerce_catalog_entity_map(val) -> dict:
+    """Brain may return product_entities as dict or single-element list — normalize safely."""
+    if isinstance(val, dict):
+        return dict(val)
+    if isinstance(val, list):
+        for item in val:
+            if isinstance(item, dict):
+                return dict(item)
+    return {}
+
+
+def _dict_has_catalog_signal(d: dict | None) -> bool:
+    if not d:
+        return False
+    for k in _CATALOG_ENTITY_KEYS:
+        v = d.get(k)
+        if v is None or v == "" or v == []:
+            continue
+        if isinstance(v, str) and not str(v).strip():
+            continue
+        return True
+    for k in _CATALOG_NUMERIC_KEYS:
+        if d.get(k) is not None:
+            return True
+    return False
+
+
+def catalog_has_search_substance(
+    text: str = "",
+    *,
+    entities: dict | None = None,
+    understanding: dict | None = None,
+    ai_route: dict | None = None,
+) -> bool:
+    """
+    True when brain JSON or structural ids give enough signal to search.
+    No language-specific phrase lists — trusts AI extraction + SKU/pro_id patterns.
+    """
+    route = ai_route if isinstance(ai_route, dict) else {}
+    pe = coerce_catalog_entity_map(route.get("_product_entities"))
+    if not pe:
+        pe = coerce_catalog_entity_map(route.get("product_entities"))
+    merged_ent = {**pe, **coerce_catalog_entity_map(entities)}
+
+    if _dict_has_catalog_signal(merged_ent) or _dict_has_catalog_signal(
+        coerce_catalog_entity_map(understanding)
+    ):
+        return True
+
+    sq = (
+        (route.get("search_query") or "")
+        or ((understanding or {}).get("search_terms") or "")
+    ).strip()
+    if sq:
+        try:
+            from services.product_filter_pipeline import brain_search_query_is_noisy
+
+            if not brain_search_query_is_noisy(sq):
+                return True
+        except ImportError:
+            return True
+
+    comb = (text or "").strip()
+    if comb:
+        try:
+            from utils.helpers import extract_product_id
+            from services.opensearch_products import _extract_sku_from_text
+
+            if extract_product_id(comb) or _extract_sku_from_text(comb):
+                return True
+        except ImportError:
+            pass
+    return False
+
+
+def catalog_title_unusable(
+    candidate: str = "",
+    *,
+    entities: dict | None = None,
+    understanding: dict | None = None,
+    ai_route: dict | None = None,
+) -> bool:
+    """
+    Reject a string as OpenSearch title_query when AI already has catalog entities,
+    or when the candidate is structurally non-catalog (filters embedded, id-meta, empty).
+    """
+    t = (candidate or "").strip()
+    route = ai_route if isinstance(ai_route, dict) else {}
+
+    try:
+        from services.product_filter_pipeline import brain_search_query_is_noisy
+    except ImportError:
+        brain_search_query_is_noisy = lambda _s: False  # noqa: E731
+
+    if t and brain_search_query_is_noisy(t):
+        return True
+    if t and re.search(r"\bdetails\s+of\b", t, re.I) and re.search(
+        r"\b(id|sku|product)\b", t, re.I
+    ):
+        return True
+
+    pe = coerce_catalog_entity_map(route.get("_product_entities"))
+    if not pe:
+        pe = coerce_catalog_entity_map(route.get("product_entities"))
+    ent = {**pe, **coerce_catalog_entity_map(entities)}
+    ai_name = (ent.get("product_name") or "").strip()
+    if t and ai_name and ai_name.lower() != t.lower():
+        g_tokens = {w for w in re.findall(r"[\w]+", ai_name.lower()) if len(w) >= 3}
+        c_tokens = {w for w in re.findall(r"[\w]+", t.lower()) if len(w) >= 3}
+        if g_tokens and c_tokens and not (g_tokens & c_tokens):
+            return True
+
+    ent_without_title = {
+        k: v for k, v in ent.items() if k not in ("product_name", "search_terms")
+    }
+
+    if catalog_has_search_substance(
+        "",
+        entities=ent_without_title,
+        understanding=understanding,
+        ai_route=route,
+    ):
+        if not t:
+            return True
+        good = (ent.get("product_name") or (understanding or {}).get("search_terms") or "").strip()
+        if good and good.lower() != t.lower():
+            g, c = good.lower(), t.lower()
+            if g not in c and c not in g:
+                g_tokens = {w for w in re.findall(r"[\w]+", g) if len(w) >= 3}
+                c_tokens = {w for w in re.findall(r"[\w]+", c) if len(w) >= 3}
+                if g_tokens and c_tokens and not (g_tokens & c_tokens):
+                    return True
+        return False
+
+    if not t or len(t) < 2:
+        return True
+    if route.get("continue_previous_topic"):
+        return True
+    words = re.findall(r"[\w]+", t, re.UNICODE)
+    if len(words) <= 2:
+        return True
+    try:
+        from services.turn_intent_gate import is_non_catalog_meta_turn
+
+        if is_non_catalog_meta_turn(t):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def should_merge_session_catalog(
+    understanding: dict | None,
+    ai_route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    """Reuse last browse spec when brain says continue OR product turn lacks catalog signal."""
+    route = ai_route if isinstance(ai_route, dict) else {}
+    if route.get("continue_previous_topic"):
+        return True
+    intent = (route.get("intent") or "").strip().lower()
+    channel = (route.get("data_channel") or "").strip().lower()
+    if intent != "product" and channel != "catalog":
+        return False
+    return not catalog_has_search_substance(
+        f"{original_msg or ''} {msg_en or ''}".strip(),
+        entities=coerce_catalog_entity_map(
+            route.get("_product_entities") or route.get("product_entities")
+        ),
+        understanding=understanding,
+        ai_route=route,
+    )
+
 
 def ai_understanding_has_shopping(ai: Optional[dict]) -> bool:
     if not ai:
@@ -176,7 +377,6 @@ def scrub_ai_product_understanding(
     if st:
         try:
             from services.product_query_understanding import (
-                is_noisy_search_query,
                 polish_search_terms,
                 scrub_conversational_tail_from_terms,
             )
@@ -184,9 +384,9 @@ def scrub_ai_product_understanding(
             cleaned = polish_search_terms(
                 scrub_conversational_tail_from_terms(st), original_msg
             )
-            if cleaned and not is_noisy_search_query(cleaned):
+            if cleaned and not catalog_title_unusable(cleaned, understanding=out):
                 out["search_terms"] = cleaned
-            elif is_noisy_search_query(st):
+            elif catalog_title_unusable(st, understanding=out):
                 out.pop("search_terms", None)
         except ImportError:
             pass

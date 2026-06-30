@@ -262,7 +262,7 @@ def llm_json_with_retry(
                 if llm_budget_exceeded():
                     set_last_llm_failure("llm_budget_exceeded")
                     return None
-                increment_llm_call(provider_name)
+                increment_llm_call(provider_name, billable=(attempt == 1))
                 if llm_budget_exceeded():
                     set_last_llm_failure("llm_budget_exceeded")
                     return None
@@ -282,6 +282,9 @@ def llm_json_with_retry(
                 if not content:
                     continue
                 try:
+                    from services.ai_route_semantics import strip_markdown_json_fence
+
+                    content = strip_markdown_json_fence(content)
                     return json.loads(content)
                 except Exception:
                     req["max_tokens"] = max(120, int(req.get("max_tokens", 300) * 0.7))
@@ -403,7 +406,14 @@ def llm_json_with_provider_fallback(
             return out
         from services.chat_resilience import get_last_llm_failure
 
-        if get_last_llm_failure() in ("rate_limit", "busy"):
+        failure = get_last_llm_failure() or ""
+        if failure == "llm_budget_exceeded":
+            log_reasoning(
+                "LLM call budget reached for this turn — not an API key problem. "
+                "Raise CHAT_MAX_LLM_CALLS or reduce duplicate classifiers."
+            )
+            break
+        if failure in ("rate_limit", "busy"):
             rate_seen = True
         if idx + 1 < len(providers):
             nxt = providers[idx + 1]["name"]

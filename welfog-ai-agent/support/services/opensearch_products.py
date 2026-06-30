@@ -440,6 +440,8 @@ def _looks_like_warehouse_sku(tok: str) -> bool:
         return False
     if re.fullmatch(r"(?i)sku", t):
         return False
+    if t.isupper() and t.isalpha() and len(t) >= 4:
+        return True
     if re.search(r"\d", t):
         if "_" in t or "-" in t:
             return True
@@ -1078,10 +1080,14 @@ def _extract_product_keywords(low: str) -> str:
 
 
 def _post_filter_mode_for_spec(spec: dict[str, Any]) -> str:
-    """Strict title tokens only when user named a brand/model; else colour/OS filters only."""
+    """Strict when brain/user named brand, product nouns, or locked single-pass catalog."""
     if spec.get("title_match_strict") or spec.get("brand"):
         return "strict"
-    if spec.get("mandatory_match_tokens") and spec.get("brand_aliases"):
+    if spec.get("mandatory_match_tokens"):
+        return "strict"
+    if spec.get("_ai_single_pass") and (spec.get("title_query") or "").strip():
+        return "strict"
+    if (spec.get("product_type") or "").strip():
         return "strict"
     return "os_filters_only"
 
@@ -3325,10 +3331,20 @@ def search_opensearch_catalog(
             req_brand = (spec.get("_requested_brand") or spec.get("brand") or "").strip()
             req_aliases = spec.get("_requested_brand_aliases") or spec.get("brand_aliases")
             if req_brand or req_aliases:
+                strict_brand = bool(spec.get("title_match_strict"))
+                if not strict_brand and req_brand:
+                    try:
+                        from services.opensearch_products import _phone_brand_vocab
+
+                        if req_brand.lower() in _phone_brand_vocab():
+                            strict_brand = True
+                    except ImportError:
+                        pass
                 cards = filter_products_by_requested_brand(
                     cards,
                     req_brand or None,
                     brand_aliases=req_aliases if isinstance(req_aliases, list) else None,
+                    strict_title=strict_brand,
                 )
             cards = filter_products_by_purchase_price(cards, spec)
             cards = filter_products_by_rating_range(cards, spec)

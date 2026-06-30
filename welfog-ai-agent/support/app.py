@@ -62,6 +62,10 @@ def _warmup_ai_on_startup() -> None:
             message_wants_order_details_or_invoice,
         )
         from utils import helpers  # noqa: F401
+
+        helpers.turn_is_obvious_product_shopping_turn(
+            "warmup product browse", "warmup product browse", ""
+        )
         try:
             from services.welfog_api import warmup_welfog_category_caches
 
@@ -211,4 +215,6 @@ if __name__ == "__main__":
         f"(Ctrl+C to stop, reloader={'on' if use_reloader else 'off'})",
         flush=True,
     )
+    # Sync handler — one /chat at a time per worker; async threads caused encode-lock pileups.
+    os.environ.setdefault("CHAT_ASYNC_HANDLER", "0")
     app.run(port=port, debug=debug, use_reloader=use_reloader, threaded=True)

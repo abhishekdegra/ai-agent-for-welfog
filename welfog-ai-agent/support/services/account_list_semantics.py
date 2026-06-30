@@ -53,6 +53,14 @@ _SAVED_LIKED_MEANING = (
     "products they liked",
     "items they saved",
     "items they hearted",
+    "customer liked",
+    "customer saved",
+    "customer's liked",
+    "customer's saved",
+    "show liked",
+    "show saved",
+    "list liked",
+    "list saved",
     "not purchased",
     "not bought",
     "not ordered yet",
@@ -419,7 +427,11 @@ def reconcile_wishlist_from_brain_meaning(route: dict | None) -> dict:
         return _apply_kind_to_route(out, k, "brain_intent_wishlist")
 
     ch = (out.get("data_channel") or "").strip().lower()
-    if ch == "catalog" or out.get("run_catalog_search"):
+    if (
+        ch == "catalog"
+        or out.get("run_catalog_search")
+        or intent in ("product", "catalog")
+    ):
         saved = any(m in blob for m in _SAVED_LIKED_MEANING)
         bought = any(m in blob for m in _PURCHASE_LIST_MEANING)
         if saved and not bought:
@@ -430,6 +442,87 @@ def reconcile_wishlist_from_brain_meaning(route: dict | None) -> dict:
             )
             return _apply_kind_to_route(out, k, "fix_catalog_wishlist_drift")
     return out
+
+
+def _meaning_blob_indicates_purchase_list(blob: str) -> bool:
+    if not blob.strip():
+        return False
+    if any(m in blob for m in _PURCHASE_LIST_MEANING):
+        return True
+    return bool(re.search(r"order\s+h\w*stor", blob))
+
+
+def reconcile_purchase_history_from_brain_meaning(route: dict | None) -> dict:
+    """
+    Trust brain user_meaning / account_list_kind when catalog drifted to product search.
+    Uses English brain fields only — not customer-text keyword routing.
+    """
+    out = dict(route or {})
+    kind = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
+    if kind in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
+        return out
+    if kind in (KIND_PURCHASE_IN_CHAT, KIND_PURCHASE_HOWTO):
+        return _apply_kind_to_route(out, kind, "brain_account_list_kind")
+
+    blob = _meaning_blob(out)
+    meaning_kind = _kind_from_meaning_blob(blob)
+    if meaning_kind in (KIND_PURCHASE_IN_CHAT, KIND_PURCHASE_HOWTO):
+        return _apply_kind_to_route(out, meaning_kind, "brain_meaning_purchase")
+    if _meaning_blob_indicates_purchase_list(blob) and meaning_kind == KIND_NONE:
+        k = (
+            KIND_PURCHASE_HOWTO
+            if _route_signals_order_history_howto(out)
+            else KIND_PURCHASE_IN_CHAT
+        )
+        return _apply_kind_to_route(out, k, "brain_meaning_purchase_blob")
+
+    intent = (out.get("intent") or "").strip().lower()
+    _purchase_intents = frozenset(
+        {
+            "order_history",
+            "purchases",
+            "purchase_list",
+            "orders_list",
+            "my_purchases",
+            "bought_items",
+            "past_purchases",
+        }
+    )
+    if intent in _purchase_intents:
+        k = (
+            KIND_PURCHASE_HOWTO
+            if _route_signals_order_history_howto(out)
+            else KIND_PURCHASE_IN_CHAT
+        )
+        return _apply_kind_to_route(out, k, "brain_intent_purchase")
+
+    ch = (out.get("data_channel") or "").strip().lower()
+    if (
+        ch == "catalog"
+        or out.get("run_catalog_search")
+        or intent in ("product", "catalog")
+    ):
+        bought = any(m in blob for m in _PURCHASE_LIST_MEANING)
+        saved = any(m in blob for m in _SAVED_LIKED_MEANING)
+        if bought and not saved:
+            k = (
+                KIND_PURCHASE_HOWTO
+                if _route_signals_order_history_howto(out)
+                else KIND_PURCHASE_IN_CHAT
+            )
+            return _apply_kind_to_route(out, k, "fix_catalog_purchase_drift")
+        if bought and saved and meaning_kind in (
+            KIND_PURCHASE_IN_CHAT,
+            KIND_PURCHASE_HOWTO,
+        ):
+            return _apply_kind_to_route(out, meaning_kind, "fix_catalog_purchase_drift")
+    return out
+
+
+def reconcile_account_list_from_brain_meaning(route: dict | None) -> dict:
+    """Wishlist then purchase-history reconcile from brain English fields."""
+    out = reconcile_wishlist_from_brain_meaning(route)
+    return reconcile_purchase_history_from_brain_meaning(out)
 
 
 def account_list_route_is_locked(route: dict | None) -> bool:
@@ -1700,11 +1793,11 @@ def promote_account_list_on_route(
     comb = _combined(original_msg, msg_en)
     intent_pre = (out.get("intent") or "").strip().lower()
 
-    out = reconcile_wishlist_from_brain_meaning(out)
+    out = reconcile_account_list_from_brain_meaning(out)
     if account_list_route_is_locked(out):
         kind = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
         if kind != KIND_NONE:
-            return _apply_kind_to_route(out, kind, "brain_wishlist_reconcile")
+            return _apply_kind_to_route(out, kind, "brain_account_list_reconcile")
 
     if out.get("_universal_brain_route"):
         try:

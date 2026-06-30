@@ -719,9 +719,43 @@ def resolve_product_search_turn(
     allow_llm: bool = True,
 ) -> ResolvedProductSearchTurn:
     """AI-first product search vs KB/support."""
+    try:
+        from services.knowledge_query_pipeline import kb_vector_fast_lane_active
+
+        if kb_vector_fast_lane_active():
+            return ResolvedProductSearchTurn(kind=KIND_NONE)
+    except Exception:
+        pass
     comb = _combined(original_msg, msg_en)
     if not comb:
         return ResolvedProductSearchTurn(kind=KIND_NONE)
+
+    try:
+        from services.chat_flow_telemetry import (
+            get_cached_brain_route,
+            should_defer_micro_classifiers_to_brain,
+        )
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+        brain = ai_route if isinstance(ai_route, dict) else get_cached_brain_route()
+        if isinstance(brain, dict):
+            ch = (brain.get("data_channel") or "").strip().lower()
+            intent = (brain.get("intent") or "").strip().lower()
+            if ch in ("kb", "live_api") and intent not in (
+                "product",
+                "deals",
+                "categories",
+                "category_feed",
+            ):
+                if not brain_route_indicates_product_catalog(brain):
+                    return ResolvedProductSearchTurn(kind=KIND_NONE)
+        if should_defer_micro_classifiers_to_brain():
+            if not isinstance(brain, dict) or not brain_route_indicates_product_catalog(
+                brain
+            ):
+                return ResolvedProductSearchTurn(kind=KIND_NONE)
+    except ImportError:
+        pass
 
     locked_turn = _locked_product_turn_from_route(ai_route)
     if locked_turn:
@@ -1277,6 +1311,25 @@ def entities_to_understanding(
         explicit_from_brain=bool((e.get("brand") or "").strip()),
         user_meaning="",
     )
+    if not brand and original_msg:
+        try:
+            from services.opensearch_products import (
+                _extract_brand_literal_from_text,
+                _infer_brand_from_message,
+            )
+
+            inferred = _infer_brand_from_message(original_msg) or _extract_brand_literal_from_text(
+                original_msg
+            )
+            if inferred:
+                brand = sanitize_catalog_brand(
+                    inferred,
+                    product_name=product_name,
+                    explicit_from_brain=True,
+                    user_meaning="",
+                )
+        except ImportError:
+            pass
     if brand:
         out["brand"] = brand
         aliases: list[str] = []
@@ -1317,6 +1370,21 @@ def entities_to_understanding(
         if v is not None and str(v).strip():
             out[dst] = str(v).strip()
 
+    if not out.get("color") and original_msg:
+        try:
+            from services.opensearch_products import (
+                extract_color_and_product_title,
+                normalize_color_fuzzy,
+            )
+
+            col, _ = extract_color_and_product_title(original_msg)
+            if not col:
+                col = normalize_color_fuzzy(original_msg)
+            if col:
+                out["color"] = col
+        except ImportError:
+            pass
+
     pid = e.get("product_id") or e.get("pro_id")
     if pid is not None and str(pid).strip().isdigit():
         out["pro_id"] = int(str(pid).strip())
@@ -1345,6 +1413,31 @@ def entities_to_understanding(
                 out[dst] = float(v)
             except (TypeError, ValueError):
                 pass
+
+    if out.get("max_price") is None and out.get("min_price") is None and original_msg:
+        try:
+            from services.opensearch_products import _extract_price_bounds
+
+            pmax, pmin = _extract_price_bounds(original_msg, original_msg.lower())
+            if pmax is not None:
+                out["max_price"] = pmax
+            if pmin is not None:
+                out["min_price"] = pmin
+        except ImportError:
+            pass
+
+    if out.get("brand"):
+        try:
+            from services.opensearch_products import _phone_brand_vocab
+
+            bl = str(out["brand"]).strip().lower()
+            if bl in _phone_brand_vocab():
+                mmt = list(out.get("mandatory_match_tokens") or [])
+                if bl not in [str(t).lower() for t in mmt]:
+                    mmt.insert(0, bl)
+                out["mandatory_match_tokens"] = mmt[:4]
+        except ImportError:
+            pass
 
     has_filter = any(
         out.get(k) is not None

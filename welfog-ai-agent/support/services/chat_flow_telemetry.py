@@ -46,6 +46,7 @@ def begin_chat_turn() -> str:
     _TLS.slow_function = ""
     _TLS.llm_budget_exceeded = False
     _TLS.route_loop_guard = False
+    _TLS._micro_defer_logged = False
     return rid
 
 
@@ -80,6 +81,10 @@ def record_user_query(original_msg: str, detected_language: str = "") -> None:
     _TLS.user_query = (original_msg or "")[:300]
     if detected_language:
         _TLS.detected_language = detected_language.strip()
+
+
+def record_routing_confidence(confidence: float) -> None:
+    _TLS.scope_confidence = max(0.0, min(1.0, float(confidence or 0.0)))
 
 
 def request_id() -> str:
@@ -130,6 +135,79 @@ def store_brain_route_result(result: dict | None) -> None:
     if isinstance(result, dict):
         _TLS.brain_route_result = dict(result)
         _TLS.brain_route_called = True
+        if not result.get("llm_unavailable"):
+            mark_routing_complete()
+
+
+def store_early_brain_dispatch(body: str | None, route: dict | None) -> None:
+    """Cache first _try_early_ai_brain_reply result — prevent duplicate dispatch per turn."""
+    _TLS.early_brain_dispatch_done = True
+    _TLS.early_brain_body = body
+    _TLS.early_brain_route = dict(route) if isinstance(route, dict) else route
+
+
+def get_early_brain_dispatch() -> tuple[str | None, dict | None] | None:
+    if not getattr(_TLS, "early_brain_dispatch_done", False):
+        return None
+    return (
+        getattr(_TLS, "early_brain_body", None),
+        getattr(_TLS, "early_brain_route", None),
+    )
+
+
+def log_routing_decision(
+    *,
+    query: str = "",
+    language: str = "",
+    intent: str = "",
+    confidence: float | None = None,
+    entities: dict[str, str] | None = None,
+    selected_route: str = "",
+    selected_tool: str = "",
+    provider_chain: str = "",
+    api_time_ms: float = 0.0,
+    rag_score: float = 0.0,
+    model_used: str = "",
+    extra: str = "",
+) -> None:
+    """Explicit routing trace for production debugging."""
+    q = (query or getattr(_TLS, "user_query", "") or "-")[:120]
+    lang = (language or getattr(_TLS, "detected_language", "") or "-").strip() or "-"
+    intent_f = (intent or getattr(_TLS, "intent", "") or "-").strip().lower() or "-"
+    tool = (
+        selected_tool
+        or selected_route
+        or getattr(_TLS, "route", "")
+        or "-"
+    ).strip() or "-"
+    route_f = (selected_route or tool or "-").strip() or "-"
+    prov = (
+        provider_chain
+        or getattr(_TLS, "provider_chain", "")
+        or getattr(_TLS, "last_provider", "")
+        or "-"
+    )
+    api_ms = api_time_ms or float(getattr(_TLS, "api_time_ms", 0.0) or 0.0)
+    conf = confidence
+    if conf is None:
+        conf = float(getattr(_TLS, "scope_confidence", 0.0) or 0.0)
+    conf_s = f"{conf:.2f}" if conf else "-"
+    ent = entities if entities is not None else getattr(_TLS, "entities", None) or {}
+    ent_s = _entities_log_str(ent if isinstance(ent, dict) else {})
+    rag_sc = rag_score or float(getattr(_TLS, "chunk_score", 0.0) or 0.0)
+    model = model_used or getattr(_TLS, "model_used", "") or "-"
+    rid = request_id()
+    total_s = response_time_sec()
+    msg = (
+        f"[routing] request_id={rid} query={q!r} language={lang} intent={intent_f} "
+        f"confidence={conf_s} entities={ent_s} selected_route={route_f} "
+        f"selected_tool={tool} provider_chain={prov} api_time={api_ms / 1000.0:.2f}s "
+        f"rag_score={rag_sc:.3f} model_used={model} total_time={total_s:.2f}s"
+    )
+    if extra:
+        msg += f" {extra}"
+    log_reasoning(msg)
+    chat_log(msg)
 
 
 def get_cached_brain_route() -> dict | None:
@@ -152,14 +230,49 @@ def should_defer_micro_classifiers_to_brain() -> bool:
 
 
 def should_skip_micro_classifier_llm() -> bool:
-    """Skip duplicate micro-LLM classifiers once universal brain already classified the turn."""
+    """Skip duplicate micro-LLM classifiers — defer until brain runs, then skip after brain classified."""
+    if should_defer_micro_classifiers_to_brain():
+        if not getattr(_TLS, "_micro_defer_logged", False):
+            _TLS._micro_defer_logged = True
+            log_reasoning(
+                "Micro-classifier deferred — universal ai_brain_route runs first (one LLM)."
+            )
+        return True
     if is_routing_complete():
         return True
+    cached = get_cached_brain_route()
+    if isinstance(cached, dict):
+        if cached.get("llm_unavailable"):
+            return False
+        if (cached.get("intent") or "").strip():
+            return True
     if getattr(_TLS, "brain_route_called", False):
-        return True
-    if get_cached_brain_route():
-        return True
+        if isinstance(cached, dict) and not cached.get("llm_unavailable"):
+            return True
     return False
+
+
+def ensure_brain_route_llm_slot() -> None:
+    """
+    ai_brain_route is the primary router — always reserve one billable LLM call.
+    Micro-classifiers exhausting CHAT_MAX_LLM_CALLS is not an API-key failure.
+    """
+    if not llm_budget_exceeded():
+        return
+    log_reasoning(
+        f"LLM call budget reset — reserving one slot for ai_brain_route "
+        f"(limit={MAX_LLM_CALLS_PER_TURN}; keys are fine)."
+    )
+    _TLS.llm_budget_exceeded = False
+    current = int(getattr(_TLS, "llm_calls", 0) or 0)
+    if current >= MAX_LLM_CALLS_PER_TURN:
+        _TLS.llm_calls = max(0, MAX_LLM_CALLS_PER_TURN - 1)
+
+
+def reset_llm_budget_for_recovery() -> None:
+    """One compact classify after brain routing failed — do not return busy on shopping turns."""
+    _TLS.llm_budget_exceeded = False
+    _TLS.llm_calls = 0
 
 
 def guard_duplicate_brain_route(caller: str = "ai_brain_route") -> dict | None:
@@ -276,13 +389,15 @@ def record_route(intent: str = "", source: str = "") -> None:
         _TLS.source = (source or "").strip().lower()
 
 
-def increment_llm_call(provider: str = "") -> None:
+def increment_llm_call(provider: str = "", *, billable: bool = True) -> None:
     try:
         from services.chat_resilience import touch_chat_turn_in_flight
 
         touch_chat_turn_in_flight()
     except ImportError:
         pass
+    if not billable:
+        return
     current = int(getattr(_TLS, "llm_calls", 0) or 0)
     if current >= MAX_LLM_CALLS_PER_TURN:
         _TLS.llm_budget_exceeded = True
@@ -412,6 +527,62 @@ def record_timeout_point(point: str) -> None:
     _TLS.timeout_point = (point or "").strip() or "-"
 
 
+def record_rag_meta(
+    *,
+    rag_source_file: str = "",
+    chunk_score: float = 0.0,
+    knowledge_version: str = "",
+    model_used: str = "",
+) -> None:
+    if rag_source_file:
+        _TLS.rag_source_file = rag_source_file
+    if chunk_score:
+        _TLS.chunk_score = float(chunk_score)
+    if knowledge_version:
+        _TLS.knowledge_version = knowledge_version
+    if model_used:
+        _TLS.model_used = model_used
+
+
+def log_conversation_intel(
+    *,
+    query: str = "",
+    language: str = "",
+    intent: str = "",
+    route: str = "",
+    rag_source_file: str = "",
+    chunk_score: float = 0.0,
+    knowledge_version: str = "",
+    source: str = "",
+    model_used: str = "",
+) -> None:
+    """Structured conversation-intelligence log (KB / chitchat / OOD)."""
+    rid = request_id()
+    elapsed = response_time_sec()
+    q = (query or getattr(_TLS, "user_query", "") or "-")[:120]
+    lang_f = (language or getattr(_TLS, "detected_language", "") or "-").strip() or "-"
+    kv = knowledge_version or getattr(_TLS, "knowledge_version", "") or "-"
+    rag = rag_source_file or getattr(_TLS, "rag_source_file", "") or "-"
+    score = chunk_score or float(getattr(_TLS, "chunk_score", 0.0) or 0.0)
+    model = model_used or getattr(_TLS, "model_used", "") or "-"
+    if intent:
+        record_route(intent=intent, source=source or route)
+    record_rag_meta(
+        rag_source_file=rag,
+        chunk_score=score,
+        knowledge_version=kv,
+        model_used=model,
+    )
+    msg = (
+        f"[conversation-intel] request_id={rid} query={q!r} language={lang_f} "
+        f"intent={intent or '-'} route={route or '-'} rag_source_file={rag} "
+        f"chunk_score={score:.3f} knowledge_version={kv} model_used={model} "
+        f"source={source or '-'} response_time={elapsed:.2f}s"
+    )
+    log_reasoning(msg)
+    chat_log(msg)
+
+
 def log_pipeline_complete(
     *,
     user_query: str = "",
@@ -440,6 +611,10 @@ def log_pipeline_complete(
     q = (user_query or getattr(_TLS, "user_query", "") or "-")[:120]
     lang_f = (detected_language or getattr(_TLS, "detected_language", "") or "-").strip() or "-"
     timeout_pt = (getattr(_TLS, "timeout_point", "") or "-").strip() or "-"
+    rag_f = (getattr(_TLS, "rag_source_file", "") or "-").strip() or "-"
+    chunk_sc = float(getattr(_TLS, "chunk_score", 0.0) or 0.0)
+    kv_f = (getattr(_TLS, "knowledge_version", "") or "-").strip() or "-"
+    model_f = (getattr(_TLS, "model_used", "") or "-").strip() or "-"
     api_ms = float(getattr(_TLS, "api_time_ms", 0.0) or 0.0)
     slow_fn = (getattr(_TLS, "slow_function", "") or "-").strip() or "-"
     phase_s = phases_summary()
@@ -449,7 +624,8 @@ def log_pipeline_complete(
         f"tool_used={tool_f} entities={ent_s} source={src_f} "
         f"llm_call_count={calls} api_time={api_ms / 1000.0:.2f}s "
         f"total_time={elapsed:.2f}s slow_function={slow_fn} phases={phase_s} "
-        f"timeout_point={timeout_pt}"
+        f"timeout_point={timeout_pt} rag_source_file={rag_f} "
+        f"chunk_score={chunk_sc:.3f} knowledge_version={kv_f} model_used={model_f}"
     )
     log_reasoning(msg)
     chat_log(msg)

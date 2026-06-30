@@ -321,6 +321,120 @@ def init_mysql_chat_schema():
         conn.close()
 
 
+def _ensure_chat_session_row(cursor, chat_id: str, user_id, user_message: str) -> None:
+    """Sidebar row must exist before/with chats — history INNER JOIN depends on it."""
+    if not chat_id:
+        return
+    title = (user_message[:30] + "...") if len(user_message or "") > 30 else (user_message or "New chat")
+    uid = str(user_id or "").strip() or "0"
+    cursor.execute(
+        "SELECT id FROM chat_sessions WHERE chat_token = %s LIMIT 1",
+        (chat_id,),
+    )
+    if cursor.fetchone():
+        return
+    try:
+        cursor.execute(
+            "INSERT INTO chat_sessions (user_id, title, chat_token, customer_id) VALUES (%s, %s, %s, %s)",
+            (uid, title, chat_id, uid),
+        )
+    except Exception as e:
+        if "customer_id" in str(e).lower():
+            cursor.execute(
+                "INSERT INTO chat_sessions (user_id, title, chat_token) VALUES (%s, %s, %s)",
+                (uid, title, chat_id),
+            )
+        else:
+            raise
+
+
+def db_store_turn_pair(chat_id, user_message, bot_message, user_id=None):
+    """Atomically append user + bot messages — avoids parallel thread lost updates."""
+    if not chat_id:
+        return
+    conn = get_mysql_connection()
+    if not conn:
+        return
+    try:
+        sid = str(chat_id)
+        numeric_chat_id = int(sid) if sid.isdigit() and len(sid) < 20 else None
+        with conn.cursor() as cursor:
+            if user_id:
+                _ensure_chat_session_row(cursor, chat_id, user_id, user_message)
+            cursor.execute("SHOW COLUMNS FROM chats LIKE 'user_id'")
+            has_user_id = cursor.fetchone() is not None
+
+            if numeric_chat_id is not None:
+                cursor.execute(
+                    "SELECT chat_data FROM chats WHERE chat_token = %s OR chat_id = %s LIMIT 1",
+                    (chat_id, numeric_chat_id),
+                )
+            else:
+                cursor.execute(
+                    "SELECT chat_data FROM chats WHERE chat_token = %s LIMIT 1",
+                    (chat_id,),
+                )
+            row = cursor.fetchone()
+
+            new_rows = [
+                {"sender": "user", "text": user_message},
+                {"sender": "bot", "text": bot_message},
+            ]
+            if row and row.get("chat_data"):
+                try:
+                    chat_data = json.loads(row["chat_data"])
+                except (TypeError, json.JSONDecodeError):
+                    chat_data = []
+                if isinstance(chat_data, dict):
+                    chat_data = [chat_data]
+                elif not isinstance(chat_data, list):
+                    chat_data = []
+                chat_data.extend(new_rows)
+                chat_data_json = json.dumps(chat_data, ensure_ascii=False)
+                if has_user_id:
+                    cursor.execute(
+                        "UPDATE chats SET chat_data = %s, chat_id = %s, user_id = %s, updated_at = NOW() WHERE chat_token = %s OR chat_id = %s",
+                        (
+                            chat_data_json,
+                            chat_id,
+                            user_id,
+                            chat_id,
+                            numeric_chat_id if numeric_chat_id is not None else -1,
+                        ),
+                    )
+                else:
+                    cursor.execute(
+                        "UPDATE chats SET chat_data = %s, chat_id = %s, updated_at = NOW() WHERE chat_token = %s OR chat_id = %s",
+                        (
+                            chat_data_json,
+                            chat_id,
+                            chat_id,
+                            numeric_chat_id if numeric_chat_id is not None else -1,
+                        ),
+                    )
+            else:
+                chat_data_json = json.dumps(new_rows, ensure_ascii=False)
+                if has_user_id:
+                    cursor.execute(
+                        "INSERT INTO chats (chat_token, chat_id, chat_data, user_id, created_at, updated_at) VALUES (%s, %s, %s, %s, NOW(), NOW())",
+                        (chat_id, chat_id, chat_data_json, user_id),
+                    )
+                else:
+                    cursor.execute(
+                        "INSERT INTO chats (chat_token, chat_id, chat_data, created_at, updated_at) VALUES (%s, %s, %s, NOW(), NOW())",
+                        (chat_id, chat_id, chat_data_json),
+                    )
+        conn.commit()
+    except Exception as e:
+        print(f"MySQL turn-pair store error: {e}", flush=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
 def db_store_message(chat_id, sender, message, user_id=None):
     conn = get_mysql_connection()
     if not conn:

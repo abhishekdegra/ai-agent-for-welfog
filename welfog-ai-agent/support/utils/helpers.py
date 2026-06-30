@@ -182,7 +182,8 @@ def _is_welfog_about_fast_path(msg: str) -> bool:
             " platform ", " story ", " kahani ", " kahaani ", " founder ", " ceo ",
             " kya karta ", " kya karti ", " kya karte ", " kya kaam ",
             " kya h ", " krti kya ", " krta kya ", " krti kya h ", " krta kya h ",
-            " ke bare ", " ke baare ", " ke barre ", " bare me ", " baare me ", " barre me ",
+            " ke bare ", " ke baare ", " ke barre ", " ke baare em ", " baare em ",
+            " bare me ", " baare me ", " barre me ",
             " baar me ", " bttoo ", " bttto ", " btado ", " btana ", " bataoo ",
         )
     ):
@@ -346,6 +347,8 @@ def _looks_like_greeting_message(msg: str) -> bool:
             continue
         if w.startswith("bh") and len(w) <= 7:
             continue
+        if w.endswith("bhia") or w.endswith("bhai") or w.endswith("bhaiya"):
+            continue
         return False
     return True
 
@@ -389,9 +392,6 @@ _CASUAL_WELLBEING_SNIPPETS = (
     "aur sab",
     "sab bdiya",
     "sab bdia",
-    "bdiya",
-    "badhiya",
-    "badiya",
     "theek hai sab",
     "kaise ho",
     "kaise ho aap",
@@ -814,7 +814,10 @@ def _light_smalltalk_blocker_hit(sample: str) -> bool:
     for w in _SMALLTALK_BLOCKER_WORDS:
         if re.search(rf"\b{re.escape(w)}\b", sample):
             return True
-    for p in ("dikhao", "dikha", "dikho", "dikhado", "milega", "milta", "chahiye", "dikhaana"):
+    for p in (
+        "dikhao", "dikha", "dikho", "dikhado", "milega", "milta", "chahiye", "dikhaana",
+        "bta de", "bata de", "btao", "batao", "suggest", "recommend", "lena", "leni", "kharid",
+    ):
         if p in sample:
             return True
     return False
@@ -1327,28 +1330,12 @@ def build_warm_feedback_reply(
     if ai_body:
         return ai_body
 
-    if should_send_warm_greeting_reply(original_msg, msg_en, conversation_context):
-        warm = fast_warm_reply_html(original_msg, msg_en, reply_lang=rl)
-        if warm:
-            return finalize_customer_reply(warm, original_msg or msg_en, rl)
     contextual = build_contextual_ack_reply(
         original_msg, msg_en, conversation_context, reply_lang=rl, ctx=ctx
     )
     if contextual:
         return contextual
-
-    preferred = _preferred_greeting_reply_key(original_msg or msg_en, reply_lang=reply_lang)
-    if preferred:
-        body = sysmsg(preferred) or ""
-    else:
-        use_hinglish = rl == "hinglish" or is_hinglish_message(original_msg or msg_en or "")
-        if use_hinglish:
-            body = sysmsg("feedback_ack_hinglish") or sysmsg("warm_smalltalk_hinglish_3") or ""
-        else:
-            body = sysmsg("feedback_ack") or sysmsg("warm_smalltalk_3") or ""
-    if not body:
-        return ""
-    return finalize_customer_reply(body, original_msg or msg_en, rl)
+    return ""
 
 
 def _should_bypass_warm_greeting_fast_path(combined_text: str) -> bool:
@@ -1454,7 +1441,9 @@ def _looks_like_native_script_short_greeting(msg: str) -> bool:
     )
     if any(h in lowered for h in hint_fragments):
         return True
-    return len(tokens) <= 3
+    if _native_script_message_looks_informational(raw):
+        return False
+    return len(tokens) <= 2
 
 
 _GREETING_STYLE_KEYS = ("greeting", "greeting_variant_2", "greeting_variant_3")
@@ -1634,8 +1623,10 @@ def pick_warm_chat_reply_key(smalltalk: bool, original_msg: str = "", reply_lang
 
 
 def build_warm_conversation_reply(original_msg: str, msg_en: str = "", reply_lang: str = "") -> str:
-    """Human-like opener — KB templates only (no heavy guards or embedding path)."""
-    return fast_warm_reply_html(original_msg, msg_en, reply_lang=reply_lang)
+    """Chitchat opener — AI only."""
+    from services.conversational_ack_flow import ai_chitchat_reply
+
+    return ai_chitchat_reply(original_msg, msg_en, "", reply_lang=reply_lang) or ""
 
 
 def _normalize_order_chat_text(text: str) -> str:
@@ -1654,6 +1645,9 @@ def _normalize_order_chat_text(text: str) -> str:
     )
     for pat, repl in replacements:
         t = re.sub(pat, repl, t, flags=re.IGNORECASE)
+    # Hinglish glued tokens: "2606252is id", "2606252ki invoice"
+    t = re.sub(r"([0-9]{4,20})(?=[a-zA-Z]{1,6}(?:\s|$|\b))", r"\1 ", t)
+    t = re.sub(r"([0-9]{4,20})(?=ki\b)", r"\1 ", t, flags=re.IGNORECASE)
     return t
 
 
@@ -1827,6 +1821,12 @@ def _turn_blocks_pincode_serviceability_routing(t: str) -> bool:
     raw = (t or "").strip()
     if not raw:
         return False
+    if re.search(r"\b[1-9]\d{5}\b", raw):
+        try:
+            if message_has_live_pincode_check_intent(raw, "", ""):
+                return False
+        except Exception:
+            pass
     tl = f" {raw.lower()} "
     if _text_has_refund_or_return_intent(raw):
         if any(
@@ -1843,6 +1843,11 @@ def _turn_blocks_pincode_serviceability_routing(t: str) -> bool:
                 return True
     if _is_welfog_about_fast_path(raw):
         return True
+    try:
+        if _text_is_welfog_payment_info_question(raw):
+            return True
+    except NameError:
+        pass
     if any(
         x in tl
         for x in (
@@ -1851,7 +1856,16 @@ def _turn_blocks_pincode_serviceability_routing(t: str) -> bool:
         )
     ):
         return True
+    try:
+        from utils.helpers import _text_mentions_social_platform
+
+        if _text_mentions_social_platform(tl):
+            return True
+    except ImportError:
+        pass
     if "wishlist" in tl or "wish list" in tl:
+        return True
+    if message_is_wishlist_like_request(raw) or _text_asks_wishlist(raw):
         return True
     if _text_wants_order_history_list_in_chat(raw) or message_is_past_purchase_list_request(raw):
         return True
@@ -2150,6 +2164,48 @@ def _conversation_bot_asked_for_pincode(conversation_context: str) -> bool:
     ) or "?" in last_asst
 
 
+def _is_llm_placeholder_order_id(token: str) -> bool:
+    """Reject routing-LLM placeholder tokens (e.g. use_provided_order_id) — not real ids."""
+    t = (token or "").strip().lower().replace("-", "_")
+    if not t:
+        return False
+    if re.fullmatch(r"[0-9]{4,20}", t):
+        return False
+    if t in (
+        "order_id",
+        "use_provided_order_id",
+        "provided_order_id",
+        "user_order_id",
+        "your_order_id",
+        "the_order_id",
+        "my_order_id",
+        "pending",
+        "none",
+        "n_a",
+        "na",
+        "unknown",
+        "tbd",
+        "example",
+        "placeholder",
+    ):
+        return True
+    if "provided" in t and "id" in t:
+        return True
+    if "placeholder" in t:
+        return True
+    return False
+
+
+def coerce_valid_order_id(oid: str | None, *, context: str = "") -> str:
+    """Return a real order id or empty string when input is missing/placeholder/invalid."""
+    t = (oid or "").strip()
+    if not t or _is_llm_placeholder_order_id(t):
+        return ""
+    if not _is_plausible_order_id(t, context=context):
+        return ""
+    return t.upper() if re.search(r"[A-Za-z]", t) else t
+
+
 def _is_plausible_order_id(token: str, context: str = "", *, shallow: bool = False) -> bool:
     """
     Order-id shapes we accept:
@@ -2161,6 +2217,8 @@ def _is_plausible_order_id(token: str, context: str = "", *, shallow: bool = Fal
     if not token:
         return False
     t = token.strip()
+    if _is_llm_placeholder_order_id(t):
+        return False
     if not re.fullmatch(r"[A-Za-z0-9]{4,20}", t):
         return False
     ctx = _normalize_order_chat_text(context or "")
@@ -2296,9 +2354,9 @@ def turn_is_obvious_product_shopping_turn(
     Clear catalog shopping turn — skip delivery/KB micro-classifiers (any language).
     Does not use customer keyword lists for routing; combines structural product signals.
     """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if turn_is_catalog_product_lookup(original_msg, msg_en):
         return True
-    comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
         return False
     if _turn_is_catalog_product_request(comb):
@@ -2407,6 +2465,10 @@ def message_is_past_purchase_list_request(t: str) -> bool:
                 return False
     if "order history" in tl or "purchase history" in tl or "my orders" in tl:
         return True
+    if re.search(r"\b(?:order|purchase)\s+h\w*stor\w*", tl):
+        return True
+    if re.search(r"\b(?:order|purchase)\s+hist\w*", tl):
+        return True
     if re.search(r"\b(?:meri|mere|my)\s+orders?\b", tl) and any(
         v in tl for v in ("dikhao", "dikha", "list", "batao", "show", "dede", "history")
     ):
@@ -2468,6 +2530,10 @@ def message_is_wishlist_like_request(t: str) -> bool:
                 for v in ("dekh", "dekho", "dikhao", "dikha", "list", "batao", "btao", "show", "chahiye")
             ):
                 return True
+    if re.search(r"\bliek\b", tl) and any(
+        x in tl for x in ("diye", "diya", "kiya", "ki", "hue", "products", "product")
+    ):
+        return True
     like_markers = (
         "like diya", "like kiya", "like ki", "like kiye", "like kri", "like kra",
         "like krta", "like kiya h", "like diye", "liked", "pasand kiya", "pasand ki",
@@ -2606,6 +2672,12 @@ def _bare_order_id_token_from_msg(msg: str, conversation_context: str = ""):
     )
     if labeled_rha and _is_plausible_order_id(labeled_rha.group(1), context=ctx_comb, shallow=True):
         return labeled_rha.group(1)
+    glued = re.search(
+        r"(?:^|[^\d])([0-9]{4,20})(?=[a-zA-Z]{1,8}(?:\s|$))",
+        raw,
+    )
+    if glued and _is_plausible_order_id(glued.group(1), context=ctx_comb, shallow=True):
+        return glued.group(1)
     bare = re.search(r"\b([0-9]{4,20})\b", raw)
     if bare and _is_plausible_order_id(bare.group(1), context=ctx_comb, shallow=True):
         return bare.group(1)
@@ -2726,8 +2798,16 @@ def _user_demands_immediate_track_action(text: str) -> bool:
 def _user_asks_hypothetical_tracking_capability(text: str) -> bool:
     """
     User asks IF bot can track another id / ETA / cancel — no id digits in this message.
-    e.g. 'agar maan le id laa deu to tu bta dega na kab aayega / cancel to nahi'.
+    LLM-unavailable failsafe only — under STRICT_AI_INTENT_ROUTING, ai_brain_route classifies
+    hypothetical vs live lookup in any language.
     """
+    try:
+        from services.semantic_intent import strict_ai_semantic_mode
+
+        if strict_ai_semantic_mode():
+            return False
+    except ImportError:
+        pass
     raw = _normalize_order_chat_text(text or "")
     if not raw.strip() or re.search(r"\b[0-9]{4,20}\b", raw):
         return False
@@ -2919,8 +2999,10 @@ def resolve_order_id_for_tracking(
     if oid:
         return oid
 
-    ai_id = (ai_extracted or "").strip()
-    if ai_id and _is_plausible_order_id(ai_id, context=f"{msg} {conversation_context}"):
+    ai_id = coerce_valid_order_id(
+        ai_extracted, context=f"{msg} {conversation_context}"
+    )
+    if ai_id:
         compact = re.sub(r"\s+", "", msg.lower())
         if ai_id.lower() in compact or ai_id in msg:
             return ai_id
@@ -3344,11 +3426,43 @@ def message_requests_new_area_without_pin(
         return True
     if extract_pincode_preferred_from_message(raw, conversation_context):
         return False
+    try:
+        from services.location_delivery_resolver import (
+            resolve_delivery_turn,
+            _DELIVERY_AI_CONF_FOLLOWUP,
+            _DELIVERY_AI_CONF_SERVICEABILITY,
+        )
+
+        understood = resolve_delivery_turn(
+            text, msg_en, conversation_context, allow_llm=True
+        )
+        if understood.is_area_followup and understood.confidence >= _DELIVERY_AI_CONF_FOLLOWUP:
+            return True
+        if (
+            understood.is_serviceability
+            and understood.confidence >= _DELIVERY_AI_CONF_SERVICEABILITY
+            and understood.location_kind in ("city", "ask_pin")
+            and not understood.pincode
+        ):
+            return True
+    except ImportError:
+        pass
     if not (
         _text_has_delivery_or_order_area_intent(raw)
         or _text_is_pincode_serviceability_question_light(raw)
     ):
         return False
+    try:
+        from services.location_delivery_resolver import (
+            _place_is_relational_or_vague_reference,
+            extract_place_query_from_delivery_message,
+        )
+
+        place = extract_place_query_from_delivery_message(raw)
+        if place and _place_is_relational_or_vague_reference(place):
+            return True
+    except ImportError:
+        pass
     tl = f" {raw.lower()} "
     if re.search(r"\baur\b", tl) and any(
         x in tl
@@ -3953,10 +4067,37 @@ def _text_is_order_tracking_intent_leaf(t: str) -> bool:
         pass
 
     raw = _normalize_order_chat_text((t or "").strip())
-    if _text_asks_order_history(raw) or _text_wants_order_history_list_in_chat(raw):
+    if not raw:
         return False
     if _text_is_undelivered_order_complaint(raw):
         return True
+    # Fast reject — pure catalog/product browse (e.g. "iphone dikha de") has no order-topic
+    # tokens; skip 10–15s order-history / live-lookup classifier chain.
+    tl_quick = f" {raw.lower()} "
+    if not _text_has_light_order_tracking_markers(raw):
+        if not any(
+            x in tl_quick
+            for x in (
+                "order",
+                "parcel",
+                "package",
+                "shipment",
+                "courier",
+                "dispatch",
+                "deliver",
+                "pahuch",
+                "pahunch",
+                "milega",
+                "aaya",
+                "aayi",
+                "mila ",
+                "status",
+                "track",
+            )
+        ):
+            return False
+    if _text_asks_order_history(raw) or _text_wants_order_history_list_in_chat(raw):
+        return False
     if _text_is_delivery_serviceability_hypothetical(raw):
         return False
     if _text_is_pincode_serviceability_question_light(raw):
@@ -5092,6 +5233,8 @@ def _normalize_order_history_typos(t: str) -> str:
         ("histery", "history"),
         ("hostory", "history"),
         ("histoey", "history"),
+        ("hstory", "history"),
+        ("hstoyr", "history"),
         ("ordr", "order"),
         ("odrer", "order"),
         ("oder ", "order "),
@@ -5099,6 +5242,7 @@ def _normalize_order_history_typos(t: str) -> str:
     ):
         s = s.replace(wrong, right)
     s = re.sub(r"\bhist[oaeiu]{0,3}r[a-z]{0,4}\b", "history", s)
+    s = re.sub(r"\bh\w*stor\w*\b", "history", s)
     return s
 
 
@@ -5761,6 +5905,11 @@ def _text_wants_order_history_list_in_chat(
             "purane order", "past order", "jo order kiye", "order kiye",
         )
     ) or ("order" in tl and "history" in tl)
+    if not has_hist:
+        norm_tl = f" {_normalize_order_history_typos(raw)} "
+        has_hist = "order history" in norm_tl or (
+            "order" in norm_tl and "history" in norm_tl
+        )
 
     list_verbs = (
         "dikhao", "dikha", "dikhe", "dikha de", "dikhado", "dikha do", "dikha dena",
@@ -6214,8 +6363,9 @@ def _text_is_live_order_lookup_intent(t: str, conversation_context: str = "") ->
     """
     from services.order_details_flow import _lightweight_details_or_invoice_signal
 
-    if _lightweight_details_or_invoice_signal(t or ""):
-        return False
+    light = (_lightweight_details_or_invoice_signal(t or "") or "").strip()
+    if light in ("order_invoice", "order_details"):
+        return True
     turn = _normalize_order_chat_text(t or "")
     if not turn.strip():
         return False
@@ -6270,6 +6420,30 @@ def _text_is_live_order_lookup_intent(t: str, conversation_context: str = "") ->
         x in tl for x in status_markers + ("bta", "bata", "check", "dekh")
     ):
         return True
+    if not has_numeric_id and re.search(r"\border\b", tl):
+        if any(
+            x in tl
+            for x in (
+                "kab tk",
+                "kab tak",
+                "kb tk",
+                "kab aa",
+                "aa jayega",
+                "aa jaayega",
+                "kab milega",
+                "kab aayega",
+                "kahan",
+                "kaha ",
+                "status",
+                "track",
+            )
+        ):
+            return True
+    try:
+        if _text_is_order_tracking_intent_leaf(t or ""):
+            return True
+    except Exception:
+        pass
     return False
 
 
@@ -6685,6 +6859,56 @@ def _catalog_product_signal_words() -> frozenset:
     return frozenset(base)
 
 
+def _text_is_welfog_payment_info_question(t: str) -> bool:
+    """
+    Payment / COD availability questions — KB, not catalog search.
+    e.g. 'cod available h kya', 'payment methods welfog'.
+    """
+    if not (t or "").strip():
+        return False
+    tl = f" {_normalize_welfog_typos(t)} "
+    payment_hints = (
+        " cod ",
+        " cash on delivery",
+        "payment method",
+        "payment mode",
+        "payment option",
+        "payment policy",
+        " pay on delivery",
+        "upi ",
+        " net banking",
+        " debit card",
+        " credit card",
+        " wallet",
+        "pay later",
+        "emi ",
+    )
+    if not any(h in tl for h in payment_hints):
+        return False
+    info_markers = (
+        "available",
+        "avail",
+        "accept",
+        "support",
+        "method",
+        "option",
+        "mode",
+        "kya",
+        "ky ",
+        "hai kya",
+        " h kya",
+        "le leta",
+        "leta h",
+        "leti h",
+        "konsa",
+        "kon sa",
+        "kon kon",
+        "which",
+        "what",
+    )
+    return any(m in tl for m in info_markers) or _text_mentions_welfog_brand(tl)
+
+
 _SHOPPING_ACTION_MARKERS = (
     "show", "buy", "need", "want", "looking for", " search ", " find ", "price ", " rate ",
     "cheap", "under rs", "under ₹", "purchase", "shop ",
@@ -6743,6 +6967,21 @@ def _text_has_kb_topic_hint(t: str) -> bool:
     if "policy" in tl or "policies" in tl or "privacy" in tl:
         return True
     if any(x in tl for x in (" faq", "faqs", "help & support", "help and support")):
+        return True
+    if any(
+        x in tl
+        for x in (
+            " cod ",
+            " cash on delivery",
+            "payment method",
+            "payment mode",
+            "payment option",
+            "upi ",
+            " net banking",
+            " debit card",
+            " credit card",
+        )
+    ):
         return True
     if _text_mentions_welfog_brand(tl) and any(
         x in tl
@@ -6813,6 +7052,8 @@ def _message_has_generic_shopping_item_signal(t: str) -> bool:
     Shopping verb + concrete item words — no fixed product list required.
     e.g. 'pressure cooker dikhao', 'sofa chahiye', 'organic honey milega kya'.
     """
+    if _text_is_welfog_payment_info_question(t):
+        return False
     tl = f" {_normalize_welfog_typos(t)} "
     if not any(m in tl for m in _SHOPPING_ACTION_MARKERS):
         return False
@@ -7068,8 +7309,6 @@ def message_is_casual_offtopic_not_shopping(text: str) -> bool:
     if message_is_knowledge_information_request(text) or message_is_welfog_about_request(text):
         return False
     tl = f" {text.lower()} "
-    if _message_has_catalog_product_signal(text):
-        return False
     personal = (
         "do you cook", "can you cook", "where do you live", "where you live",
         "marry me", "date me", "are you human", "are you real", "tell me a joke",
@@ -7081,6 +7320,8 @@ def message_is_casual_offtopic_not_shopping(text: str) -> bool:
     )
     if any(p in tl for p in personal):
         return True
+    if _message_has_catalog_product_signal(text):
+        return False
     # Relationship advice only — NOT shopping for gf/bf (suit, watch, gift)
     if re.search(r"\b(gf|bf|girlfriend|boyfriend)\b", tl) and any(
         x in tl for x in ("mil rhi", "mil nahi", "nhi mil", "nahi mil", "kya karu", "kya kru")
@@ -7256,7 +7497,32 @@ def _normalize_policy_typos(text: str) -> str:
 
 
 def _text_mentions_welfog_brand(text: str) -> bool:
-    return "welfog" in _normalize_welfog_typos(text)
+    raw = text or ""
+    if "वेलफोग" in raw or "वेल फोग" in raw:
+        return True
+    return "welfog" in _normalize_welfog_typos(raw)
+
+
+def _native_script_message_looks_informational(msg: str) -> bool:
+    """Question / about-brand in Indic scripts — not a greeting (no intent routing)."""
+    raw = (msg or "").strip()
+    if not raw:
+        return False
+    if "?" in raw or "？" in raw:
+        return True
+    if _text_mentions_welfog_brand(raw):
+        return True
+    lowered = raw.lower()
+    question_marks = (
+        "क्या", "कैसे", "कब", "कहाँ", "कहां", "कितना", "कितने", "कौन", "क्यों",
+        "कसा", "काय", "कुठे", "कधी", "किती", "कौण", "कें", "कैसा", "कैसी",
+        "என்ன", "எப்படி", "எங்க", "யார்",
+        "ఏమి", "ఎలా", "ఎక్కడ",
+        "ಏನು", "ಹೇಗೆ", "ಎಲ್ಲಿ",
+        "എന്ത്", "എങ്ങനെ", "എവിടെ",
+        "কি", "কী", "কিভাবে", "কোথায়",
+    )
+    return any(m in lowered for m in question_marks)
 
 
 _WELFOG_ABOUT_MARKERS = (
@@ -7705,6 +7971,8 @@ def _text_mentions_social_platform(t: str) -> bool:
     )
     if any(m in tl for m in markers):
         return True
+    if re.search(r"\b(?:i?n?stagram|insta|instragram|instra)\b", tl):
+        return True
     if re.search(r"\bx\.com\b", tl):
         return True
     if re.search(r"\b(?:twiter|twittr|twitt?er|twitter|tweet)\b", tl):
@@ -7784,7 +8052,10 @@ def _turn_is_catalog_product_request(t: str) -> bool:
     if re.search(
         r"\b(shirt|pant|jeans|dress|shoes|kurta|cover|case|mobile|product|products)\b",
         tl,
-    ) and re.search(r"\b(dikha\w*|lena|leni|kharid|buy|show|chahiye)\b", tl):
+    ) and re.search(
+        r"\b(dikha\w*|lena|leni|kharid|buy|show|chahiye|bta\w*|bata\w*|suggest|recommend)\b",
+        tl,
+    ):
         return True
     if re.search(r"\b(dono|both)\b", tl) and re.search(
         r"\b(shirt|cover|case|product|mobile)\b", tl
@@ -7935,8 +8206,6 @@ def message_asks_other_company_social_media(
     turn = (text or "").strip()
     if not turn:
         return False
-    if _turn_is_catalog_product_request(turn):
-        return False
     if not _text_mentions_social_platform(turn):
         return False
     if _external_entity_social_request(turn):
@@ -7971,6 +8240,8 @@ def message_asks_other_company_social_media(
                 rf"(?:insta|instagram|facebook|youtube|twitter|linkedin|social).{{0,40}}\b{re.escape(brand)}\b",
                 tl,
             ):
+                if _turn_is_catalog_product_request(turn):
+                    return False
                 return True
 
     m = re.search(
@@ -7989,6 +8260,8 @@ def message_asks_other_company_social_media(
             "teri", "tera", "tumhari", "tumhara", "tumhare",
             "unke", "unka", "unhi", "customer", "care",
         ):
+            if _turn_is_catalog_product_request(turn):
+                return False
             return True
     return False
 
@@ -8016,69 +8289,20 @@ def _text_mentions_kb_social_platform(text: str) -> bool:
 def message_asks_welfog_social_media(
     text: str, conversation_context: str = ""
 ) -> bool:
-    """Official Welfog social links / handles — from company knowledge."""
+    """Legacy instant-router helper — main /chat uses AI kb_turn classifier instead."""
     turn = (text or "").strip()
     if not turn:
-        return False
-    if _turn_is_catalog_product_request(turn):
         return False
     if message_asks_other_company_social_media(turn, conversation_context=conversation_context):
         return False
     if _is_welfog_social_followup(turn, conversation_context):
         return True
     tl = f" {_normalize_welfog_typos(turn)} "
-    wants_social = (
-        _text_mentions_social_platform(tl)
-        or _text_mentions_kb_social_platform(turn)
-        or any(
-            x in tl for x in ("social media", "social link", "official link", "official page")
-        )
-    )
-    if not wants_social:
-        return False
-
-    # Follow-up: "instagram ki bhi dede", "twitter bhi de" (Welfog thread only — not "agoda ki bhi linkdin")
-    if re.search(
-        r"\b(?:instagram|insta|youtube|yout+ube|twiter|twittr|twitter|linkedin|linkdin|facebook|fb)\w*\s+k[e]?\s+bhi\b",
-        tl,
-    ) or re.search(r"\b(bhi|aur)\s+(dede|do|dena|bhej|share|send|bata)\b", tl):
-        subj = re.search(r"\b([a-z][a-z0-9]{2,20})\s+k[ai]\s+bhi\b", tl)
-        if subj and _social_request_subject_is_external(subj.group(1)):
-            return False
-        if _text_mentions_social_platform(tl) and (
-            _text_mentions_welfog_brand(tl)
-            or (
-                _conversation_recent_welfog_social(conversation_context)
-                and not _external_entity_social_request(turn)
-            )
-        ):
-            return True
-
     if _text_mentions_welfog_brand(tl):
-        return True
-    if re.search(
-        r"\bwelfog\s+k[iae]\s+(?:insta(?:gram)?|instagram|facebook|fb|youtube|linkedin|linkdin|twitter|social)\b",
-        tl,
-    ):
-        return True
-    if any(
-        x in tl
-        for x in (
-            "official", "apna", "apni", "aapka", "aapki", "hamara", "hamari",
-            "teri", "tera", "tumhari", "tumhara", "tumhare",
-            "company", "brand page", "welfog ka", "welfog ki", "welfog ke",
-            "customer care", "customer support", "connect hona", "connect karna",
-        )
-    ):
-        return True
-    tokens = [t for t in re.findall(r"[a-z0-9]+", tl) if len(t) >= 2]
-    # Short ask in Welfog chat: "instagram dena" — not "agoda ki linkdin"
-    if len(tokens) <= 10 and (
-        _text_mentions_social_platform(tl) or _text_mentions_kb_social_platform(turn)
-    ):
-        if _external_entity_social_request(turn):
-            return False
-        return True
+        if _text_mentions_social_platform(tl) or _text_mentions_kb_social_platform(turn):
+            return True
+    if _turn_is_catalog_product_request(turn):
+        return False
     return False
 
 
@@ -8087,6 +8311,8 @@ def message_is_welfog_about_request(text: str) -> bool:
     User wants to know what Welfog is / company info — NOT a catalog SKU search.
     Handles typos (wlefog) and Hinglish (ke baare me, batao kuchh welfog).
     """
+    if _is_welfog_about_fast_path(text):
+        return True
     if message_asks_welfog_categories_list(text):
         return False
     try:
@@ -8102,8 +8328,6 @@ def message_is_welfog_about_request(text: str) -> bool:
         return False
     if message_asks_my_welfog_purchases(text):
         return False
-    if _is_welfog_about_fast_path(text):
-        return True
     raw = text or ""
     tl = f" {_normalize_welfog_typos(text)} "
     if _text_mentions_welfog_brand(tl) and any(
@@ -8330,6 +8554,7 @@ def _text_has_product_shopping_intent_core(t: str) -> bool:
         message_needs_support_not_product(t)
         or message_needs_policy_answer(t)
         or message_is_knowledge_information_request(t)
+        or _text_is_welfog_payment_info_question(t)
     ):
         return False
     if _text_asks_order_history(t) or message_is_past_purchase_list_request(t):

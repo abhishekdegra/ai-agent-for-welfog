@@ -230,6 +230,8 @@ def ai_classify_scope_and_reply(
     msg_en: str = "",
     conversation_context: str = "",
     reply_lang: str = "",
+    *,
+    preflight: bool = False,
 ) -> Optional[ScopeDecision]:
     """
     Dedicated scope LLM — any language, unseen wording. Returns classification + reply
@@ -253,7 +255,7 @@ def ai_classify_scope_and_reply(
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
 
     comb = _combined(original_msg, msg_en)
-    if not comb or _has_definite_welfog_shopping_signal(comb):
+    if not comb or (not preflight and _has_definite_welfog_shopping_signal(comb)):
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
@@ -295,6 +297,8 @@ Infer meaning semantically — never match fixed keyword lists."""
         user_payload = f"RECENT CONVERSATION:\n{compact_ctx}\n\n{user_payload}"
 
     try:
+        scope_timeout = 8 if preflight else 11
+        scope_attempts = 1 if preflight else 2
         data = _llm_json_with_provider_fallback(
             providers,
             [
@@ -302,8 +306,8 @@ Infer meaning semantically — never match fixed keyword lists."""
                 {"role": "user", "content": user_payload},
             ],
             max_tokens=220,
-            timeout_sec=11,
-            max_attempts=2,
+            timeout_sec=scope_timeout,
+            max_attempts=scope_attempts,
             temperature=0.25,
         )
     except Exception as exc:
@@ -816,8 +820,18 @@ def build_scope_reply(
             body = refill.reply
 
     if not body:
-        use_h = rl == "hinglish" or is_hinglish_message(original_msg or msg_en)
-        body = _generic_scope_fallback(decision.scope, use_h)
+        try:
+            from services.conversational_ack_flow import ai_natural_scope_reply
+
+            body = ai_natural_scope_reply(
+                decision.scope,
+                original_msg,
+                msg_en,
+                "",
+                reply_lang=rl,
+            )
+        except ImportError:
+            body = ""
 
     if body and rl not in ("en", "hinglish"):
         body = localize_for_customer(body, rl)

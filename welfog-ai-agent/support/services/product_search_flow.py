@@ -1342,12 +1342,10 @@ def _run_locked_catalog_search_fast(
         product_search_show_view_more,
     )
     from services.product_filter_pipeline import (
-        _build_catalog_spec_from_locked_entities,
         _build_related_accessory_understanding,
-        _enrich_brain_entities_structural,
-        _structural_gap_ai_from_message,
         apply_catalog_result_filters,
         brain_search_query_is_noisy,
+        build_catalog_spec_for_product_turn,
         log_product_search_pipeline,
     )
     from services.product_query_understanding import (
@@ -1356,71 +1354,68 @@ def _run_locked_catalog_search_fast(
     )
     from services.welfog_api import build_welfog_product_browse_url
 
-    sq = (
-        (search_query or "").strip()
-        or ((ai_route or {}).get("search_query") or "").strip()
-        or ((ai_understanding or {}).get("search_terms") or "").strip()
-    )
-    try:
-        from services.ai_route_semantics import _catalog_search_query_from_brain_route
-
-        sq_brain = _catalog_search_query_from_brain_route(ai_route)
-        if sq_brain:
-            sq = sq_brain
-    except ImportError:
-        pass
     locked_u = dict(ai_understanding or {})
+    sq = ""
+    if locked_u.get("sku"):
+        sq = str(locked_u["sku"]).strip()
+    elif locked_u.get("pro_id"):
+        sq = f"pro_id {locked_u['pro_id']}"
     entities = dict((ai_route or {}).get("_product_entities") or {})
-    entities = _enrich_brain_entities_structural(
-        entities, original_msg, msg_en, brain_route=ai_route
-    )
-    if entities and ai_route is not None:
-        ai_route = dict(ai_route)
-        ai_route["_product_entities"] = entities
 
     try:
         from services.product_catalog_resolver import entities_to_understanding
 
         eu = entities_to_understanding(
-            entities, search_query=sq, original_msg=original_msg
+            entities, search_query="", original_msg=original_msg
         )
         if eu:
-            locked_u = eu
+            for k, v in eu.items():
+                if v not in (None, "", []) and k not in locked_u:
+                    locked_u[k] = v
     except ImportError:
         pass
 
-    if sq and not brain_search_query_is_noisy(sq) and not locked_u.get("search_terms"):
-        locked_u["search_terms"] = sq
+    try:
+        from services.product_filter_pipeline import merge_session_product_understanding
+
+        locked_u = merge_session_product_understanding(
+            locked_u,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            ctx=ctx,
+            ai_route=ai_route,
+        )
+    except ImportError:
+        pass
     if locked_u:
         locked_u["_ai_first"] = True
 
     pre_fallback_u = dict(locked_u)
 
-    gap = _structural_gap_ai_from_message(
+    allow_nlu = True
+    if locked_u.get("sku") or locked_u.get("pro_id"):
+        allow_nlu = False
+    elif isinstance(ai_route, dict) and ai_route.get("_needs_product_nlu_llm") is False:
+        allow_nlu = False
+
+    os_spec, pq_llm = build_catalog_spec_for_product_turn(
         original_msg,
         msg_en,
-        locked_understanding=locked_u,
-        brain_search_query=sq,
-    )
-    os_spec, pq_llm = _build_catalog_spec_from_locked_entities(
-        original_msg,
-        msg_en,
-        gap=gap,
+        conversation_context=conversation_context,
+        reply_lang=reply_lang,
         ctx=ctx,
         ai_route=ai_route,
-        locked_understanding=gap,
+        locked_understanding=locked_u or None,
         brain_search_query=sq,
+        allow_product_nlu_llm=allow_nlu,
     )
-    os_spec["_ai_single_pass"] = True
+    if pq_llm and pq_llm.get("_product_nlu_from_ai") and isinstance(ai_route, dict):
+        ai_route = dict(ai_route)
+        ai_route["_product_nlu_from_ai"] = True
     log_reasoning(
-        "Catalog brain-locked entity spec — skip duplicate product NLU LLM."
-    )
-    log_reasoning(
-        f"Catalog locked path: title={os_spec.get('title_query')!r} "
-        f"brand={os_spec.get('brand')!r} color={os_spec.get('color')!r} "
-        f"price_max={os_spec.get('purchase_price_max')!r} "
-        f"rating_min={os_spec.get('rating_min')!r} pro_id={os_spec.get('pro_id')!r} "
-        f"sku={os_spec.get('sku')!r} category_id={os_spec.get('category_id')!r}"
+        "Catalog locked path — AI product NLU → OpenSearch "
+        f"(title={os_spec.get('title_query')!r} brand={os_spec.get('brand')!r} "
+        f"color={os_spec.get('color')!r} sku={os_spec.get('sku')!r})."
     )
 
     ctx = ctx if ctx is not None else {}
@@ -1437,7 +1432,11 @@ def _run_locked_catalog_search_fast(
     if not products and raw_count == 0:
         req_brand = (os_spec.get("_requested_brand") or os_spec.get("brand") or "").strip()
         mandatory_device = list(os_spec.get("mandatory_match_tokens") or [])
-        if req_brand and not mandatory_device:
+        if (
+            req_brand
+            and not mandatory_device
+            and not os_spec.get("_ai_single_pass")
+        ):
             retry_spec = dict(os_spec)
             retry_spec.pop("brand", None)
             retry_spec.pop("brand_aliases", None)
@@ -1469,20 +1468,16 @@ def _run_locked_catalog_search_fast(
     if not products and locked_u.get("device_browse") and not locked_u.get("specific_accessory"):
         fb_u = _build_related_accessory_understanding(locked_u, entities)
         if fb_u:
-            fb_gap = _structural_gap_ai_from_message(
+            fb_spec, _fb_pq = build_catalog_spec_for_product_turn(
                 original_msg,
                 msg_en,
-                locked_understanding=fb_u,
-                brain_search_query=fb_u.get("search_terms") or "",
-            )
-            fb_spec, _fb_pq = _build_catalog_spec_from_locked_entities(
-                original_msg,
-                msg_en,
-                gap=fb_gap,
+                conversation_context=conversation_context,
+                reply_lang=reply_lang,
                 ctx=ctx,
                 ai_route=ai_route,
-                locked_understanding=fb_gap,
+                locked_understanding=fb_u,
                 brain_search_query=fb_u.get("search_terms") or "",
+                allow_product_nlu_llm=False,
             )
             fb_spec["_related_fallback"] = True
             fb_spec["_ai_single_pass"] = True
@@ -1761,7 +1756,11 @@ def _run_catalog_search(
     if catalog_single_pass and ai_understanding:
         from services.product_filter_pipeline import build_catalog_spec_for_product_turn
 
-        sq_fast = (search_query or (ai_route or {}).get("search_query") or "").strip()
+        nlu_ready = bool(
+            (ai_understanding or {}).get("_product_nlu_from_ai")
+            or (ai_understanding or {}).get("pro_id")
+            or (ai_understanding or {}).get("sku")
+        )
         os_spec, pq_llm = build_catalog_spec_for_product_turn(
             original_msg,
             msg_en,
@@ -1770,8 +1769,8 @@ def _run_catalog_search(
             ctx=ctx,
             ai_route=ai_route,
             locked_understanding=ai_understanding,
-            brain_search_query=sq_fast,
-            allow_product_nlu_llm=False,
+            brain_search_query=(search_query or "").strip(),
+            allow_product_nlu_llm=not nlu_ready,
         )
         title_match = (os_spec.get("title_query") or "").strip()
         log_reasoning(f"Catalog ultra-fast path: OpenSearch sq={title_match!r}")
@@ -2044,6 +2043,64 @@ def run_product_search_ai_flow(
     comb = f"{original_msg} {msg_en}"
     from utils.helpers import extract_product_id
 
+    # Fast pro_id / SKU — skip brain-locked stack when message has explicit catalog id.
+    try:
+        from services.catalog_spec_semantics import user_mentions_sku_this_turn
+        from services.opensearch_products import _extract_sku_from_text
+        from services.product_filter_pipeline import apply_understanding_sku_pro_id_fixes
+
+        fast_u = apply_understanding_sku_pro_id_fixes({}, original_msg, msg_en) or {}
+        sku_fast = (fast_u.get("sku") or "").strip()
+        bare_msg = (original_msg or "").strip()
+        if (
+            not sku_fast
+            and bare_msg
+            and " " not in bare_msg
+            and user_mentions_sku_this_turn(bare_msg)
+        ):
+            sku_fast = bare_msg
+            fast_u["sku"] = sku_fast
+        if sku_fast and (
+            user_mentions_sku_this_turn(original_msg)
+            or _extract_sku_from_text(original_msg)
+            or (bare_msg == sku_fast and " " not in bare_msg)
+        ):
+            fast_u["_ai_first"] = True
+            fast_u.setdefault("action", "search_products")
+            fast_u["is_shopping"] = True
+            return _run_locked_catalog_search_fast(
+                original_msg,
+                msg_en,
+                user_id,
+                ctx=ctx,
+                reply_lang=reply_lang,
+                search_query=sku_fast,
+                conversation_context=conversation_context,
+                ai_understanding=fast_u,
+                ai_route=ai_route,
+            )
+        pid_fast = fast_u.get("pro_id") or extract_product_id(comb)
+        if pid_fast:
+            if ctx is not None:
+                ctx.setdefault("data", {})["lookup_pro_id"] = int(pid_fast)
+            return _run_catalog_search(
+                original_msg,
+                msg_en,
+                user_id,
+                ctx=ctx,
+                reply_lang=reply_lang,
+                search_query=f"pro_id {pid_fast}",
+                conversation_context=conversation_context,
+                ai_understanding={
+                    "pro_id": int(pid_fast),
+                    "action": "search_products",
+                    "is_shopping": True,
+                },
+                ai_route=ai_route,
+            )
+    except ImportError:
+        pass
+
     # Brain/direct locked catalog — skip gates, classifiers, and duplicate order-intent LLMs.
     try:
         from services.product_catalog_resolver import (
@@ -2053,53 +2110,32 @@ def run_product_search_ai_flow(
 
         if product_catalog_route_is_locked(ai_route):
             work_route = dict(ai_route) if isinstance(ai_route, dict) else {}
-            try:
-                from services.ai_route_semantics import _brain_product_entities_from_route
-                from services.product_filter_pipeline import _enrich_brain_entities_structural
-
-                ent = _brain_product_entities_from_route(
-                    work_route, original_msg=original_msg, msg_en=msg_en
-                )
-                ent = _enrich_brain_entities_structural(
-                    ent, original_msg, msg_en, brain_route=work_route
-                )
-                if ent:
-                    work_route["_product_entities"] = ent
-                    pn = (ent.get("product_name") or "").strip()
-                    if pn and pn.lower() not in ("products", "product"):
-                        work_route["search_query"] = pn
-                ai_route = work_route
-            except ImportError:
-                pass
-
-            route_sq_brain = (
-                (search_query or "").strip()
-                or ((ai_route or {}).get("search_query") or "").strip()
-            )
             locked_u = understanding_from_locked_product_route(
-                ai_route,
-                route_sq_brain,
+                work_route,
+                "",
                 original_msg=original_msg,
                 msg_en=msg_en,
             )
-            if not locked_u and route_sq_brain and route_sq_brain.lower() not in (
-                "products",
-                "product",
-            ):
-                locked_u = {
-                    "action": "search_products",
-                    "is_shopping": True,
-                    "search_terms": route_sq_brain,
-                    "_ai_first": True,
-                }
             if not locked_u:
                 locked_u = {
                     "action": "search_products",
                     "is_shopping": True,
                     "_ai_first": True,
                 }
+            try:
+                from services.product_filter_pipeline import merge_session_product_understanding
+
+                locked_u = merge_session_product_understanding(
+                    locked_u,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    ctx=ctx,
+                    ai_route=ai_route,
+                )
+            except ImportError:
+                pass
             log_reasoning(
-                "Product brain-locked fast path — skip gates/classifiers → OpenSearch."
+                "Product brain-locked fast path — AI NLU → OpenSearch."
             )
             if isinstance(ai_route, dict):
                 ai_route.setdefault("_ai_single_pass", True)
@@ -2109,7 +2145,7 @@ def run_product_search_ai_flow(
                 user_id,
                 ctx=ctx,
                 reply_lang=reply_lang,
-                search_query=route_sq_brain,
+                search_query="",
                 conversation_context=conversation_context,
                 ai_understanding=locked_u,
                 ai_route=ai_route,

@@ -24,6 +24,7 @@ _ensure_hf_hub_token()
 _model = None
 _model_init_lock = threading.Lock()
 _encode_lock = threading.RLock()
+_ENCODE_WAIT_SEC = float(os.getenv("EMBED_ENCODE_WAIT_SEC", "4") or "4")
 
 
 def embeddings_disabled() -> bool:
@@ -58,8 +59,17 @@ def encode_texts(texts):
     if m is None:
         return None
     try:
-        with _encode_lock:
+        acquired = _encode_lock.acquire(timeout=max(0.5, _ENCODE_WAIT_SEC))
+        if not acquired:
+            print(
+                f"[embed] encode lock busy >{_ENCODE_WAIT_SEC:.0f}s — skip vector (text KB fallback)",
+                flush=True,
+            )
+            return None
+        try:
             return m.encode(texts)
+        finally:
+            _encode_lock.release()
     except Exception as exc:
         print(f"[embed] encode failed: {exc}", flush=True)
         return None

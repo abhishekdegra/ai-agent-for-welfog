@@ -241,6 +241,12 @@ html, body {
     gap: 8px;
 }
 
+.hist-item-body {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+}
+
 .hist-delete {
     background: none;
     border: none;
