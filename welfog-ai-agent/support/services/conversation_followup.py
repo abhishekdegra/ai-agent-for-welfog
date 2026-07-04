@@ -68,6 +68,15 @@ def is_deals_request_message(original_msg: str, msg_en: str = "") -> bool:
     if not combined:
         return False
     if not re.search(r"\bdeals?\b|\boffers?\b|\bdiscount", combined):
+        if (
+            re.search(r"\bwelfog\b", combined)
+            and re.search(r"\b(?:today|todays|today's|aaj)\b", combined)
+            and re.search(
+                r"\b(?:amazing|special|khaas|khas|highlight|best|top|offer)\b",
+                combined,
+            )
+        ):
+            return True
         return False
     if any(m in combined for m in _DEALS_SHOW_MARKERS):
         return True

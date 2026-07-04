@@ -652,6 +652,10 @@ def _turn_might_need_account_list_classifier(route: dict, comb: str) -> bool:
     """True when message likely asks for MY saved items vs MY purchases (any wording)."""
     if not (comb or "").strip():
         return False
+    intent = (route.get("intent") or "").strip().lower()
+    scope = (route.get("conversation_scope") or "").strip().lower()
+    if intent in ("out_of_domain", "product") or scope == "out_of_domain":
+        return False
     try:
         from utils.helpers import (
             _text_wants_order_history_list_in_chat,
@@ -765,6 +769,8 @@ Examples by meaning (not exhaustive):
 - "where do I see stuff I liked in the app" → wishlist_howto
 - "everything I ever bought on Welfog" → purchase_history_in_chat
 - "how to open my old orders page" → purchase_history_howto
+- User wants THEIR past orders shown in this chat (any language/script: Tamil, Telugu, Bengali, Hinglish, English, typos) → purchase_history_in_chat
+- User asks for order data/list/history to display here → purchase_history_in_chat (NOT product catalog search)
 - Amazon/Flipkart account → none (other company — not Welfog)
 
 {language_reply_instruction(rl)}"""
@@ -781,8 +787,8 @@ Examples by meaning (not exhaustive):
                 {"role": "user", "content": user_payload},
             ],
             max_tokens=160,
-            timeout_sec=10,
-            max_attempts=2,
+            timeout_sec=5,
+            max_attempts=1,
             temperature=0.2,
         )
     except Exception as exc:

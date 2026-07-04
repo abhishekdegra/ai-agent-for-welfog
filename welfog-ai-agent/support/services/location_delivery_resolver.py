@@ -50,6 +50,7 @@ _MAJOR_CITY_PINS: dict[str, str] = {
     "trivandrum": "695001", "udaipur": "313001", "vadodara": "390001", "varanasi": "221001",
     "vijayawada": "520001", "visakhapatnam": "530001", "vizag": "530001",
     "bharatpur": "321001", "sikar": "332001", "alwar": "301001",
+    "nasirabad": "305601",
 }
 
 _NOMINATIM_HEADERS = {"User-Agent": "WelfogSupportBot/1.0 (delivery-check; pan-india)"}
@@ -62,7 +63,7 @@ _DELIVERY_PLACE_STOPWORDS_RE = re.compile(
     r"bhai|welfog|ho|hai|hogi|hoga|h|na|nahi|ni|"
     r"me|mein|par|pe|per|in|at|to|for|"
     r"yaha|yahan|waha|wahan|idhar|udhar|"
-    r"please|pls|bhejo|dena|dede|the|a|an|is|will|can|"
+    r"please|pls|bhejo|dena|dede|apni|the|a|an|is|will|can|"
     r"order|place|karna|karenge|kru|karu|chahta|chahti"
     r")\b",
     re.I,
@@ -150,6 +151,17 @@ def _fuzzy_major_city_typo(place: str, *, max_edits: int = 2) -> str:
     if best_city and best_dist <= max_edits:
         log_reasoning(f"City typo fuzzy: {place!r} → {best_city!r} (edit distance {best_dist})")
         return best_city
+    return ""
+
+
+def _major_city_named_in_text(text: str) -> str:
+    """Known metro name embedded in delivery text (e.g. 'bhia noida apni' → noida)."""
+    low = _norm_city_key(text)
+    if not low:
+        return ""
+    for city in sorted(_MAJOR_CITY_PINS, key=len, reverse=True):
+        if re.search(rf"\b{re.escape(city)}\b", low):
+            return city
     return ""
 
 
@@ -309,7 +321,7 @@ def _nominatim_reverse_pincode(lat: float, lng: float) -> str:
                 "zoom": 18,
             },
             headers=_NOMINATIM_HEADERS,
-            timeout=10,
+            timeout=4,
         )
         if res.status_code == 200:
             addr = (res.json() or {}).get("address") or {}
@@ -333,7 +345,7 @@ def _nominatim_search(place: str, query: str) -> list[dict]:
                 "countrycodes": "in",
             },
             headers=_NOMINATIM_HEADERS,
-            timeout=12,
+            timeout=4,
         )
         if res.status_code == 200:
             return res.json() or []
@@ -352,6 +364,9 @@ def _nominatim_geocode_india(
     place = (city or "").strip()
     if not place:
         return {}
+    if _place_name_looks_gibberish(place):
+        log_reasoning(f"City geocode skipped — place {place!r} looks unresolvable (ask PIN).")
+        return {}
 
     queries: list[str] = []
     if state_hint:
@@ -361,7 +376,7 @@ def _nominatim_geocode_india(
         queries.append(place)
 
     seen_q: set[str] = set()
-    for query in queries:
+    for query in queries[:3]:
         qn = query.strip().lower()
         if not qn or qn in seen_q:
             continue
@@ -407,7 +422,7 @@ def _geocode_google_maps(
         res = requests.get(
             "https://maps.googleapis.com/maps/api/geocode/json",
             params={"address": query, "key": api_key, "region": "in"},
-            timeout=12,
+            timeout=4,
         )
         if res.status_code != 200:
             return {}
@@ -457,6 +472,9 @@ def geocode_city_to_pincode(
     """
     key = _norm_city_key(city)
     if not key or len(key) < 2:
+        return {}
+    if _place_name_looks_gibberish(city):
+        log_reasoning(f"Geocode skip — {city!r} not a resolvable place (AI → ask PIN).")
         return {}
     cache_key = f"{key}|{(state_hint or '').lower()}|{country.lower()}"
     now = time.time()
@@ -885,24 +903,53 @@ def resolve_delivery_turn(
         if cached.is_serviceability or cached.is_area_followup:
             return cached
 
-    try:
-        from utils.helpers import turn_is_obvious_product_shopping_turn
+    # AI-first when LLM available — never short-circuit on product heuristics before classifier.
+    if allow_llm:
+        try:
+            from services.product_catalog_resolver import product_turn_should_beat_delivery
 
-        if turn_is_obvious_product_shopping_turn(
-            original_msg, msg_en, conversation_context
+            if product_turn_should_beat_delivery(
+                original_msg,
+                msg_en,
+                conversation_context,
+                allow_llm=True,
+            ):
+                empty = DeliveryTurnUnderstanding(source="product_shopping")
+                _delivery_turn_cache_put(cache_key, empty)
+                return empty
+        except ImportError:
+            pass
+        route_u_early = _understanding_from_ai_route(ai_route)
+        if route_u_early and (
+            route_u_early.is_serviceability
+            or route_u_early.is_area_followup
+            or route_u_early.location_kind in ("pincode", "city", "ask_pin")
         ):
-            try:
-                from utils.helpers import _conversation_in_pincode_delivery_flow
+            _delivery_turn_cache_put(cache_key, route_u_early)
+            return route_u_early
+        ai_first = ai_understand_delivery_turn(
+            original_msg,
+            msg_en,
+            conversation_context,
+            ai_route=ai_route,
+            reply_lang=reply_lang,
+        )
+        if ai_first and ai_first.source != "deferred_brain":
+            _delivery_turn_cache_put(cache_key, ai_first)
+            return ai_first
 
-                if not _conversation_in_pincode_delivery_flow(conversation_context):
-                    # Product availability on Welfog — not PIN/city serviceability.
-                    empty = DeliveryTurnUnderstanding(source="product_shopping")
-                    _delivery_turn_cache_put(cache_key, empty)
-                    return empty
-            except ImportError:
-                pass
-    except ImportError:
-        pass
+    if not allow_llm:
+        try:
+            from utils.helpers import turn_is_obvious_product_shopping_turn
+
+            if turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conversation_context
+            ):
+                empty = DeliveryTurnUnderstanding(source="product_shopping")
+                _delivery_turn_cache_put(cache_key, empty)
+                return empty
+        except ImportError:
+            pass
 
     if cached is not None and cached.source != "pending":
         return cached
@@ -1035,22 +1082,7 @@ def _resolved_location_from_understanding(
         )
 
     if kind == "ask_pin" and (service_ok or followup_ok):
-        place = (understood.city_name or "").strip()
-        if place:
-            geo = geocode_city_to_pincode(place, state_hint=understood.state_hint)
-            if geo.get("pincode"):
-                return ResolvedDeliveryLocation(
-                    kind="city_geocoded",
-                    pincode=str(geo["pincode"]),
-                    city_label=str(geo.get("city_label") or place),
-                    state_hint=str(geo.get("state_hint") or understood.state_hint),
-                    source=str(geo.get("source") or "geocode"),
-                    confidence=str(geo.get("confidence") or "medium"),
-                    geocode_display=str(geo.get("display_name") or ""),
-                    lat=geo.get("lat"),
-                    lng=geo.get("lng"),
-                    reasoning=understood.user_meaning[:200],
-                )
+        # AI explicitly chose ask_pin — reply immediately; no geocode retries.
         return ResolvedDeliveryLocation(
             kind="ask_pin",
             city_label=understood.city_name,
@@ -1074,8 +1106,13 @@ def _try_geocode_place_from_message(
         return empty
 
     candidates: list[tuple[str, str]] = []
+    named_city = _major_city_named_in_text(comb)
+    if named_city:
+        candidates.append((named_city, state_hint or ""))
     if (city_hint or "").strip():
-        candidates.append((city_hint.strip(), state_hint or ""))
+        hint = city_hint.strip()
+        if not any(_norm_city_key(c[0]) == _norm_city_key(hint) for c in candidates):
+            candidates.append((hint, state_hint or ""))
     extracted = extract_place_query_from_delivery_message(comb)
     if extracted:
         norm_ext = _norm_city_key(extracted)
@@ -1179,6 +1216,12 @@ def resolve_delivery_check_target(
     Structural failsafe only when LLM unavailable.
     """
     empty = ResolvedDeliveryLocation(kind="none")
+    comb = _combined(original_msg, msg_en)
+
+    if isinstance(ai_route, dict) and ai_route.get("_pincode_delivery_locked") and not allow_llm:
+        geo_early = _try_geocode_place_from_message(comb)
+        if geo_early.kind != "none":
+            return geo_early
 
     bare = _bare_pin_submission_in_pincode_thread(
         original_msg, conversation_context, ai_route=ai_route
@@ -1222,8 +1265,13 @@ def resolve_delivery_check_target(
     )
     loc = _resolved_location_from_understanding(understood, reply_lang=reply_lang)
     if loc.kind == "ask_pin":
+        if (
+            understood.location_kind == "ask_pin"
+            and (understood.is_serviceability or understood.is_area_followup)
+        ):
+            return loc
         geo_loc = _try_geocode_place_from_message(
-            _combined(original_msg, msg_en),
+            comb,
             city_hint=understood.city_name or loc.city_label,
             state_hint=understood.state_hint,
         )
@@ -1233,6 +1281,22 @@ def resolve_delivery_check_target(
     if loc.kind != "none":
         return loc
 
+    if understood.is_serviceability or understood.is_area_followup:
+        place = (understood.city_name or "").strip()
+        if (
+            understood.location_kind == "ask_pin"
+            or _delivery_question_incomplete(comb, understood)
+            or (place and _place_name_looks_gibberish(place))
+        ):
+            log_reasoning("Delivery AI → ask PIN (unresolvable / incomplete place).")
+            return ResolvedDeliveryLocation(
+                kind="ask_pin",
+                city_label=understood.city_name,
+                source="ai_serviceability_no_geocode",
+                confidence="medium",
+                reasoning=understood.user_meaning[:200] or "Delivery check — need PIN.",
+            )
+
     failsafe = _understanding_llm_down_failsafe(
         original_msg, msg_en, conversation_context, ai_route=ai_route
     )
@@ -1241,14 +1305,24 @@ def resolve_delivery_check_target(
         if loc_fs.kind != "none":
             return loc_fs
 
-    comb = _combined(original_msg, msg_en)
-    geo_loc = _try_geocode_place_from_message(
-        comb,
-        city_hint=understood.city_name,
-        state_hint=understood.state_hint,
+    skip_late_geocode = (
+        understood.is_serviceability or understood.is_area_followup
+    ) and (
+        understood.location_kind == "ask_pin"
+        or _delivery_question_incomplete(comb, understood)
+        or (
+            (understood.city_name or "").strip()
+            and _place_name_looks_gibberish((understood.city_name or "").strip())
+        )
     )
-    if geo_loc.kind != "none":
-        return geo_loc
+    if not skip_late_geocode:
+        geo_loc = _try_geocode_place_from_message(
+            comb,
+            city_hint=understood.city_name,
+            state_hint=understood.state_hint,
+        )
+        if geo_loc.kind != "none":
+            return geo_loc
 
     if _delivery_question_incomplete(comb, understood) and (
         understood.is_serviceability or understood.is_area_followup
@@ -1276,6 +1350,15 @@ def turn_continues_pincode_area_check(
     raw = (text or "").strip()
     if not raw:
         return False
+    try:
+        from services.product_catalog_resolver import product_turn_should_beat_delivery
+
+        if product_turn_should_beat_delivery(
+            raw, "", conversation_context, allow_llm=True
+        ):
+            return False
+    except ImportError:
+        pass
     try:
         from utils.helpers import (
             _conversation_in_pincode_delivery_flow,
@@ -1345,8 +1428,7 @@ def _short_area_followup_in_pincode_thread(text: str) -> bool:
         return False
     if _PIN_RE.search(raw):
         return True
-    place = extract_place_query_from_delivery_message(raw)
-    if place and len(place) >= 3 and not _place_name_looks_gibberish(place):
+    if _major_city_named_in_text(raw):
         return True
     tl = f" {raw.lower()} "
     if re.search(r"\b(?:aur|and|also|waha|vaha|wahan|vahan)\b", tl):
@@ -1462,6 +1544,21 @@ def turn_requests_delivery_serviceability(
             return False
     except Exception:
         pass
+    if isinstance(ai_route, dict):
+        try:
+            from services.ai_route_semantics import brain_route_prefers_kb_answer
+
+            if brain_route_prefers_kb_answer(ai_route):
+                if not _bare_pin_submission_in_pincode_thread(
+                    original_msg, conversation_context, ai_route=ai_route
+                ):
+                    return False
+        except ImportError:
+            ch = (ai_route.get("data_channel") or "").strip().lower()
+            if ch == "kb" and not _bare_pin_submission_in_pincode_thread(
+                original_msg, conversation_context, ai_route=ai_route
+            ):
+                return False
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
@@ -1514,13 +1611,19 @@ def turn_requests_delivery_serviceability(
         if turn_is_obvious_product_shopping_turn(
             original_msg, msg_en, conversation_context
         ):
-            try:
-                from utils.helpers import _conversation_in_pincode_delivery_flow
+            return False
+    except ImportError:
+        pass
+    try:
+        from services.product_catalog_resolver import product_turn_should_beat_delivery
 
-                if not _conversation_in_pincode_delivery_flow(conversation_context):
-                    return False
-            except ImportError:
-                return False
+        if product_turn_should_beat_delivery(
+            original_msg,
+            msg_en,
+            conversation_context,
+            allow_llm=allow_llm,
+        ):
+            return False
     except ImportError:
         pass
 
@@ -1534,28 +1637,6 @@ def turn_requests_delivery_serviceability(
             return True
     except ImportError:
         pass
-
-    if allow_llm:
-        try:
-            from utils.helpers import (
-                _conversation_in_pincode_delivery_flow,
-                turn_is_obvious_product_shopping_turn,
-            )
-
-            if turn_is_obvious_product_shopping_turn(
-                original_msg, msg_en, conversation_context
-            ) and not _conversation_in_pincode_delivery_flow(conversation_context):
-                return False
-        except ImportError:
-            pass
-        loc = resolve_delivery_check_target(
-            original_msg,
-            msg_en,
-            conversation_context,
-            ai_route=ai_route,
-            allow_llm=True,
-        )
-        return loc.kind in ("pincode", "city_geocoded", "ask_pin")
 
     failsafe = _understanding_llm_down_failsafe(
         original_msg, msg_en, conversation_context, ai_route=ai_route

@@ -689,31 +689,17 @@ def try_scope_ai_early_reply(
     except ImportError:
         pass
 
-    try:
-        from services.conversation_scope import (
-            SCOPE_CHITCHAT,
-            SCOPE_OUT,
-            SCOPE_WELFOG,
-            ai_classify_scope_and_reply,
-            build_scope_reply,
-            _has_definite_welfog_shopping_signal,
-        )
+    if not preflight:
+        try:
+            from services.chat_flow_telemetry import get_cached_brain_route
 
-        if not preflight and _has_definite_welfog_shopping_signal(comb):
-            return None
-    except ImportError:
-        return None
-
-    try:
-        from services.chat_flow_telemetry import get_cached_brain_route
-
-        brain = get_cached_brain_route()
-        if isinstance(brain, dict):
-            ch = (brain.get("data_channel") or "").strip().lower()
-            if ch in ("live_api", "catalog", "kb"):
-                return None
-    except ImportError:
-        pass
+            brain = get_cached_brain_route()
+            if isinstance(brain, dict):
+                ch = (brain.get("data_channel") or "").strip().lower()
+                if ch in ("live_api", "catalog", "kb"):
+                    return None
+        except ImportError:
+            pass
 
     if not preflight:
         try:

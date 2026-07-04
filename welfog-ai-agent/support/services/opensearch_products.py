@@ -2602,26 +2602,16 @@ def _brand_name_should_clauses(brand_or_aliases) -> list[dict]:
     seen: set[str] = set()
     for raw in tokens:
         low = raw.lower()
-        if not low or low in seen or low in ("no brand", "brand"):
+        if not low or low in seen or low in ("no brand", "brand", "generic", "unbranded"):
             continue
         seen.add(low)
         should.append(
             {
                 "multi_match": {
                     "query": low,
-                    "fields": ["brand^5", "name^4", "sku^2", "category_name"],
+                    "fields": ["name^5", "sku^2", "category_name", "brand"],
                     "type": "best_fields",
                     "fuzziness": "AUTO",
-                }
-            }
-        )
-        should.append(
-            {
-                "term": {
-                    "brand": {
-                        "value": raw,
-                        "case_insensitive": True,
-                    }
                 }
             }
         )
@@ -2965,7 +2955,7 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
     if not brand_tokens and spec.get("brand"):
         brand_tokens = [spec["brand"]]
     name_should = _brand_name_should_clauses(brand_tokens)
-    if name_should:
+    if name_should and not spec.get("brand_name_match_only"):
         filters.append({"bool": {"should": name_should, "minimum_should_match": 1}})
     if spec.get("unit_price_min") is not None:
         filters.append({"range": {"unit_price": {"gte": spec["unit_price_min"]}}})

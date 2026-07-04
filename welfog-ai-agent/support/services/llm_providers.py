@@ -1,12 +1,17 @@
 """
 Multi-provider LLM chain (OpenAI-compatible chat completions).
 
-Default order (LLM_PROVIDER_ORDER): grok → openai → gemini → deepseek
+Default order (LLM_PROVIDER_ORDER): groq → openai → gemini → deepseek
 
-- grok: xAI (GROK_API_KEY / XAI_API_KEY) when set; else Groq Cloud (GROQ_API_KEY).
-- openai: OPENAI_API_KEY, model gpt-4.1-mini
-- gemini: GEMINI_API_KEY via Google OpenAI-compatible endpoint
+On failure (timeout, rate limit, bad JSON), llm_json_with_provider_fallback tries the
+next configured provider automatically until one succeeds or the chain is exhausted.
+
+- groq: GROQ_API_KEY (Groq Cloud)
+- openai: OPENAI_API_KEY
+- gemini: GEMINI_API_KEY / GOOGLE_API_KEY
 - deepseek: DEEPSEEK_API_KEY
+
+Legacy slot "grok" still supported (xAI Grok, or Groq Cloud if no xAI key).
 """
 from __future__ import annotations
 
@@ -28,7 +33,7 @@ _DEFAULT_MODELS = {
     "deepseek": "deepseek-chat",
 }
 
-_DEFAULT_ORDER = ("grok", "openai", "gemini", "deepseek")
+_DEFAULT_ORDER = ("groq", "openai", "gemini", "deepseek")
 
 
 def _env(name: str) -> str:
@@ -172,23 +177,34 @@ def build_pinned_provider_chain(model_key: str) -> list[dict[str, Any]]:
 def get_configured_provider_chain() -> list[dict[str, Any]]:
     """
     Providers from LLM_PROVIDER_ORDER that have API keys in .env.
-    PRIMARY_AI_PROVIDER (e.g. openai) is tried first when set.
+    Order is preserved exactly — groq first by default, then openai, gemini, deepseek.
     """
-    chain = build_auto_provider_chain()
-    primary = _env("PRIMARY_AI_PROVIDER").lower()
-    if not primary or not chain:
-        return chain
-    preferred: list[dict[str, Any]] = []
-    rest: list[dict[str, Any]] = []
-    for spec in chain:
-        name = (spec.get("name") or "").strip().lower()
-        if name == primary or (primary == "grok" and name == "groq"):
-            preferred.append(spec)
-        else:
-            rest.append(spec)
-    if preferred:
-        return preferred + [s for s in rest if s not in preferred]
-    return chain
+    return build_auto_provider_chain()
+
+
+def get_standard_fallback_chain(*, max_providers: int | None = None) -> list[dict[str, Any]]:
+    """
+    Full auto-failover chain for JSON classifiers and routing.
+    Uses admin Auto mode (env order) or a single pinned provider when admin pins a model.
+    """
+    chain = get_llm_provider_chain()
+    if not chain:
+        return []
+    if max_providers is None:
+        cap = max(1, min(4, int(os.getenv("LLM_MAX_PROVIDERS", "4") or "4")))
+    else:
+        cap = max(1, min(4, int(max_providers)))
+    if len(chain) <= 1:
+        return list(chain)
+    return chain[:cap]
+
+
+def provider_chain_label(chain: list[dict[str, Any]] | None = None) -> str:
+    """Human-readable chain for logs, e.g. groq→openai→gemini→deepseek."""
+    specs = chain if chain is not None else get_standard_fallback_chain()
+    if not specs:
+        return "-"
+    return "→".join((p.get("name") or "?") for p in specs)
 
 
 def get_llm_provider_chain() -> list[dict[str, Any]]:
@@ -365,6 +381,10 @@ def llm_json_with_provider_fallback(
             "GEMINI_API_KEY, and/or DEEPSEEK_API_KEY."
         )
         return None
+    if len(providers) > 1:
+        log_reasoning(
+            f"LLM fallback chain: {' → '.join(p.get('name') or '?' for p in providers)}"
+        )
     rate_seen = False
     for idx, p in enumerate(providers):
         headers = {
@@ -432,7 +452,7 @@ def llm_json_chat_completion(
 ) -> Optional[dict]:
     """Chat completion with JSON response across the env-configured provider chain."""
     return llm_json_with_provider_fallback(
-        get_configured_provider_chain() or get_llm_provider_chain(),
+        get_standard_fallback_chain(),
         messages,
         max_tokens=max_tokens,
         timeout_sec=timeout_sec,

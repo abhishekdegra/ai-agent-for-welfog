@@ -442,6 +442,81 @@ JSON only."""
     return finalize_customer_reply(_wrap_ack_html(raw), original_msg or msg_en, rl)
 
 
+def ai_harm_sensitive_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+) -> str:
+    """Empathetic safety reply — AI first, harm template if LLM unavailable."""
+    if (os.getenv("CHITCHAT_AI_REPLY", "1") or "1").strip().lower() in (
+        "0",
+        "false",
+        "no",
+        "off",
+    ):
+        return ""
+
+    from services.ai_service import (
+        _compact_conversation_context,
+        _llm_json_with_provider_fallback,
+        _llm_classifier_provider_chain,
+        _trim_text_mid,
+    )
+    from services.translation_service import (
+        finalize_customer_reply,
+        language_reply_instruction,
+        resolve_customer_reply_lang,
+    )
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+
+    rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
+    compact_ctx = _compact_conversation_context(conversation_context or "", 1800)
+    user_line = _trim_text_mid(comb, 240)
+
+    system_prompt = f"""You are Welfog's shopping support assistant. The user may be in emotional distress or mentioning self-harm.
+
+Return ONLY JSON: {{"reasoning":"1 line","response":"reply"}}
+
+RULES:
+- "response" in the SAME language/script as the user's LATEST message (Hinglish = Roman Hindi+English).
+- 2-4 short sentences: empathetic, caring, encourage talking to someone they trust NOW.
+- Mention India helplines: iCall 9152987821, Vandrevala 1860-2662-345, emergency 112.
+- Do NOT mention grievance officer, legal, seller registration, or product search.
+- Light note you are Welfog shopping assistant if they need order help later.
+{language_reply_instruction(rl)}
+JSON only."""
+
+    user_payload = ""
+    if compact_ctx:
+        user_payload += f"RECENT CONVERSATION:\n{compact_ctx}\n\n"
+    user_payload += f"LATEST USER MESSAGE:\n{user_line}"
+
+    providers = _llm_classifier_provider_chain()
+    if not providers:
+        return ""
+
+    data = _llm_json_with_provider_fallback(
+        providers,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ],
+        max_tokens=220,
+        timeout_sec=10,
+        max_attempts=1,
+        temperature=0.25,
+    )
+    raw = (data.get("response") or "").strip() if data else ""
+    if raw:
+        log_reasoning(f"Harm AI reply: {(data.get('reasoning') or '')[:100]}")
+        return finalize_customer_reply(_wrap_ack_html(raw), original_msg or msg_en, rl)
+    return ""
+
+
 def ai_natural_scope_reply(
     scope: str,
     original_msg: str,
@@ -452,6 +527,10 @@ def ai_natural_scope_reply(
 ) -> str:
     """AI-generated chitchat or OOD reply — never static KB templates."""
     scope_l = (scope or "").strip().lower()
+    if scope_l == "harm_sensitive":
+        return ai_harm_sensitive_reply(
+            original_msg, msg_en, conversation_context, reply_lang=reply_lang
+        )
     if scope_l == "out_of_domain":
         return ai_ood_reply(
             original_msg, msg_en, conversation_context, reply_lang=reply_lang

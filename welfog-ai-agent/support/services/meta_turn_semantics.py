@@ -65,9 +65,9 @@ def _turn_blocks_assistant_intro(text: str) -> bool:
     if not (text or "").strip():
         return True
     try:
-        from services.product_browse_semantics import message_is_product_availability_browse
+        from services.product_browse_semantics import blocks_assistant_intro_fast_path
 
-        if message_is_product_availability_browse(text):
+        if blocks_assistant_intro_fast_path(text):
             return True
     except ImportError:
         pass

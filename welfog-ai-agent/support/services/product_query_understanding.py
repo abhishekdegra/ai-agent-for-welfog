@@ -142,10 +142,66 @@ _KE_LIYE_CLAUSE = re.compile(
 )
 
 
-def extract_focused_product_query(original_msg: str, msg_en: str = "") -> str:
+def extract_focused_product_query(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> str:
     """
-    Pull the actual catalog ask from long Hinglish messages with greeting + backstory.
-    e.g. 'iphone cover pasand tha ... realme ke liye cover bta de' -> 'realme cover'.
+    AI-first catalog search terms from any language / long Hinglish message.
+    Falls back to lightweight heuristics only when the product LLM is unavailable.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return ""
+
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        skip_llm = should_skip_micro_classifier_llm()
+    except ImportError:
+        skip_llm = False
+
+    if not skip_llm:
+        try:
+            ai = ai_extract_product_search(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang="",
+            )
+            if ai and ai.get("is_shopping") is True:
+                terms = polish_search_terms(
+                    (ai.get("search_terms") or "").strip(),
+                    original_msg,
+                )
+                if terms and len(terms) >= 2:
+                    # #region agent log
+                    try:
+                        from services.debug_session_log import dbg97
+
+                        dbg97(
+                            "H16",
+                            "product_query_understanding.py:extract_focused_product_query",
+                            "ai_product_terms",
+                            {
+                                "msg_preview": comb[:60],
+                                "terms": terms[:60],
+                            },
+                        )
+                    except ImportError:
+                        pass
+                    # #endregion
+                    return terms
+        except Exception:
+            pass
+
+    return _extract_focused_product_query_heuristic(original_msg, msg_en)
+
+
+def _extract_focused_product_query_heuristic(original_msg: str, msg_en: str = "") -> str:
+    """
+    Offline fallback when product LLM is unavailable — not used for routing intent.
     """
     text = re.sub(r"\s+", " ", f"{original_msg or ''} {msg_en or ''}".lower()).strip()
     if not text:
@@ -192,9 +248,6 @@ def extract_focused_product_query(original_msg: str, msg_en: str = "") -> str:
                 break
 
     if brand and nouns:
-        noun = "mobile cover" if "cover" in nouns or "case" in nouns else nouns[0]
-        if noun in ("cover", "case") and brand not in ("cover", "case"):
-            return clean_product_part_label(f"{brand} {noun}", original_msg)
         return clean_product_part_label(f"{brand} {nouns[0]}", original_msg)
 
     if nouns:
@@ -269,17 +322,43 @@ def resolve_catalog_search_terms_for_message(
     msg_en: str = "",
     *,
     ai_route: dict | None = None,
+    conversation_context: str = "",
+    force_llm: bool = False,
 ) -> str:
     """
-    Semantic catalog search terms for structural / locked product turns.
-    Uses shared filler tables + focused-query parsing — not ad-hoc keyword regex in routes.
-    Works across Hinglish, English, typos, and long roundabout asks.
+    Catalog search terms for locked product routes — AI extract first (any language),
+    heuristics only when LLM is unavailable.
     """
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
         return ""
 
-    focused = extract_focused_product_query(original_msg, msg_en)
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        skip_llm = False if force_llm else should_skip_micro_classifier_llm()
+    except ImportError:
+        skip_llm = False
+
+    if not skip_llm:
+        try:
+            ai = ai_extract_product_search(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang="",
+            )
+            if ai and ai.get("is_shopping") is True:
+                terms = polish_search_terms(
+                    (ai.get("search_terms") or "").strip(),
+                    original_msg,
+                )
+                if terms and len(terms.strip()) >= 2:
+                    return terms.strip()
+        except Exception:
+            pass
+
+    focused = _extract_focused_product_query_heuristic(original_msg, msg_en)
     if focused and len(focused.strip()) >= 2:
         return focused.strip()
 
@@ -305,6 +384,41 @@ def resolve_catalog_search_terms_for_message(
     except ImportError:
         pass
     return ""
+
+
+def shopping_extract_plausible(
+    original_msg: str, msg_en: str, search_terms: str
+) -> bool:
+    """Reject conversational fragments misread as product search by the extract LLM."""
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    sq = (search_terms or "").strip()
+    if not comb or not sq:
+        return False
+    if is_noisy_search_query(sq):
+        return False
+    try:
+        from services.opensearch_products import _extract_product_keywords
+
+        if _extract_product_keywords(sq):
+            return True
+    except ImportError:
+        pass
+    try:
+        from services.turn_intent_gate import (
+            is_non_catalog_meta_turn,
+            message_has_catalog_search_signal,
+        )
+
+        if message_has_catalog_search_signal(comb):
+            return True
+        if is_non_catalog_meta_turn(comb):
+            return False
+    except ImportError:
+        pass
+    sq_words = re.findall(r"[a-z0-9]+", sq.lower())
+    if any(w in sq_words for w in ("instagram", "facebook", "youtube", "twitter", "linkedin", "telegram", "social", "link", "handle")):
+        return False
+    return False
 
 
 def dedupe_search_terms(text: str) -> str:
@@ -461,6 +575,9 @@ RULES:
 - Keep product-specific words: basmati rice, basmati wheat, white shirt, water jug, black shirt.
 - match_mode strict when brand/model in search_terms (iphone cover, redmi cover); universal for generic charger/rice/shirt only.
 - If user only asks about orders/tracking/refund with NO product to buy, is_shopping=false and search_terms="".
+- If user vents about relationships, emotions, or personal life (e.g. gf left, setting chhod ke bhag gyi) with NO product to buy, is_shopping=false and search_terms="".
+- Typos are OK — infer the product (cabel→cable, moblie→mobile) in search_terms.
+- "cabel/cable tumhare pass" / "milega kya" on Welfog = USB/charging cable PRODUCT shopping — NOT internet/WiFi connection.
 - If unsure of product, put best guess in search_terms (2-4 words max).
 - max_price / min_price → customer purchase price (NOT MRP/unit_price). Use for rs/budget/range only.
 - rating_min / rating_max for star filters (e.g. rating > 2 → rating_min=2, under 3 stars → rating_max=3).
@@ -487,7 +604,12 @@ JSON only."""
         timeout_sec=12,
         max_attempts=2,
     )
-    if not out or not out.get("is_shopping", True):
+    if not out:
+        return None
+    if out.get("is_shopping") is not True:
+        log_reasoning(
+            f"Product LLM extract: not shopping — {(out.get('reasoning') or '')[:100]}"
+        )
         return out
 
     terms = polish_search_terms((out.get("search_terms") or "").strip(), original_msg)
@@ -737,8 +859,8 @@ def display_label_for_product_search(
     if label and is_noisy_search_query(label, understanding=llm or {}, entities=spec):
         label = ""
     if (not label or label.lower() in ("products", "product")) and spec.get("brand"):
-        tq = clean_product_part_label(spec.get("title_query") or "cover", original_msg)
-        label = f"{spec['brand']} {tq}".strip()
+        tq = clean_product_part_label(spec.get("title_query") or "", original_msg)
+        label = f"{spec['brand']} {tq}".strip() if tq else str(spec["brand"]).strip()
     if not label:
         return "your search"
     extras = []

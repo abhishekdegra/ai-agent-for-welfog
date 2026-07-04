@@ -104,6 +104,21 @@ def turn_is_pincode_delivery_fast_path(
     except ImportError:
         pass
 
+    try:
+        from utils.helpers import (
+            _text_is_pincode_serviceability_question,
+            message_has_live_pincode_check_intent,
+        )
+
+        if message_has_live_pincode_check_intent(
+            original_msg, conversation_context, msg_en
+        ):
+            return True
+        if _text_is_pincode_serviceability_question(comb, conversation_context):
+            return True
+    except ImportError:
+        pass
+
     if isinstance(ctx, dict):
         if ctx.get("awaiting") == "order_id":
             return False
@@ -120,6 +135,34 @@ def turn_is_pincode_delivery_fast_path(
             "payment",
         ):
             return False
+        topic = ((ctx.get("data") or {}).get("topic_mode") or "").strip().lower()
+        if topic == "pincode_check":
+            try:
+                from services.product_catalog_resolver import (
+                    product_turn_should_beat_delivery,
+                )
+
+                if product_turn_should_beat_delivery(
+                    original_msg,
+                    msg_en,
+                    conversation_context,
+                    allow_llm=True,
+                ):
+                    return False
+            except ImportError:
+                pass
+            try:
+                from services.location_delivery_resolver import (
+                    _short_area_followup_in_pincode_thread,
+                    turn_continues_pincode_area_check,
+                )
+
+                if turn_continues_pincode_area_check(comb, conversation_context):
+                    return True
+                if _short_area_followup_in_pincode_thread(comb):
+                    return True
+            except ImportError:
+                pass
 
     try:
         from utils.helpers import (
@@ -145,7 +188,7 @@ def turn_is_pincode_delivery_fast_path(
             original_msg,
             msg_en,
             conversation_context,
-            allow_llm=True,
+            allow_llm=False,
         ):
             return True
     except ImportError:
@@ -354,8 +397,24 @@ def try_pincode_delivery_fast_reply(
     ctx: dict | None,
     *,
     reset_context_fn: Callable[[dict], None] | None = None,
+    skip_turn_check: bool = False,
+    allow_llm: bool = False,
 ) -> Optional[str]:
-    if not turn_is_pincode_delivery_fast_path(
+    if skip_turn_check:
+        try:
+            from services.product_catalog_resolver import product_turn_should_beat_delivery
+
+            if product_turn_should_beat_delivery(
+                original_msg,
+                msg_en,
+                conversation_context,
+                allow_llm=allow_llm,
+            ):
+                return None
+        except ImportError:
+            pass
+
+    if not skip_turn_check and not turn_is_pincode_delivery_fast_path(
         original_msg, msg_en, conversation_context, ctx
     ):
         return None
@@ -406,11 +465,11 @@ def try_pincode_delivery_fast_reply(
         from services.location_delivery_resolver import turn_requests_delivery_serviceability
         from services.pincode_delivery_flow import run_delivery_location_check
 
-        if turn_requests_delivery_serviceability(
+        if skip_turn_check or turn_requests_delivery_serviceability(
             original_msg,
             msg_en,
             conversation_context,
-            allow_llm=True,
+            allow_llm=allow_llm,
         ):
             loc_res = run_delivery_location_check(
                 original_msg,
@@ -422,7 +481,7 @@ def try_pincode_delivery_fast_reply(
                     "data_channel": "live_api",
                     "_pincode_delivery_locked": True,
                 },
-                allow_llm=False,
+                allow_llm=allow_llm,
             )
             if loc_res.handled and loc_res.reply_html:
                 if isinstance(ctx, dict):

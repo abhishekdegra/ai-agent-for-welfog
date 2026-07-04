@@ -41,6 +41,8 @@ def _brain_route_is_personal_order_live(brain_route: dict) -> bool:
         return True
     if intent in ("order", "refund", "payment") and channel in ("live_api", "order"):
         return True
+    if needs_oid and intent in ("order", "refund", "payment"):
+        return True
     if needs_oid and olk in (
         "track",
         "tracking",
@@ -127,7 +129,7 @@ def _try_brain_immediate_scope_or_kb_reply(
     elif not scope and intent in ("general",):
         scope = "general_chitchat"
 
-    # --- Pure chitchat — never KB/catalog (brain JSON scope wins) ---
+    # --- Pure chitchat — never KB vector / catalog ---
     if scope == "general_chitchat":
         if channel == "kb":
             channel = "none"
@@ -204,6 +206,33 @@ def _try_brain_immediate_scope_or_kb_reply(
             except ImportError:
                 pass
             return scope_reply
+
+    # --- KB vector only for Welfog support turns (never before OOD/chitchat above) ---
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if not (
+            brain_route_indicates_product_catalog(brain_route)
+            or turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conv_for_llm
+            )
+        ):
+            from services.knowledge_query_pipeline import try_knowledge_vector_only_reply
+
+            kb_vec = try_knowledge_vector_only_reply(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang=lang,
+                ai_route=brain_route,
+                embedding_only=True,
+            )
+            if kb_vec and kb_vec.strip():
+                log_reasoning("Brain immediate — admin KB vector (Welfog support turn).")
+                return kb_vec
+    except ImportError:
+        pass
 
     # --- KB policy (refund/shipping/faqs) — must run before product/order stacks ---
     if channel == "kb" and not brain_route.get("needs_order_id"):
@@ -465,7 +494,11 @@ def _try_brain_kb_locked_reply(
             msg_en,
             kb_keys,
             reply_lang=lang,
-            conversation_context=conv_for_llm,
+            conversation_context=(
+                ""
+                if brain_route.get("_preflight_kb")
+                else conv_for_llm
+            ),
             user_meaning_en=(brain_route.get("user_meaning") or "").strip(),
             ai_route=brain_route,
         )
@@ -551,6 +584,11 @@ def _brain_is_product_catalog_turn(brain: dict, original_msg: str, msg_en: str) 
         pass
     intent = (brain.get("intent") or "").strip().lower()
     channel = (brain.get("data_channel") or "").strip().lower()
+    if intent in ("categories", "category_feed"):
+        return False
+    if intent == "category_browse" and not (brain.get("category_browse") or "").strip():
+        if not (brain.get("search_query") or "").strip() and not brain.get("run_catalog_search"):
+            return False
     if brain.get("category_only_browse") or (brain.get("category_browse") or "").strip():
         return True
     meta = (brain.get("meta_kind") or "none").strip().lower()
@@ -856,6 +894,12 @@ def _try_brain_product_catalog_fallback_dispatch(
     """
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
+    intent_ub = (brain_route.get("intent") or "").strip().lower()
+    if intent_ub in ("categories", "category_feed"):
+        return None
+    if intent_ub == "category_browse" and not (brain_route.get("category_browse") or "").strip():
+        if not (brain_route.get("search_query") or "").strip():
+            return None
     channel = (brain_route.get("data_channel") or "").strip().lower()
     if channel == "kb":
         return None
@@ -2064,6 +2108,7 @@ def _try_brain_pincode_direct_reply(
         try:
             from services.location_delivery_resolver import (
                 _MAJOR_CITY_PINS,
+                _major_city_named_in_text,
                 _norm_city_key,
                 extract_place_query_from_delivery_message,
                 geocode_city_to_pincode,
@@ -2071,6 +2116,8 @@ def _try_brain_pincode_direct_reply(
 
             comb = f"{original_msg} {msg_en}".strip()
             city = (location or "").strip()
+            if not city:
+                city = _major_city_named_in_text(comb) or ""
             if not city:
                 for word in re.findall(r"[a-z]{3,}", comb.lower()):
                     if _norm_city_key(word) in _MAJOR_CITY_PINS:
@@ -2396,8 +2443,77 @@ def try_brain_direct_dispatch(
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
 
+    try:
+        from services.knowledge_query_pipeline import try_kb_informational_locked_reply
+        from services.turn_intent_coordinator import kb_turn_blocks_product_catalog
+
+        kb_lock = try_kb_informational_locked_reply(
+            original_msg,
+            msg_en,
+            conv_for_llm,
+            reply_lang=lang,
+            brain_route=brain_route,
+        )
+        if kb_lock and kb_lock.strip():
+            log_reasoning("Brain dispatch — KB informational lock (no catalog).")
+            return kb_lock
+        classified = None
+        try:
+            from services.turn_intent_coordinator import peek_or_classify_kb_turn
+
+            classified = peek_or_classify_kb_turn(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                lang,
+                preflight=True,
+            )
+        except ImportError:
+            pass
+        if kb_turn_blocks_product_catalog(classified):
+            brain_route = dict(brain_route)
+            brain_route["data_channel"] = "kb"
+            brain_route["intent"] = "general"
+            brain_route["run_catalog_search"] = False
+    except ImportError:
+        pass
+
     channel0 = (brain_route.get("data_channel") or "").strip().lower()
     intent0 = (brain_route.get("intent") or "").strip().lower()
+    try:
+        from services.ai_route_semantics import (
+            brain_route_indicates_informational_kb,
+            reconcile_welfog_kb_from_brain_meaning,
+        )
+
+        if brain_route_indicates_informational_kb(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        ):
+            kb_route = reconcile_welfog_kb_from_brain_meaning(
+                dict(brain_route),
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            )
+            kb_sem = _try_brain_kb_locked_reply(
+                kb_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+                reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+            )
+            if kb_sem:
+                log_reasoning("Brain dispatch — semantic KB from brain JSON.")
+                return kb_sem
+    except ImportError:
+        pass
     if channel0 == "kb" and not brain_route.get("needs_order_id"):
         if intent0 in ("refund", "payment", "general", "seller", ""):
             kb_early = _try_brain_kb_locked_reply(
@@ -2416,6 +2532,7 @@ def try_brain_direct_dispatch(
 
     try:
         from services.ai_route_semantics import (
+            brain_route_indicates_informational_kb,
             brain_route_indicates_product_catalog,
             reconcile_pincode_delivery_from_brain_meaning,
             reconcile_product_catalog_from_brain_meaning,
@@ -3128,6 +3245,35 @@ def try_finish_brain_classified_turn(
         if structural:
             log_reasoning("Brain finish — structural product OpenSearch (msg_en fallback).")
             return structural
+    except ImportError:
+        pass
+
+    try:
+        order_finish = _try_brain_order_live_direct_reply(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv_for_llm=conv_for_llm,
+            user_id=user_id,
+            lang=lang,
+            ctx=ctx,
+            reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+        )
+        if not order_finish:
+            order_finish = _try_brain_order_live_fallback_dispatch(
+                brain_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reply_for_live_order_id_lookup=reply_for_live_order_id_lookup,
+                reset_context_fn=reset_context_fn,
+            )
+        if order_finish:
+            log_reasoning("Brain finish — order track/invoice ask-ID or live API.")
+            return order_finish
     except ImportError:
         pass
     return None

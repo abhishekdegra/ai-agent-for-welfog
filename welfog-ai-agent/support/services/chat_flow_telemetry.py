@@ -15,8 +15,17 @@ from utils.reasoning_log import chat_log, log_reasoning
 
 _TLS = threading.local()
 
-MAX_LLM_CALLS_PER_TURN = int(os.getenv("CHAT_MAX_LLM_CALLS", "3") or "3")
+_CFG_CHAT_MAX_LLM_CALLS = int(os.getenv("CHAT_MAX_LLM_CALLS", "3") or "3")
+# Hard safety cap: keep per-turn LLM fan-out bounded even if env is higher.
+MAX_LLM_CALLS_PER_TURN = max(1, min(3, _CFG_CHAT_MAX_LLM_CALLS))
 MAX_ROUTE_STEPS_PER_TURN = int(os.getenv("CHAT_MAX_ROUTE_STEPS", "16") or "16")
+
+
+def ensure_chat_turn_started() -> str:
+    """One TLS reset per HTTP /chat request (guards + handler share the same turn)."""
+    if getattr(_TLS, "started_at", None) is not None:
+        return request_id()
+    return begin_chat_turn()
 
 
 def begin_chat_turn() -> str:
@@ -215,11 +224,22 @@ def get_cached_brain_route() -> dict | None:
     return dict(r) if isinstance(r, dict) else None
 
 
+def begin_pre_brain_live_api_preflight() -> None:
+    """Allow focused micro-LLMs (account-list, delivery, KB-turn) before ai_brain_route."""
+    _TLS.pre_brain_live_api_preflight = True
+
+
+def end_pre_brain_live_api_preflight() -> None:
+    _TLS.pre_brain_live_api_preflight = False
+
+
 def should_defer_micro_classifiers_to_brain() -> bool:
     """
     True while the universal brain route has not run this turn.
     Micro-classifiers (KB-turn, refund, catalog-menu) must not fire before it.
     """
+    if getattr(_TLS, "pre_brain_live_api_preflight", False):
+        return False
     if is_routing_complete():
         return False
     if getattr(_TLS, "brain_route_called", False):
@@ -267,6 +287,15 @@ def ensure_brain_route_llm_slot() -> None:
     current = int(getattr(_TLS, "llm_calls", 0) or 0)
     if current >= MAX_LLM_CALLS_PER_TURN:
         _TLS.llm_calls = max(0, MAX_LLM_CALLS_PER_TURN - 1)
+
+
+def ensure_product_rescue_llm_slot() -> None:
+    """Reserve LLM budget for OOD product rescue (classify + extract)."""
+    reset_llm_budget_for_recovery()
+    _TLS.llm_calls = 1
+    log_reasoning(
+        f"LLM budget reset for product rescue (limit={MAX_LLM_CALLS_PER_TURN})."
+    )
 
 
 def reset_llm_budget_for_recovery() -> None:

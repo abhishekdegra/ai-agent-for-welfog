@@ -1418,7 +1418,7 @@ _CATEGORY_BROWSE_SIGNALS = (
     "dikhao", "dikha", "dikhe", "dikhaa", "dikha de", "dikha do", "dikhado",
     "dekho", "dekh", "show", "list", "display", "browse", "explore",
     "batao", "btao", "bata", "bta", "btana", "batana", "bta de", "bata de", "bta do",
-    "bhi bta", "bhi dikha", "bhi bata", "bhi show", "k bhi",
+    "bhi bta", "bhi dikha", "bhi bata", "bhi show", "k bhi", "ke bhi",
     "chahiye", "chiye", "dena", "de do", "dede", "de de",
     "lao", "la do", "bhejo", "send", "view", "see",
     "puchh", "pooch", "puch", "bol", "bolo",
@@ -2548,8 +2548,12 @@ def fetch_purchase_history(user_id, page=1):
     return None
 
 
-def _fetch_purchase_history_at_offset(uid: str, offset: int):
-    """Single API call with strongest offset/limit hints."""
+def _ph_fetch_deadline() -> float:
+    return time.time() + float(os.getenv("PH_FETCH_BUDGET_SEC", "10") or "10")
+
+
+def _fetch_purchase_history_at_offset(uid: str, offset: int, *, deadline: float | None = None):
+    """Single API call with strongest offset/limit hints — returns (rows, reported_total)."""
     url = f"{PH_API_BASE}/{uid}"
     page_num = offset // PH_PER_PAGE + 1 if PH_PER_PAGE else 1
     param_sets = (
@@ -2557,18 +2561,84 @@ def _fetch_purchase_history_at_offset(uid: str, offset: int):
         {"user_id": uid, "offset": offset, "limit": PH_PER_PAGE},
         {"user_id": uid, "page": page_num, "per_page": PH_PER_PAGE},
     )
+    timeout = min(_LIVE_ORDER_API_TIMEOUT_SEC, 5)
     for params in param_sets:
+        if deadline is not None and time.time() >= deadline:
+            return None
         try:
-            res = requests.get(url, params=params, timeout=8)
+            res = requests.get(url, params=params, timeout=timeout)
             if res.status_code != 200:
                 continue
             data = res.json()
             rows = data.get("data") if isinstance(data, dict) else None
-            if isinstance(rows, list):
-                return rows
+            if not isinstance(rows, list):
+                continue
+            reported_total = None
+            if isinstance(data, dict):
+                meta = data.get("meta")
+                if isinstance(meta, dict):
+                    try:
+                        reported_total = int(meta.get("total"))
+                    except (TypeError, ValueError):
+                        reported_total = None
+            return rows, reported_total
         except Exception:
             continue
     return None
+
+
+def _ph_accum_snapshot(uid: str) -> dict:
+    with _PH_ACCUM_LOCK:
+        slot = _PH_ACCUM.get(str(uid).strip())
+        return dict(slot) if isinstance(slot, dict) else {}
+
+
+def _ph_infer_has_more(
+    rows: list,
+    chunk: list,
+    *,
+    exhausted: bool,
+    reported_total: int | None,
+    page: int,
+) -> bool:
+    if reported_total is not None and reported_total > 0:
+        return reported_total > page * PH_PER_PAGE
+    if len(rows) > page * PH_PER_PAGE:
+        return True
+    return len(chunk) >= PH_PER_PAGE and not exhausted
+
+
+def _purchase_history_first_page_rows(uid: str) -> list:
+    """
+    Page-1 guard/chat fast path — one fetch round, strict budget, warm accum cache.
+    Avoids multi-round offset probing that could exceed client timeouts.
+    """
+    uid = str(uid).strip()
+    if not uid:
+        return []
+    deadline = _ph_fetch_deadline()
+    now = time.time()
+    with _PH_ACCUM_LOCK:
+        slot = _PH_ACCUM.get(uid)
+        if slot and (now - slot["ts"]) <= _PH_ACCUM_TTL_SEC:
+            rows = slot.get("rows") or []
+            if rows:
+                return list(rows)
+    batch_pack = _fetch_purchase_history_at_offset(uid, 0, deadline=deadline)
+    if not batch_pack:
+        return []
+    batch, reported_total = batch_pack
+    if not batch:
+        return []
+    with _PH_ACCUM_LOCK:
+        slot = {
+            "rows": list(batch),
+            "ts": time.time(),
+            "exhausted": len(batch) < PH_PER_PAGE,
+            "reported_total": reported_total,
+        }
+        _PH_ACCUM[uid] = slot
+        return list(batch)
 
 
 def _row_id(row):
@@ -2584,9 +2654,13 @@ def _ensure_accumulated_rows(uid: str, min_length: int):
     HTTP calls run outside _PH_ACCUM_LOCK so /chat greetings are not blocked.
     """
     uid = str(uid).strip()
-    max_fetch_rounds = 6
+    if min_length <= PH_PER_PAGE + 1:
+        rows = _purchase_history_first_page_rows(uid)
+        if rows:
+            return rows
+    max_fetch_rounds = 4
     rounds = 0
-    deadline = time.time() + float(os.getenv("PH_FETCH_BUDGET_SEC", "14") or "14")
+    deadline = _ph_fetch_deadline()
     while rounds < max_fetch_rounds and time.time() < deadline:
         rounds += 1
         with _PH_ACCUM_LOCK:
@@ -2608,7 +2682,17 @@ def _ensure_accumulated_rows(uid: str, min_length: int):
             offset = len(rows)
             first_row_id = _row_id(rows[0]) if rows else None
 
-        batch = _fetch_purchase_history_at_offset(uid, offset)
+        if time.time() >= deadline:
+            break
+        batch_pack = _fetch_purchase_history_at_offset(uid, offset, deadline=deadline)
+        if not batch_pack:
+            with _PH_ACCUM_LOCK:
+                slot = _PH_ACCUM.get(uid)
+                if slot:
+                    slot["exhausted"] = True
+                    slot["ts"] = time.time()
+                return (slot or {}).get("rows") or []
+        batch, reported_total = batch_pack
         if not batch:
             with _PH_ACCUM_LOCK:
                 slot = _PH_ACCUM.get(uid)
@@ -2623,6 +2707,8 @@ def _ensure_accumulated_rows(uid: str, min_length: int):
             if not slot:
                 return batch[:min_length] if batch else []
             rows = slot["rows"]
+            if reported_total is not None:
+                slot["reported_total"] = reported_total
             if rows and first_new is not None and first_new == first_row_id:
                 slot["exhausted"] = True
                 slot["ts"] = time.time()
@@ -2660,6 +2746,18 @@ def purchase_history_slice(uid: str, page: int):
     """
     uid = str(uid).strip()
     page = max(1, int(page))
+    if page == 1:
+        rows = _purchase_history_first_page_rows(uid)
+        chunk = rows[:PH_PER_PAGE]
+        snap = _ph_accum_snapshot(uid)
+        has_more = _ph_infer_has_more(
+            rows,
+            chunk,
+            exhausted=bool(snap.get("exhausted")),
+            reported_total=snap.get("reported_total"),
+            page=page,
+        )
+        return chunk, has_more
     end = page * PH_PER_PAGE
     # Fetch one extra row past the current page boundary so we can accurately
     # tell whether there is a next page, even when the current page is exactly
@@ -2667,7 +2765,16 @@ def purchase_history_slice(uid: str, page: int):
     rows = _ensure_accumulated_rows(uid, end + 1)
     start = (page - 1) * PH_PER_PAGE
     chunk = rows[start:end]
-    has_more = len(rows) > end
+    snap = _ph_accum_snapshot(uid)
+    has_more = _ph_infer_has_more(
+        rows,
+        chunk,
+        exhausted=bool(snap.get("exhausted")),
+        reported_total=snap.get("reported_total"),
+        page=page,
+    )
+    if not has_more and len(rows) > end:
+        has_more = True
     return chunk, has_more
 
 
@@ -2795,7 +2902,7 @@ def _ph_render_card(row):
 
 
 def _ph_tail_html(has_more, next_page):
-    """Tail sits INSIDE .wf-ph-scroll below the current page of cards — user scrolls down to reach View more."""
+    """Footer below the scroll area — always visible without scrolling past all cards."""
     if not has_more:
         return ""
     return (
@@ -2835,8 +2942,8 @@ def format_purchase_history_reply(user_id, page=1, append_only=False):
     parts.append("<div class='wf-ph-scroll'>")
     for row in display_rows:
         parts.append(_ph_render_card(row))
-    parts.append(_ph_tail_html(has_more, page + 1))
     parts.append("</div>")
+    parts.append(_ph_tail_html(has_more, page + 1))
 
     inner = "".join(parts)
     return f"<div class='wf-ph-root'>{inner}</div>"
@@ -3282,7 +3389,10 @@ def check_order_ownership(user_id: str, order_id: str, max_batches: int = 8) -> 
     saw_any_row = False
 
     while batches < max_batches:
-        batch = _fetch_purchase_history_at_offset(uid, offset)
+        batch_pack = _fetch_purchase_history_at_offset(uid, offset)
+        if not batch_pack:
+            break
+        batch, _reported = batch_pack
         if not batch:
             break
         saw_any_row = True
@@ -3876,7 +3986,10 @@ def _enrich_order_details_row(row: dict, user_id: str) -> dict:
     targets = _order_id_match_variants(oid)
     offset = 0
     for _ in range(12):
-        batch = _fetch_purchase_history_at_offset(str(user_id).strip(), offset)
+        batch_pack = _fetch_purchase_history_at_offset(str(user_id).strip(), offset)
+        if not batch_pack:
+            break
+        batch, _reported = batch_pack
         if not batch:
             break
         for ph_row in batch:

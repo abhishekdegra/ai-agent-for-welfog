@@ -344,6 +344,11 @@ def merge_ai_into_catalog_spec(
             pass
 
     cat_browse = (ai.get("category_browse") or "").strip()
+    if ai.get("category_id") is not None and not spec.get("category_id"):
+        try:
+            spec["category_id"] = int(ai["category_id"])
+        except (TypeError, ValueError):
+            pass
     if cat_browse:
         try:
             from services.welfog_api import get_category_id_from_text

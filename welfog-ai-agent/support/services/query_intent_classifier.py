@@ -272,12 +272,14 @@ def ai_classify_query_intent(
     msg_en: str = "",
     conversation_context: str = "",
     reply_lang: str = "",
+    *,
+    ignore_routing_complete: bool = False,
 ) -> Optional[QueryIntentDecision]:
     """Dedicated classifier LLM — semantic only, no keyword examples."""
     try:
         from services.chat_flow_telemetry import is_routing_complete, skip_step
 
-        if is_routing_complete():
+        if not ignore_routing_complete and is_routing_complete():
             skip_step("ai_classify_query_intent", "main router already ran")
             return None
     except ImportError:

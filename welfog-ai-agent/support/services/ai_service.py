@@ -86,54 +86,32 @@ def _shrink_groq_payload(req: dict, factor: float = 0.72) -> dict:
 
 
 def _llm_provider_chain() -> list[dict]:
-    from services.llm_providers import get_llm_provider_chain
+    from services.llm_providers import get_standard_fallback_chain
 
-    return get_llm_provider_chain()
+    return get_standard_fallback_chain()
 
 
 def _llm_classifier_provider_chain() -> list[dict]:
     """
-    JSON classifiers / routing: env chain (LLM_PROVIDER_ORDER), capped for latency.
-    Set LLM_CLASSIFIER_MAX_PROVIDERS=4 in .env to try all keys; default 2 (groq→openai).
+    JSON micro-classifiers: groq → openai → gemini → deepseek (auto-failover).
+    LLM_CLASSIFIER_MAX_PROVIDERS caps tries (default 4 = full chain).
     """
-    from services.llm_providers import get_configured_provider_chain
+    from services.llm_providers import get_standard_fallback_chain
 
-    chain = get_configured_provider_chain()
-    cap_default = (
-        "4"
-        if (os.getenv("STRICT_LLM_FAILSAFE", "") or "").strip().lower()
-        in ("1", "true", "yes", "on")
-        else "2"
-    )
-    cap = max(1, min(4, int(os.getenv("LLM_CLASSIFIER_MAX_PROVIDERS", cap_default) or cap_default)))
-    return chain[:cap] if chain else []
+    cap = max(1, min(4, int(os.getenv("LLM_CLASSIFIER_MAX_PROVIDERS", "4") or "4")))
+    return get_standard_fallback_chain(max_providers=cap)
 
 
 def _llm_routing_provider_chain(*, prefer_openai: bool = False) -> list[dict]:
     """
-    ai_brain_route — try full env chain (groq→openai→gemini→deepseek by default).
-    LLM_ROUTING_MAX_PROVIDERS caps how many keys to try (default 4 = all configured).
-    prefer_openai: Hinglish / long prompts — OpenAI JSON mode is more reliable than Groq.
+    ai_brain_route — full fallback chain (groq → openai → gemini → deepseek).
+    prefer_openai is ignored; order comes from LLM_PROVIDER_ORDER.
     """
-    from services.llm_providers import get_configured_provider_chain
+    _ = prefer_openai  # legacy callers
+    from services.llm_providers import get_standard_fallback_chain
 
-    chain = get_configured_provider_chain()
     cap = max(1, min(4, int(os.getenv("LLM_ROUTING_MAX_PROVIDERS", "4") or "4")))
-    if prefer_openai and chain:
-        openai = [p for p in chain if (p.get("name") or "").strip().lower() == "openai"]
-        rest = [p for p in chain if (p.get("name") or "").strip().lower() != "openai"]
-        chain = openai + rest if openai else list(chain)
-        return chain[:cap]
-    prefer_groq = (os.getenv("LLM_ROUTING_PREFER_GROQ", "1") or "1").strip().lower() not in (
-        "0",
-        "false",
-        "no",
-    )
-    if prefer_groq and chain:
-        groq = [p for p in chain if (p.get("name") or "").strip().lower() == "groq"]
-        rest = [p for p in chain if (p.get("name") or "").strip().lower() != "groq"]
-        chain = groq + rest if groq else list(chain)
-    return chain[:cap] if chain else []
+    return get_standard_fallback_chain(max_providers=cap)
 
 
 def _llm_json_with_provider_fallback(
@@ -182,15 +160,7 @@ def ai_brain_route(
 
     reply_lang = resolve_customer_reply_lang(user_msg, reply_lang)
     try:
-        providers = _llm_routing_provider_chain(
-            prefer_openai=bool(
-                (msg_en or "").strip()
-                and (user_msg or "").strip()
-                and (msg_en or "").strip().lower()
-                != (user_msg or "").strip().lower()
-            )
-            or reply_lang not in ("en",)
-        )
+        providers = _llm_routing_provider_chain()
         if not providers:
             _safe_print(
                 "ERROR: No AI provider key found — set GROQ/OPENAI/GEMINI/DEEPSEEK API keys."
@@ -313,7 +283,7 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
 - Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="" unless user also named a product type.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
-- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new .txt file is added. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund KB (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB.
+- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new .txt file is added. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund KB (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help — those are KB only.
 - Personal life, marriage, dating, jokes, homework, politics, sports scores, other apps — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys.
 - General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company → kb company (NOT assistant_intro).

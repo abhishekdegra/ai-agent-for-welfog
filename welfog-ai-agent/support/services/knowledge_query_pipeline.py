@@ -750,10 +750,11 @@ Return ONLY valid JSON:
 
 is_informational_kb=true — user wants to READ Welfog FAQ/policy/how-it-works (no personal fetch now):
 • General delivery/shipping TIME or duration (any phrasing) → delivery_shipping
+• Shipping policy, delivery policy, courier partner questions (general FAQ) → delivery_shipping or general_faq
 • Refund/return POLICY or general steps → refund_return_policy, is_refund_or_return=true
-• Payment methods, fees, COD → payment_fees
-• What is Welfog, company info → company_faq
-• Welfog official social media / Instagram / YouTube / Facebook links → welfog_social
+• Payment methods, fees, COD, checkout problems (general how-to / what to do) → payment_fees or general_faq
+• What is Welfog, company info, about Welfog → company_faq
+• Welfog official social media / Instagram / LinkedIn / YouTube / Facebook links → welfog_social
 • Seller registration/login on Welfog → seller
 • Customer care phone/email → contact_support
 • Privacy, terms → privacy_terms
@@ -1730,8 +1731,44 @@ def try_ai_first_kb_early_reply(
                 )
                 return kb_body
 
+            try:
+                from services.kb_service import direct_kb_search
+
+                kb_body = direct_kb_search(
+                    rq,
+                    keys=None,
+                    min_score=max(0.18, KB_DIRECT_MIN_SCORE - 0.04),
+                    zero_llm_fast=True,
+                ) or ""
+                if kb_body:
+                    log_reasoning(
+                        f"KB preflight — AI topic={topic} + full KB vector fallback."
+                    )
+                    return kb_body
+            except ImportError:
+                pass
+
+            try:
+                from services.kb_service import format_dynamic_kb_answer
+
+                dyn = format_dynamic_kb_answer(
+                    original_msg,
+                    msg_en,
+                    reply_lang=rl,
+                    conversation_context=conversation_context,
+                    suggested_keys=keys,
+                    ai_route={"user_meaning": um} if um else None,
+                )
+                if dyn and dyn.strip():
+                    log_reasoning(
+                        f"KB preflight — AI topic={topic} + dynamic KB answer."
+                    )
+                    return dyn
+            except ImportError:
+                pass
+
             log_reasoning(
-                f"KB preflight — AI topic={topic} but no scoped KB hit; defer."
+                f"KB preflight — AI topic={topic} but no KB hit; defer to brain."
             )
             return None
         except ImportError:
@@ -1744,8 +1781,39 @@ def try_ai_first_kb_early_reply(
             brain = ai_route or get_cached_brain_route()
             if isinstance(brain, dict):
                 ch = (brain.get("data_channel") or "").strip().lower()
-                if ch in ("live_api", "catalog"):
+                if ch == "live_api":
                     return None
+                try:
+                    from services.ai_route_semantics import (
+                        brain_route_indicates_informational_kb,
+                    )
+
+                    if ch == "catalog" and not brain_route_indicates_informational_kb(
+                        brain
+                    ):
+                        return None
+                except ImportError:
+                    if ch in ("live_api", "catalog"):
+                        return None
+        except ImportError:
+            pass
+
+        try:
+            from services.ai_route_semantics import brain_route_indicates_informational_kb
+            from services.chat_flow_telemetry import get_cached_brain_route
+
+            brain = ai_route if isinstance(ai_route, dict) else get_cached_brain_route()
+            if isinstance(brain, dict) and not brain.get("llm_unavailable"):
+                if brain_route_indicates_informational_kb(brain):
+                    semantic = try_brain_semantic_kb_reply(
+                        original_msg,
+                        msg_en,
+                        conversation_context,
+                        reply_lang=reply_lang,
+                        brain_route=brain,
+                    )
+                    if semantic:
+                        return semantic
         except ImportError:
             pass
 
@@ -1757,8 +1825,18 @@ def try_ai_first_kb_early_reply(
                 ch = (brain.get("data_channel") or "").strip().lower()
                 scope = (brain.get("conversation_scope") or "").strip().lower()
                 intent = (brain.get("intent") or "").strip().lower()
-                if ch in ("live_api", "catalog"):
+                if ch == "live_api":
                     return None
+                if ch == "catalog":
+                    try:
+                        from services.ai_route_semantics import (
+                            brain_route_indicates_informational_kb,
+                        )
+
+                        if not brain_route_indicates_informational_kb(brain):
+                            return None
+                    except ImportError:
+                        return None
                 if ch == "kb" or (brain.get("data_channel") or "").strip().lower() == "kb":
                     meaning = (brain.get("user_meaning") or "").strip()
                     keys = list(brain.get("kb_keys") or [])
@@ -1912,6 +1990,235 @@ def try_ai_first_kb_early_reply(
         ai_route=ai_route,
         embedding_only=True,
     )
+
+
+_KB_EMBED_CACHE: dict[str, bool] = {}
+
+
+def kb_embedding_indicates_informational_turn(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    ai_route: dict | None = None,
+    min_confidence: float = 0.42,
+) -> bool:
+    """
+    True when admin KB vectors (auto-refreshed from panel) strongly match the turn.
+    No keyword lists — embedding + rerank only.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return False
+    cache_key = comb[:240]
+    if cache_key in _KB_EMBED_CACHE:
+        return _KB_EMBED_CACHE[cache_key]
+
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            _KB_EMBED_CACHE[cache_key] = False
+            return False
+    except ImportError:
+        pass
+
+    try:
+        from services.early_live_dispatch import turn_blocks_kb_pre_scope
+
+        if turn_blocks_kb_pre_scope(
+            original_msg,
+            msg_en,
+            conversation_context,
+            ai_route=ai_route,
+            route_decision=None,
+        ):
+            _KB_EMBED_CACHE[cache_key] = False
+            return False
+    except ImportError:
+        pass
+
+    sem = analyze_informational_knowledge_turn(
+        original_msg,
+        msg_en,
+        conversation_context,
+        ai_route=ai_route,
+        embedding_only=True,
+    )
+    ok = bool(sem.is_informational and float(sem.confidence or 0) >= min_confidence)
+    _KB_EMBED_CACHE[cache_key] = ok
+    if ok:
+        log_reasoning(
+            f"KB embedding lane — informational (conf={float(sem.confidence or 0):.2f})."
+        )
+    return ok
+
+
+def try_brain_semantic_kb_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    brain_route: dict | None = None,
+) -> Optional[str]:
+    """
+    Answer from admin KB when brain JSON locked channel=kb / kb_keys.
+    Uses vector RAG + resolve_brain_kb_keys — no keyword lists.
+    """
+    try:
+        from services.ai_route_semantics import (
+            brain_route_prefers_kb_answer,
+            reconcile_welfog_kb_from_brain_meaning,
+        )
+        from services.kb_service import format_kb_answer_from_brain_keys
+    except ImportError:
+        return None
+
+    route = brain_route
+    if route is None:
+        try:
+            from services.chat_flow_telemetry import get_cached_brain_route
+
+            route = get_cached_brain_route()
+        except ImportError:
+            return None
+    if not isinstance(route, dict) or route.get("llm_unavailable"):
+        return None
+    if not brain_route_prefers_kb_answer(route):
+        return None
+
+    kb_route = reconcile_welfog_kb_from_brain_meaning(
+        dict(route),
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    keys = list(kb_route.get("kb_keys") or [])
+    um = (kb_route.get("user_meaning") or "").strip()
+    body = format_kb_answer_from_brain_keys(
+        original_msg,
+        msg_en,
+        keys,
+        reply_lang=reply_lang,
+        conversation_context=conversation_context,
+        user_meaning_en=um,
+        ai_route=kb_route,
+    )
+    if body and body.strip():
+        log_reasoning("KB brain JSON — vector RAG (no keyword gate).")
+        return body
+    return None
+
+
+def try_kb_informational_locked_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    brain_route: dict | None = None,
+) -> Optional[str]:
+    """
+    Admin KB first (embeddings), then brain kb_keys, then semantic KB classifier.
+  No customer keyword lists.
+    """
+    route = brain_route
+    if route is None:
+        try:
+            from services.chat_flow_telemetry import get_cached_brain_route
+
+            route = get_cached_brain_route()
+        except ImportError:
+            route = None
+
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if isinstance(route, dict) and brain_route_indicates_product_catalog(route):
+            return None
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            return None
+    except ImportError:
+        pass
+
+    vec_body = try_knowledge_vector_only_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ai_route=route if isinstance(route, dict) else None,
+        embedding_only=True,
+    )
+    if vec_body and vec_body.strip():
+        log_reasoning("KB lock — admin vector match (blocks catalog).")
+        return vec_body
+
+    brain_body = try_brain_semantic_kb_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        brain_route=route if isinstance(route, dict) else None,
+    )
+    if brain_body and brain_body.strip():
+        return brain_body
+
+    blocks_catalog = kb_embedding_indicates_informational_turn(
+        original_msg,
+        msg_en,
+        conversation_context,
+        ai_route=route if isinstance(route, dict) else None,
+    )
+
+    try:
+        from services.turn_intent_coordinator import (
+            kb_turn_blocks_product_catalog,
+            peek_or_classify_kb_turn,
+        )
+
+        classified = peek_or_classify_kb_turn(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang,
+            preflight=True,
+        )
+        if kb_turn_blocks_product_catalog(classified):
+            blocks_catalog = True
+    except ImportError:
+        classified = None
+
+    if not blocks_catalog:
+        return None
+
+    body = try_ai_first_kb_early_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        preflight=True,
+        ai_route=route if isinstance(route, dict) else None,
+    )
+    if body and body.strip():
+        return body
+
+    try:
+        from services.knowledge_fast_path import try_knowledge_fast_reply
+
+        return try_knowledge_fast_reply(
+            original_msg,
+            msg_en,
+            conversation_context,
+            reply_lang=reply_lang,
+        )
+    except ImportError:
+        return None
 
 
 def try_knowledge_reply_before_interference(

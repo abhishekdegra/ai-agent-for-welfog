@@ -1,7 +1,7 @@
 """
 Admin-controlled LLM selection (SQLite). Customers never set this.
 
-- auto: full fallback chain from env (grok/groq → openai → gemini → deepseek)
+- auto: full fallback chain from env (groq → openai → gemini → deepseek)
 - provider:model: single pinned model for all JSON chat completions
 """
 from __future__ import annotations

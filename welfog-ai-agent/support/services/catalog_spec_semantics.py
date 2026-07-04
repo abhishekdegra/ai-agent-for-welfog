@@ -304,6 +304,126 @@ def user_mentions_sku_this_turn(text: str) -> bool:
     return False
 
 
+_ACCESSORY_RE = re.compile(
+    r"\b(cover|covers|case|cases|bumper|backcover|back\s*cover|tempered|protector)\b",
+    re.I,
+)
+_ONLY_PRODUCT_RE = re.compile(
+    r"\b(?:only|sirf|bas)\s+(?:the\s+)?([a-z0-9][a-z0-9\s\-]{0,40}?)(?:\s+(?:chahiye|chahie|chaiye|want|wanted|need|needed))?\b",
+    re.I,
+)
+_NEGATE_ACCESSORY_RE = re.compile(
+    r"(?:"
+    r"\b(?:cover|case|covers|cases)\s+(?:nahi|nai|nahin|no|not)\b|"
+    r"\b(?:nahi|nai|nahin|not|no)\s+(?:\w+\s+){0,4}(?:cover|case|covers|cases)\b|"
+    r"\bwithout\s+(?:cover|case)\b|"
+    r"\bnot\s+(?:a\s+)?(?:cover|case)\b"
+    r")",
+    re.I,
+)
+
+
+def _message_mentions_accessory(text: str) -> bool:
+    return bool(_ACCESSORY_RE.search(text or ""))
+
+
+def _user_negates_accessory_search(text: str) -> bool:
+    return bool(_NEGATE_ACCESSORY_RE.search(text or ""))
+
+
+def _strip_accessory_tokens_from_terms(terms: str) -> str:
+    words = re.findall(r"[a-z0-9]+(?:-[a-z0-9]+)*", (terms or "").lower())
+    drop = {
+        "cover", "covers", "case", "cases", "bumper", "backcover", "back",
+        "mobile", "phone", "tempered", "protector", "glass",
+    }
+    kept = [w for w in words if w not in drop]
+    return " ".join(kept).strip()
+
+
+def _only_product_phrase_from_message(text: str) -> str:
+    m = _ONLY_PRODUCT_RE.search(text or "")
+    if not m:
+        return ""
+    phrase = re.sub(r"\s+", " ", (m.group(1) or "").strip().lower())
+    if _message_mentions_accessory(phrase):
+        return ""
+    return _strip_accessory_tokens_from_terms(phrase)
+
+
+def align_catalog_terms_to_user_message(
+    ai: dict[str, Any],
+    original_msg: str = "",
+    msg_en: str = "",
+) -> dict[str, Any]:
+    """
+    Never search accessory words the customer did not ask for (e.g. iphone → not iphone cover).
+    """
+    out = dict(ai)
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return out
+
+    user_wants_accessory = _message_mentions_accessory(comb)
+    user_negates_accessory = _user_negates_accessory_search(comb)
+    only_phrase = _only_product_phrase_from_message(comb)
+
+    if user_negates_accessory or only_phrase:
+        out["allow_related_fallback"] = False
+        out["specific_accessory"] = True
+        out.pop("device_browse", None)
+        out.pop("related_search_terms", None)
+        out.pop("exclude_title_tokens", None)
+        if only_phrase:
+            out["search_terms"] = only_phrase
+        elif user_negates_accessory:
+            st = (out.get("search_terms") or "").strip()
+            if st:
+                cleaned = _strip_accessory_tokens_from_terms(st)
+                if cleaned:
+                    out["search_terms"] = cleaned
+        ptype = (out.get("product_type") or "").strip().lower()
+        if ptype in ("cover", "case", "cases", "covers", "bumper"):
+            out.pop("product_type", None)
+        mmt = [
+            t
+            for t in (out.get("mandatory_match_tokens") or [])
+            if str(t).strip().lower() not in ("cover", "covers", "case", "cases", "bumper")
+        ]
+        if mmt:
+            out["mandatory_match_tokens"] = mmt[:4]
+        else:
+            out.pop("mandatory_match_tokens", None)
+        return out
+
+    if not user_wants_accessory:
+        st = (out.get("search_terms") or "").strip()
+        if st and _ACCESSORY_RE.search(st):
+            cleaned = _strip_accessory_tokens_from_terms(st)
+            if cleaned:
+                out["search_terms"] = cleaned
+            elif not _ACCESSORY_RE.search(comb):
+                out["search_terms"] = st
+        related = (out.get("related_search_terms") or "").strip()
+        if related and _ACCESSORY_RE.search(related) and not user_wants_accessory:
+            out.pop("related_search_terms", None)
+            out["allow_related_fallback"] = False
+        ptype = (out.get("product_type") or "").strip().lower()
+        if ptype in ("cover", "case", "cases", "covers", "bumper") and not user_wants_accessory:
+            out.pop("product_type", None)
+        mmt = [
+            t
+            for t in (out.get("mandatory_match_tokens") or [])
+            if str(t).strip().lower() not in ("cover", "covers", "case", "cases", "bumper")
+        ]
+        if mmt:
+            out["mandatory_match_tokens"] = mmt[:4]
+        elif out.get("mandatory_match_tokens"):
+            out.pop("mandatory_match_tokens", None)
+
+    return out
+
+
 def scrub_ai_product_understanding(
     ai: Optional[dict],
     original_msg: str = "",
@@ -402,7 +522,7 @@ def scrub_ai_product_understanding(
             else:
                 cleaned.append(item)
         out["product_requests"] = cleaned
-    return out
+    return align_catalog_terms_to_user_message(out, original_msg, msg_en)
 
 
 def normalize_rating_filters_from_message(comb: str, spec: dict[str, Any]) -> None:

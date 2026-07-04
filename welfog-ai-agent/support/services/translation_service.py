@@ -143,26 +143,149 @@ def _looks_english_only_latin(msg: str) -> bool:
     return hinglish_hits == 0 and english_hits >= 1
 
 
-def _english_html_to_roman_hinglish(text: str) -> str:
+def _english_html_to_roman_hinglish(text: str, user_msg: str = "") -> str:
+    """
+    Legacy name — rewrites into natural Roman Hinglish via LLM (not en→hi Google + romanize).
+    """
     if not text or not str(text).strip():
         return text
-    parts = HTML_TAG_RE.split(text)
-    out = []
-    for part in parts:
-        if HTML_TAG_RE.fullmatch(part):
-            out.append(part)
-            continue
-        seg = (part or "").strip()
-        if not seg:
-            out.append(part)
-            continue
-        try:
-            hi = GoogleTranslator(source="en", target="hi").translate(seg)
-            out.append(_romanize_devanagari_text(hi if isinstance(hi, str) else seg))
-        except Exception as e:
-            log_reasoning(f"Translation error (en->hinglish): {e}. Using original segment.")
-            out.append(part)
-    return "".join(out)
+    if user_msg:
+        return _llm_rewrite_customer_reply(text, user_msg, "hinglish")
+    return text
+
+
+def _infer_reply_text_language(text: str) -> str:
+    """Best-effort language of bot output text."""
+    plain = re.sub(r"<[^>]+>", " ", text or "").strip()
+    if not plain:
+        return "en"
+    script = _detect_script_language(plain)
+    if script:
+        return script
+    if DEVANAGARI_RE.search(plain):
+        return "hi"
+    if is_hinglish_message(plain):
+        return "hinglish"
+    if _looks_english_only_latin(plain):
+        return "en"
+    if _reply_style_mismatches_hinglish(plain):
+        return "hi"
+    return "en"
+
+
+def _reply_style_mismatches_hinglish(text: str) -> bool:
+    """Formal romanized Hindi (Google+romanize artifact) — not natural Hinglish."""
+    plain = re.sub(r"<[^>]+>", " ", text or "").lower().strip()
+    if not plain or not _latin_script_only(plain):
+        return False
+    if DEVANAGARI_RE.search(text or ""):
+        return True
+    if is_hinglish_message(plain):
+        return False
+    if _looks_english_only_latin(plain):
+        return False
+    hing = _hinglish_marker_count(plain)
+    eng = len(set(re.findall(r"\b[a-zA-Z]{2,}\b", plain)) & _ENGLISH_CONVERSATIONAL)
+    if hing >= 1:
+        return False
+    long_words = re.findall(r"\b[a-zA-Z]{5,}\b", plain)
+    return eng <= 1 and len(long_words) >= 3
+
+
+def _reply_needs_style_rewrite(text: str, target_lang: str, user_msg: str = "") -> bool:
+    """True when bot text language/style does not match the customer's target."""
+    target_lang = resolve_customer_reply_lang(user_msg, target_lang)
+    if target_lang == "en":
+        plain = re.sub(r"<[^>]+>", " ", text or "").strip()
+        return bool(plain) and not _looks_english_only_latin(plain) and not _latin_script_only(plain)
+    if target_lang == "hinglish":
+        return _reply_style_mismatches_hinglish(text) or _looks_english_only_latin(
+            re.sub(r"<[^>]+>", " ", text or "").strip()
+        )
+    if target_lang in NATIVE_SCRIPT_LANGS:
+        return not _bot_text_matches_reply_lang(text, target_lang)
+    return False
+
+
+def _llm_rewrite_customer_reply(text: str, user_msg: str, reply_lang: str) -> str:
+    """Rewrite answer text into customer's language/style — facts and numbers preserved."""
+    if not (text or "").strip() or not (user_msg or "").strip():
+        return text
+    rl = resolve_customer_reply_lang(user_msg, reply_lang)
+    try:
+        from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
+
+        ensure_product_rescue_llm_slot()
+    except ImportError:
+        pass
+    try:
+        from services.ai_service import (
+            _llm_json_with_provider_fallback,
+            _llm_classifier_provider_chain,
+            _trim_text_mid,
+        )
+    except ImportError:
+        return text
+    providers = _llm_classifier_provider_chain()
+    if not providers:
+        return text
+    system_prompt = f"""Rewrite the ANSWER for the customer. Return ONLY JSON: {{"response":"..."}}
+
+RULES:
+- Match the customer's LATEST message language, script, and conversational style exactly.
+- {language_reply_instruction(rl)}
+- Copy every number, phone, email, URL, day-count, and policy fact EXACTLY from the source.
+- Do NOT add facts. Do NOT change meaning. Do NOT answer a different question.
+- Keep HTML tags/structure when the source has HTML.
+- Roman Hinglish = casual WhatsApp-style mixed Hindi+English in Latin script — never formal Sanskritized transliteration.
+JSON only."""
+    user_payload = (
+        f"CUSTOMER WROTE:\n{_trim_text_mid(user_msg, 320)}\n\n"
+        f"ANSWER TO REWRITE:\n{_trim_text_mid(text, 2200)}"
+    )
+    data = _llm_json_with_provider_fallback(
+        providers,
+        [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_payload},
+        ],
+        max_tokens=700,
+        timeout_sec=14,
+        max_attempts=1,
+    )
+    resp = (data.get("response") or "").strip() if data else ""
+    return resp if resp else text
+
+
+def _log_language_preservation(
+    user_msg: str,
+    reply_lang: str,
+    body_in: str,
+    body_out: str,
+    *,
+    translation_applied: bool,
+) -> None:
+    # #region agent log
+    try:
+        from services.debug_session_log import dbg97
+
+        dbg97(
+            "H18",
+            "translation_service.py:finalize_customer_reply",
+            "language_preservation",
+            {
+                "input_language": resolve_customer_reply_lang(user_msg, reply_lang),
+                "output_language": _infer_reply_text_language(body_out),
+                "translation_applied": translation_applied,
+            },
+        )
+    except ImportError:
+        pass
+    # #endregion
+    log_reasoning(
+        f"Language preservation: input={resolve_customer_reply_lang(user_msg, reply_lang)} "
+        f"output={_infer_reply_text_language(body_out)} translated={translation_applied}"
+    )
 
 
 def _is_valid_lang_code(lang: str) -> bool:
@@ -550,7 +673,7 @@ def is_live_api_structured_html(text: str) -> bool:
 def finalize_customer_reply(text: str, user_msg: str, reply_lang: str = "") -> str:
     """
     Last-mile localization before sending to the customer.
-    Native scripts: translate English/Hinglish templates. en/hinglish: pass through.
+    Match language/script/style of the customer's latest message.
     """
     if text is None:
         return text
@@ -560,20 +683,41 @@ def finalize_customer_reply(text: str, user_msg: str, reply_lang: str = "") -> s
     if not body:
         return text
     rl = resolve_customer_reply_lang(user_msg, reply_lang)
+    translation_applied = False
+    out = text
+
     if rl in ("hinglish", "en"):
         if is_live_api_structured_html(body):
+            _log_language_preservation(user_msg, rl, body, out, translation_applied=False)
             return text
-        if rl == "hinglish":
-            if DEVANAGARI_RE.search(body):
-                return _romanize_devanagari_text(text)
-            # Never block /chat on Google en→hi→roman (30–120s+). Hinglish sysmsg templates
-            # and product/API cards are already customer-readable in Latin script.
-            return text
-        return text
+        if _reply_needs_style_rewrite(body, rl, user_msg):
+            rewritten = _llm_rewrite_customer_reply(text, user_msg, rl)
+            if rewritten and rewritten.strip() and rewritten.strip() != body:
+                out = rewritten
+                translation_applied = True
+        if not translation_applied:
+            out_lang = _infer_reply_text_language(out)
+            if out_lang != rl:
+                rewritten = _llm_rewrite_customer_reply(out, user_msg, rl)
+                if rewritten and rewritten.strip():
+                    plain_out = re.sub(r"<[^>]+>", " ", out).strip()
+                    plain_new = re.sub(r"<[^>]+>", " ", rewritten).strip()
+                    if plain_new and plain_new != plain_out:
+                        out = rewritten
+                        translation_applied = True
+        _log_language_preservation(user_msg, rl, body, out, translation_applied=translation_applied)
+        return out
+
     if rl in NATIVE_SCRIPT_LANGS:
         if _bot_text_matches_reply_lang(body, rl):
+            _log_language_preservation(user_msg, rl, body, out, translation_applied=False)
             return text
-        return localize_for_customer(text, rl)
+        out = localize_for_customer(text, rl)
+        translation_applied = out.strip() != body
+        _log_language_preservation(user_msg, rl, body, out, translation_applied=translation_applied)
+        return out
+
+    _log_language_preservation(user_msg, rl, body, out, translation_applied=False)
     return text
 
 

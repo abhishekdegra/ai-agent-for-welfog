@@ -173,17 +173,21 @@ def _should_invoke_catalog_menu_classifier(
         "out_of_domain",
     ):
         return False
+    if _suspicious_product_search_for_menu(ai_route):
+        return True
+    if _user_meaning_suggests_catalog_menu(ai_route):
+        return True
     mk = (ai_route.get("meta_kind") or "none").strip().lower()
     if mk in ("conversational", "assistant_intro", "hostile"):
         return False
     scope = (ai_route.get("conversation_scope") or "").strip().lower()
     if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+        if intent in ("general", "product", "category_browse") and ai_route.get(
+            "is_welfog_related", True
+        ) is not False:
+            return True
         return False
-    if _suspicious_product_search_for_menu(ai_route):
-        return True
     if intent == "product" and channel == "catalog" and ai_route.get("run_catalog_search"):
-        return True
-    if _user_meaning_suggests_catalog_menu(ai_route):
         return True
     return False
 
@@ -295,36 +299,46 @@ def resolve_catalog_menu_turn(
     reply_lang: str = "",
     *,
     allow_llm: bool = True,
+    force_llm: bool = False,
 ) -> ResolvedCatalogMenuTurn:
     """
     Priority: brain route → semantic signals → AI micro-classifier → none.
+    force_llm bypasses micro-classifier defer after universal brain routing.
     """
     comb = _combined(original_msg, msg_en)
     if not comb:
         return ResolvedCatalogMenuTurn(kind=KIND_NONE)
 
-    try:
-        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+    if force_llm:
+        try:
+            from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
 
-        if should_skip_micro_classifier_llm():
-            brain = _brain_catalog_menu_resolution(ai_route)
-            if brain:
-                _RESOLVE_CACHE.key = (
-                    f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"
-                    f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}"
+            ensure_product_rescue_llm_slot()
+        except ImportError:
+            pass
+    else:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+            if should_skip_micro_classifier_llm():
+                brain = _brain_catalog_menu_resolution(ai_route)
+                if brain:
+                    _RESOLVE_CACHE.key = (
+                        f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"
+                        f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}|{force_llm}"
+                    )
+                    _RESOLVE_CACHE.result = brain
+                    return brain
+                log_reasoning(
+                    "Catalog-menu: defer/skip — universal brain route owns classification."
                 )
-                _RESOLVE_CACHE.result = brain
-                return brain
-            log_reasoning(
-                "Catalog-menu: defer/skip — universal brain route owns classification."
-            )
-            return ResolvedCatalogMenuTurn(kind=KIND_NONE)
-    except ImportError:
-        pass
+                return ResolvedCatalogMenuTurn(kind=KIND_NONE)
+        except ImportError:
+            pass
 
     cache_key = (
         f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"
-        f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}"
+        f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}|{force_llm}"
     )
     if getattr(_RESOLVE_CACHE, "key", None) == cache_key:
         cached = getattr(_RESOLVE_CACHE, "result", None)
@@ -337,23 +351,27 @@ def resolve_catalog_menu_turn(
         _RESOLVE_CACHE.result = brain
         return brain
 
-    signal = _semantic_signal_catalog_menu(original_msg, msg_en)
-    if signal:
-        _RESOLVE_CACHE.key = cache_key
-        _RESOLVE_CACHE.result = signal
-        return signal
+    if not force_llm:
+        signal = _semantic_signal_catalog_menu(original_msg, msg_en)
+        if signal:
+            _RESOLVE_CACHE.key = cache_key
+            _RESOLVE_CACHE.result = signal
+            return signal
 
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
-        if product_catalog_route_is_locked(ai_route):
+        if product_catalog_route_is_locked(ai_route) and not force_llm:
             _RESOLVE_CACHE.key = cache_key
             _RESOLVE_CACHE.result = ResolvedCatalogMenuTurn(kind=KIND_NONE)
             return ResolvedCatalogMenuTurn(kind=KIND_NONE)
     except ImportError:
         pass
 
-    if allow_llm and _should_invoke_catalog_menu_classifier(ai_route, original_msg, msg_en):
+    invoke_llm = force_llm or (
+        allow_llm and _should_invoke_catalog_menu_classifier(ai_route, original_msg, msg_en)
+    )
+    if invoke_llm:
         classified = ai_classify_catalog_menu_turn(
             original_msg,
             msg_en,
@@ -412,12 +430,14 @@ def _build_route_data_from_resolution(
             data_channel="live_api",
             reasoning="Today's deals / offers on Welfog.",
         )
+        out["run_catalog_search"] = False
     elif resolved.kind == KIND_CATEGORIES_LIST:
         out.update(
             intent="categories",
             data_channel="live_api",
             reasoning="List Welfog shopping categories.",
         )
+        out["run_catalog_search"] = False
     elif resolved.kind == KIND_CATEGORY_BROWSE:
         sq = resolved.search_query or resolved.category_name
         out.update(
@@ -427,7 +447,94 @@ def _build_route_data_from_resolution(
             search_query=sq,
             reasoning=f"Products in category {resolved.category_name or sq}.",
         )
+    out.pop("kb_keys", None)
+    out["is_welfog_related"] = True
+    out["meta_kind"] = "none"
+    out["conversation_scope"] = "welfog_support"
+    out["_turn_promotions_done"] = True
     return out
+
+
+def guard_reconcile_catalog_menu_route(
+    route_data: dict,
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+) -> dict:
+    """
+    Guard: brain JSON first; ONE catalog-menu LLM when misrouted to KB/chitchat/product.
+    Any language — not customer keyword lists.
+    """
+    if not isinstance(route_data, dict):
+        return route_data
+    comb = _combined(original_msg, msg_en)
+    brain_res = _brain_catalog_menu_resolution(route_data)
+    if brain_res:
+        log_reasoning(f"Guard catalog-menu: brain locked {brain_res.kind}.")
+        return _build_route_data_from_resolution(brain_res, comb, route_data)
+
+    needs_ai = (
+        _should_invoke_catalog_menu_classifier(route_data, original_msg, msg_en)
+        or _user_meaning_suggests_catalog_menu(route_data)
+        or _suspicious_product_search_for_menu(route_data)
+    )
+    intent = (route_data.get("intent") or "").strip().lower()
+    channel = (route_data.get("data_channel") or "").strip().lower()
+    if (
+        not needs_ai
+        and channel == "kb"
+        and intent in ("general", "payment", "seller", "refund")
+        and route_data.get("is_welfog_related", True) is not False
+    ):
+        needs_ai = True
+        log_reasoning(
+            "Guard catalog-menu: brain KB channel — verify with catalog-menu LLM."
+        )
+    if (
+        not needs_ai
+        and intent == "general"
+        and (route_data.get("scope_reply") or "").strip()
+        and route_data.get("is_welfog_related", True) is not False
+    ):
+        needs_ai = True
+        log_reasoning(
+            "Guard catalog-menu: brain chitchat reply — verify deals/categories intent."
+        )
+    um_blob = (route_data.get("user_meaning") or "").lower()
+    if (
+        not needs_ai
+        and "categor" in um_blob
+        and intent in ("general", "category_browse", "product", "category_feed")
+    ):
+        needs_ai = True
+        log_reasoning(
+            "Guard catalog-menu: brain meaning mentions categories — verify list vs browse."
+        )
+    if not needs_ai and intent == "category_browse":
+        needs_ai = True
+        log_reasoning(
+            "Guard catalog-menu: category_browse without locked menu — verify via LLM."
+        )
+    if not needs_ai:
+        return route_data
+
+    resolved = resolve_catalog_menu_turn(
+        original_msg,
+        msg_en,
+        conversation_context,
+        ai_route=route_data,
+        reply_lang=reply_lang,
+        allow_llm=True,
+        force_llm=True,
+    )
+    if resolved.kind != KIND_NONE:
+        log_reasoning(
+            f"Guard catalog-menu: AI corrected route → {resolved.kind} "
+            f"(was intent={(route_data.get('intent') or '-')})."
+        )
+        return _build_route_data_from_resolution(resolved, comb, route_data)
+    return route_data
 
 
 def catalog_menu_route_decision(

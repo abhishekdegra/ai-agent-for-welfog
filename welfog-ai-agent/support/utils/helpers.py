@@ -16,6 +16,7 @@ _pin_order_guard = threading.local()
 _pincode_intent_guard = threading.local()
 _pincode_light_guard = threading.local()
 _order_tracking_guard = threading.local()
+_live_order_lookup_guard = threading.local()
 _extract_oid_guard = threading.local()
 _refund_lookup_guard = threading.local()
 
@@ -1719,6 +1720,17 @@ def _text_is_pincode_serviceability_question(t: str, conversation_context: str =
         return False
     if _turn_blocks_pincode_serviceability_routing(raw):
         return False
+    # Fast path — city/PIN serviceability (never KB embed / order classifier chain).
+    if _text_is_delivery_serviceability_hypothetical(raw):
+        return True
+    if not re.search(r"\b[1-9]\d{5}\b", raw):
+        if _text_has_delivery_or_order_area_intent(raw) and not _user_denies_pincode_insists_order_id(
+            raw
+        ):
+            if not _text_has_order_id_context(raw) or _text_has_explicit_pincode_subject(raw):
+                return True
+        if _text_is_pincode_serviceability_question_light(raw):
+            return True
     if message_mentions_wishlist_topic(raw) or _text_asks_how_to_view_wishlist(
         raw, conversation_context
     ):
@@ -1820,6 +1832,8 @@ def _turn_blocks_pincode_serviceability_routing(t: str) -> bool:
         return False
     raw = (t or "").strip()
     if not raw:
+        return False
+    if _text_is_delivery_serviceability_hypothetical(raw):
         return False
     if re.search(r"\b[1-9]\d{5}\b", raw):
         try:
@@ -2363,6 +2377,8 @@ def turn_is_obvious_product_shopping_turn(
         return True
     if _text_has_product_shopping_intent_core(comb):
         return True
+    if _text_is_delivery_serviceability_hypothetical(comb):
+        return False
     return False
 
 
@@ -4096,7 +4112,9 @@ def _text_is_order_tracking_intent_leaf(t: str) -> bool:
             )
         ):
             return False
-    if _text_asks_order_history(raw) or _text_wants_order_history_list_in_chat(raw):
+    if message_is_past_purchase_list_request(raw) or _text_wants_order_history_list_in_chat(
+        raw
+    ):
         return False
     if _text_is_delivery_serviceability_hypothetical(raw):
         return False
@@ -5255,6 +5273,8 @@ def _text_asks_order_history(t: str) -> bool:
     raw = (t or "").strip()
     if not raw:
         return False
+    if message_is_past_purchase_list_request(raw):
+        return True
     if _text_is_live_order_lookup_intent(raw):
         return False
 
@@ -6361,6 +6381,22 @@ def _text_is_live_order_lookup_intent(t: str, conversation_context: str = "") ->
     User pasted/named an Order ID and wants live status/refund/tracking — not history list or placement how-to.
     Lightweight checks only (no extract_order_id) to avoid helper recursion.
     """
+    if getattr(_live_order_lookup_guard, "active", False):
+        return False
+    _live_order_lookup_guard.active = True
+    try:
+        return _text_is_live_order_lookup_intent_impl(t, conversation_context)
+    finally:
+        _live_order_lookup_guard.active = False
+
+
+def _text_is_live_order_lookup_intent_impl(
+    t: str, conversation_context: str = ""
+) -> bool:
+    raw = (t or "").strip()
+    if raw and message_is_past_purchase_list_request(raw):
+        return False
+
     from services.order_details_flow import _lightweight_details_or_invoice_signal
 
     light = (_lightweight_details_or_invoice_signal(t or "") or "").strip()
@@ -7491,6 +7527,9 @@ def _normalize_policy_typos(text: str) -> str:
         ("privcy", "privacy"),
         ("polcy", "policy"),
         ("polici", "policy"),
+        ("shhiping", "shipping"),
+        ("shiping", "shipping"),
+        ("shippng", "shipping"),
     ):
         t = t.replace(typo, fix)
     return t
@@ -8300,6 +8339,14 @@ def message_asks_welfog_social_media(
     tl = f" {_normalize_welfog_typos(turn)} "
     if _text_mentions_welfog_brand(tl):
         if _text_mentions_social_platform(tl) or _text_mentions_kb_social_platform(turn):
+            return True
+    if _text_mentions_social_platform(tl) and re.search(
+        r"\b(?:maang|mang|mangwa|dena|de\s+do|dedo|chahiye|want|need|give|id|link|handle)\b",
+        tl,
+    ):
+        if _text_mentions_welfog_brand(tl) or _conversation_recent_welfog_social(
+            conversation_context
+        ):
             return True
     if _turn_is_catalog_product_request(turn):
         return False

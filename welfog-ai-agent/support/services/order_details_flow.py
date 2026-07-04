@@ -1449,13 +1449,11 @@ def understand_single_order_request(
             from utils.helpers import (
                 _message_looks_like_shopping_query,
                 message_is_wishlist_like_request,
-                message_is_past_purchase_list_request,
             )
 
             if (
                 _message_looks_like_shopping_query(comb)
                 or message_is_wishlist_like_request(comb)
-                or message_is_past_purchase_list_request(comb)
             ):
                 shop_skip = {
                     "goal": "",
@@ -1474,6 +1472,22 @@ def understand_single_order_request(
             pass
 
     if isinstance(ai_route, dict):
+        ai_intent = (ai_route.get("intent") or "").strip().lower()
+        ai_channel = (ai_route.get("data_channel") or "").strip().lower()
+        if ai_intent in ("product", "product_search") or ai_channel == "catalog":
+            skip = {
+                "goal": "",
+                "action": "not_order_topic",
+                "field_focus": "summary",
+                "order_id": "",
+                "confidence": "high",
+                "source": "product_route_intent",
+                "reasoning": "AI route already locked to product/catalog; skip single-order lookup.",
+                "is_welfog_related": True,
+            }
+            _SINGLE_ORDER_CACHE.key = cache_key
+            _SINGLE_ORDER_CACHE.result = skip
+            return skip
         try:
             from services.product_catalog_resolver import product_catalog_route_is_locked
 

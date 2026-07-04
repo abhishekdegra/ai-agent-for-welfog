@@ -344,27 +344,33 @@ if (chat) {
                 setChatIdInUrl(currentChatId);
             }
             if (data.type === "purchase_history_append") {
-                const tail = scrollEl.querySelector(".wf-ph-tail");
-                if (data.cards_html && tail) {
+                const tailInRoot = root.querySelector(".wf-ph-tail");
+                const tailInScroll = scrollEl.querySelector(".wf-ph-tail");
+                if (data.cards_html) {
                     const frag = dedupePurchaseHistoryCards(data.cards_html, scrollEl);
+                    const insertBefore = tailInScroll || null;
                     if (frag.firstChild) {
-                        tail.parentNode.insertBefore(frag, tail);
+                        if (insertBefore) {
+                            insertBefore.parentNode.insertBefore(frag, insertBefore);
+                        } else {
+                            scrollEl.appendChild(frag);
+                        }
                     }
-                } else if (data.cards_html && !tail) {
-                    const frag = dedupePurchaseHistoryCards(data.cards_html, scrollEl);
-                    if (frag.firstChild) scrollEl.appendChild(frag);
                 }
-                const tailOld = scrollEl.querySelector(".wf-ph-tail");
-                if (tailOld) tailOld.remove();
+                if (tailInRoot) tailInRoot.remove();
+                if (tailInScroll) tailInScroll.remove();
                 var newTail = data.tail_html;
                 if (newTail === undefined || newTail === null) {
                     newTail = data.footer_html;
                 }
                 if (newTail) {
-                    scrollEl.insertAdjacentHTML("beforeend", newTail);
+                    root.insertAdjacentHTML("beforeend", newTail);
                 }
                 requestAnimationFrame(function() {
-                    scrollEl.scrollTop = scrollEl.scrollHeight;
+                    const tailBtn = root.querySelector(".wf-ph-more");
+                    if (tailBtn && typeof tailBtn.scrollIntoView === "function") {
+                        tailBtn.scrollIntoView({ block: "nearest", behavior: "smooth" });
+                    }
                 });
             } else if (data.data) {
                 addMessage(data.data, "bot");

@@ -15,6 +15,7 @@ from typing import Any, Callable, Optional
 from utils.reasoning_log import chat_log, log_reasoning
 
 CHAT_MAX_SECONDS = float(os.getenv("CHAT_MAX_SECONDS") or "70")
+GUARD_PRELOCK_MAX_SEC = float(os.getenv("GUARD_PRELOCK_MAX_SEC", "18") or "18")
 CHAT_IN_FLIGHT_STALE_SEC = float(
     os.getenv("CHAT_IN_FLIGHT_STALE_SEC") or "1"
 )
@@ -354,13 +355,15 @@ def run_with_chat_deadline(
     *,
     app,
     deadline_sec: float = CHAT_MAX_SECONDS,
+    force_threaded: bool = False,
 ):
     """
     Wall-clock cap for /chat. Default: synchronous handler (no zombie daemon threads
     contending on encode lock / LLM). Set CHAT_ASYNC_HANDLER=1 for legacy threaded mode.
+    force_threaded=True: always use join(timeout) so guard prelocks cannot block Flask.
     """
     limit = float(deadline_sec or CHAT_MAX_SECONDS)
-    use_async = (os.getenv("CHAT_ASYNC_HANDLER") or "0").strip().lower() in (
+    use_async = force_threaded or (os.getenv("CHAT_ASYNC_HANDLER") or "0").strip().lower() in (
         "1",
         "true",
         "yes",

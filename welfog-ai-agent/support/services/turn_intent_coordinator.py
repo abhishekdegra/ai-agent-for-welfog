@@ -14,7 +14,7 @@ from typing import Optional
 from utils.reasoning_log import log_reasoning
 
 _ACCOUNT_LIST_CACHE = threading.local()
-_AI_CONF_MIN = 0.55
+_AI_CONF_MIN = 0.45
 
 
 def _combined(original_msg: str, msg_en: str = "") -> str:
@@ -72,6 +72,7 @@ def structural_skip_account_list_classifier(
         from utils.helpers import (
             message_is_conversation_reset_command,
             turn_is_catalog_product_lookup,
+            turn_is_obvious_product_shopping_turn,
             _text_is_pincode_serviceability_question,
         )
 
@@ -79,7 +80,27 @@ def structural_skip_account_list_classifier(
             return True
         if turn_is_catalog_product_lookup(original_msg, msg_en):
             return True
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            return True
         if _text_is_pincode_serviceability_question(comb, conversation_context):
+            return True
+    except ImportError:
+        pass
+    try:
+        from services.conversation_followup import is_deals_request_message
+
+        if is_deals_request_message(original_msg, msg_en):
+            return True
+    except ImportError:
+        pass
+    try:
+        from services.knowledge_query_pipeline import _heuristic_informational_signal
+
+        if _heuristic_informational_signal(
+            original_msg, msg_en, conversation_context
+        ):
             return True
     except ImportError:
         pass
@@ -162,6 +183,76 @@ def get_account_list_ai_classification(
     return result
 
 
+_ACCOUNT_LIST_BLOCK_PRODUCT_MIN_CONF = 0.42
+
+
+def account_list_ai_blocks_product_path(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    *,
+    ai_route: dict | None = None,
+) -> bool:
+    """
+    Account-list micro-LLM classified purchase history or wishlist — product catalog
+    must not run (any language/script; no customer keyword lists).
+    """
+    classified = get_account_list_ai_classification(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang,
+        ai_route=ai_route,
+    )
+    if not classified:
+        return False
+    try:
+        from services.account_list_semantics import KIND_NONE
+    except ImportError:
+        return False
+    kind = (classified.get("account_list_kind") or KIND_NONE).strip().lower()
+    conf = float(classified.get("confidence") or 0.0)
+    if kind == KIND_NONE or conf < _ACCOUNT_LIST_BLOCK_PRODUCT_MIN_CONF:
+        return False
+    return kind in (
+        "purchase_history_in_chat",
+        "purchase_history_howto",
+        "wishlist_in_chat",
+        "wishlist_howto",
+    )
+
+
+def account_list_ai_is_live_list_turn(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    *,
+    ai_route: dict | None = None,
+    min_conf: float = _ACCOUNT_LIST_BLOCK_PRODUCT_MIN_CONF,
+) -> bool:
+    """Cached account-list micro-LLM — show MY orders/wishlist in chat (any language)."""
+    classified = get_account_list_ai_classification(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang,
+        ai_route=ai_route,
+    )
+    if not classified:
+        return False
+    try:
+        from services.account_list_semantics import KIND_NONE
+    except ImportError:
+        return False
+    kind = (classified.get("account_list_kind") or KIND_NONE).strip().lower()
+    conf = float(classified.get("confidence") or 0.0)
+    if kind == KIND_NONE or conf < min_conf:
+        return False
+    return kind in ("purchase_history_in_chat", "wishlist_in_chat")
+
+
 def resolve_account_list_action_ai_first(
     original_msg: str,
     msg_en: str = "",
@@ -234,7 +325,12 @@ def resolve_account_list_action_ai_first(
             }
 
     if strict_llm_failsafe_enabled() and classified is not None:
-        return empty
+        kind_llm = _norm_account_list_kind(
+            classified.get("account_list_kind") or KIND_NONE
+        )
+        # LLM picked a live-list kind but below confidence — do not keyword-override.
+        if kind_llm != KIND_NONE:
+            return empty
 
     comb = _combined(original_msg, msg_en)
     kw = _keyword_resolve_account_list_action(comb, conversation_context, None)
@@ -368,24 +464,28 @@ def get_kb_turn_ai_classification(
     reply_lang: str = "",
     *,
     ai_route: dict | None = None,
+    preflight: bool = False,
 ) -> Optional[dict]:
     """One micro-LLM per turn — cached for knowledge fast path + refund guard."""
-    key = _turn_cache_key(original_msg, msg_en, conversation_context, reply_lang, "kb_turn")
+    key = _turn_cache_key(
+        original_msg, msg_en, conversation_context, reply_lang, "kb_turn"
+    )
     if getattr(_KB_TURN_CACHE, "key", None) == key:
         cached = getattr(_KB_TURN_CACHE, "result", None)
         if cached is not None:
             return cached
 
-    try:
-        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+    if not preflight:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
 
-        if should_skip_micro_classifier_llm():
-            log_reasoning("KB-turn: defer/skip — universal brain route owns classification.")
-            _KB_TURN_CACHE.key = key
-            _KB_TURN_CACHE.result = None
-            return None
-    except ImportError:
-        pass
+            if should_skip_micro_classifier_llm():
+                log_reasoning("KB-turn: defer/skip — universal brain route owns classification.")
+                _KB_TURN_CACHE.key = key
+                _KB_TURN_CACHE.result = None
+                return None
+        except ImportError:
+            pass
 
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
@@ -428,15 +528,105 @@ def get_kb_turn_ai_classification(
     if route:
         ch = (route.get("data_channel") or "").strip().lower()
         scope = (route.get("conversation_scope") or "").strip().lower()
-        if ch in ("live_api", "catalog") or scope in (
+        if scope in (
             "general_chitchat",
             "out_of_domain",
             "harm_sensitive",
         ):
-            log_reasoning("KB-turn: brain already routed — skip micro-LLM.")
+            log_reasoning("KB-turn: brain scope chitchat/OOD — skip micro-LLM.")
             _KB_TURN_CACHE.key = key
             _KB_TURN_CACHE.result = None
             return None
+        try:
+            from services.ai_route_semantics import (
+                brain_route_indicates_informational_kb,
+                brain_route_prefers_kb_answer,
+            )
+            from services.knowledge_query_pipeline import (
+                kb_embedding_indicates_informational_turn,
+            )
+
+            if brain_route_indicates_informational_kb(
+                route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
+            ):
+                keys = list(route.get("kb_keys") or [])
+                um = (route.get("user_meaning") or "").strip()
+                if not keys and brain_route_prefers_kb_answer(route):
+                    keys = list(route.get("kb_keys") or [])
+                topic = keys[0] if keys else "general_faq"
+                result = {
+                    "is_informational_kb": True,
+                    "needs_live_api": False,
+                    "confidence": 0.88,
+                    "kb_topic": topic,
+                    "user_meaning_en": um,
+                    "source": "ai_brain_route",
+                }
+                log_reasoning(
+                    "KB-turn: brain JSON / embedding informational — skip micro-LLM."
+                )
+                _KB_TURN_CACHE.key = key
+                _KB_TURN_CACHE.result = result
+                return result
+            if ch == "catalog" and kb_embedding_indicates_informational_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=route,
+            ):
+                um = (route.get("user_meaning") or "").strip()
+                result = {
+                    "is_informational_kb": True,
+                    "needs_live_api": False,
+                    "confidence": 0.85,
+                    "kb_topic": "general_faq",
+                    "user_meaning_en": um,
+                    "source": "kb_embedding",
+                }
+                log_reasoning(
+                    "KB-turn: admin embedding — brain catalog misroute corrected."
+                )
+                _KB_TURN_CACHE.key = key
+                _KB_TURN_CACHE.result = result
+                return result
+        except ImportError:
+            pass
+        if ch == "live_api":
+            log_reasoning("KB-turn: brain live_api — skip micro-LLM.")
+            _KB_TURN_CACHE.key = key
+            _KB_TURN_CACHE.result = None
+            return None
+        if ch == "catalog":
+            try:
+                from services.product_catalog_resolver import (
+                    product_catalog_route_is_locked,
+                )
+                from utils.helpers import turn_is_obvious_product_shopping_turn
+
+                pe = route.get("_product_entities") or route.get("product_entities") or {}
+                has_pe = isinstance(pe, dict) and any(
+                    v not in (None, "", [], {}) for v in pe.values()
+                )
+                if turn_is_obvious_product_shopping_turn(
+                    original_msg, msg_en, conversation_context
+                ) or (product_catalog_route_is_locked(route) and has_pe):
+                    log_reasoning(
+                        "KB-turn: brain catalog + shopping — skip micro-LLM."
+                    )
+                    _KB_TURN_CACHE.key = key
+                    _KB_TURN_CACHE.result = None
+                    return None
+                log_reasoning(
+                    "KB-turn: brain catalog but FAQ semantic — run micro-LLM."
+                )
+            except ImportError:
+                log_reasoning("KB-turn: brain catalog — skip micro-LLM.")
+                _KB_TURN_CACHE.key = key
+                _KB_TURN_CACHE.result = None
+                return None
         if ch == "kb" and route.get("kb_keys"):
             keys = list(route.get("kb_keys") or [])
             um = (route.get("user_meaning") or "").strip()
@@ -462,6 +652,7 @@ def get_kb_turn_ai_classification(
             conversation_context,
             reply_lang=reply_lang,
             ai_route=ai_route,
+            preflight=preflight,
         )
     except ImportError:
         result = None
@@ -486,6 +677,38 @@ def kb_turn_is_informational(
     )
 
 
+def peek_or_classify_kb_turn(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "",
+    *,
+    preflight: bool = True,
+) -> dict | None:
+    """One cached KB-turn classification per message (preflight bypasses brain defer)."""
+    peeked = peek_kb_turn_classification(
+        original_msg, msg_en, conversation_context, reply_lang
+    )
+    if peeked is not _KB_CACHE_UNSET:
+        return peeked
+    return get_kb_turn_ai_classification(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang,
+        preflight=preflight,
+    )
+
+
+def kb_turn_blocks_product_catalog(
+    classified: dict | None,
+    *,
+    min_conf: float = 0.42,
+) -> bool:
+    """True when KB micro-LLM locked an informational FAQ/policy turn."""
+    return kb_turn_is_informational(classified, min_conf=min_conf)
+
+
 def resolve_kb_turn_ai_first(
     original_msg: str,
     msg_en: str = "",
@@ -494,6 +717,7 @@ def resolve_kb_turn_ai_first(
     ctx: dict | None = None,
     *,
     ai_route: dict | None = None,
+    preflight: bool = False,
 ) -> dict:
     """
     AI-first: should this turn be answered from KB (any language)?
@@ -513,8 +737,24 @@ def resolve_kb_turn_ai_first(
     ):
         return empty
 
+    try:
+        if account_list_ai_is_live_list_turn(
+            original_msg, msg_en, conversation_context, reply_lang, ai_route=ai_route
+        ):
+            log_reasoning(
+                "KB turn skipped — account-list AI classified live orders/wishlist API."
+            )
+            return empty
+    except ImportError:
+        pass
+
     classified = get_kb_turn_ai_classification(
-        original_msg, msg_en, conversation_context, reply_lang, ai_route=ai_route
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang,
+        ai_route=ai_route,
+        preflight=preflight,
     )
     if kb_turn_is_informational(classified):
         topic = (classified.get("kb_topic") or "general_faq").strip().lower()

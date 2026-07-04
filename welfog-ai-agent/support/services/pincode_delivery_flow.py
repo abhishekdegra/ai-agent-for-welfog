@@ -522,7 +522,10 @@ def run_delivery_location_check(
     from services.welfog_api import check_pincode_delivery
 
     rl = reply_lang or "en"
-    if not turn_requests_delivery_serviceability(
+    locked = bool(
+        isinstance(ai_route, dict) and ai_route.get("_pincode_delivery_locked")
+    )
+    if not locked and not turn_requests_delivery_serviceability(
         original_msg,
         msg_en,
         conversation_context,
@@ -532,6 +535,7 @@ def run_delivery_location_check(
         return OrderFlowResult(handled=False)
 
     from services.location_delivery_resolver import (
+        DeliveryTurnUnderstanding,
         resolve_delivery_turn,
         should_ask_user_for_pincode,
     )
@@ -553,19 +557,20 @@ def run_delivery_location_check(
         allow_llm=allow_llm,
     )
     if loc.kind == "ask_pin":
+        in_delivery_flow = locked or understood.is_serviceability or understood.is_area_followup
         if not should_ask_user_for_pincode(
             understood,
             original_msg,
             msg_en,
             conversation_context,
             loc=loc,
-        ):
+        ) and not in_delivery_flow:
             log_reasoning(
                 "Delivery: skip PIN prompt — not incomplete/vague/unresolvable."
             )
             return OrderFlowResult(handled=False)
         body = build_pincode_missing_or_invalid_reply(
-            original_msg, msg_en, conversation_context, reply_lang=rl, allow_ai=allow_llm
+            original_msg, msg_en, conversation_context, reply_lang=rl, allow_ai=False
         )
         if body:
             return OrderFlowResult(handled=True, reply_html=body, intent="pincode_check")

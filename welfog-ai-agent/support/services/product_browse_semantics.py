@@ -436,17 +436,6 @@ def ai_route_is_product_browse_turn(
     if _hard_exclude_browse(comb):
         return False
 
-    if not _from_resolver:
-        try:
-            from services.product_catalog_resolver import turn_requests_product_catalog
-
-            if turn_requests_product_catalog(
-                original_msg, msg_en, "", ai_route=r, allow_llm=True
-            ):
-                return True
-        except ImportError:
-            pass
-
     try:
         from utils.helpers import _text_has_product_shopping_intent_core, _turn_is_catalog_product_request
 
@@ -456,6 +445,17 @@ def ai_route_is_product_browse_turn(
         pass
     if _keyword_failsafe_browse(comb):
         return True
+
+    if not _from_resolver:
+        try:
+            from services.product_catalog_resolver import turn_requests_product_catalog
+
+            if turn_requests_product_catalog(
+                original_msg, msg_en, "", ai_route=r, allow_llm=False
+            ):
+                return True
+        except ImportError:
+            pass
 
     intent = (r.get("intent") or "").strip().lower()
     channel = (r.get("data_channel") or "").strip().lower()

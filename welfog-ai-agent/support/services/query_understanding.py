@@ -300,7 +300,7 @@ def top_customer_kb_file_match(
     Returns (file_key, score); empty key when no confident match.
     """
     try:
-        from services.kb_service import best_kb_hit, get_customer_kb_keys
+        from services.kb_service import get_customer_kb_keys, rank_customer_kb_files_by_embedding
     except ImportError:
         return "", 0.0
 
@@ -330,10 +330,12 @@ def top_customer_kb_file_match(
     ]
     if not keys:
         return "", 0.0
-    hit = best_kb_hit(query, keys=keys, min_score=min_score)
-    if not hit:
+    ranked = rank_customer_kb_files_by_embedding(
+        query, keys=keys, min_score=min_score, top_n=1
+    )
+    if not ranked:
         return "", 0.0
-    return str(hit.get("source") or "").strip(), float(hit.get("score") or 0.0)
+    return ranked[0][0], float(ranked[0][1])
 
 
 def infer_kb_query_category(
@@ -397,7 +399,9 @@ def scoped_kb_keys_for_retrieval(
         if scoped:
             return scoped
 
-    allow = _INTENT_KB_HINTS.get(cat) or _INTENT_KB_HINTS.get("general") or frozenset()
+    if cat in ("", "general"):
+        return list(customer)
+    allow = _INTENT_KB_HINTS.get(cat) or frozenset()
     scoped = [k for k in customer if k in allow or any(h in k.lower() for h in allow)]
     return scoped if scoped else list(customer)
 

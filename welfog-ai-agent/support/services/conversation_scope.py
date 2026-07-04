@@ -255,7 +255,7 @@ def ai_classify_scope_and_reply(
     from services.translation_service import language_reply_instruction, resolve_customer_reply_lang
 
     comb = _combined(original_msg, msg_en)
-    if not comb or (not preflight and _has_definite_welfog_shopping_signal(comb)):
+    if not comb:
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)

@@ -1014,7 +1014,15 @@ html, body {
     position: relative;
 }
 
-.msg .wf-ph-tail {
+.msg .wf-ph-root > .wf-ph-tail {
+    padding: 14px 4px 4px;
+    margin-top: 10px;
+    border-top: 1px solid rgba(0, 0, 0, 0.06);
+    text-align: center;
+    flex-shrink: 0;
+}
+
+.msg .wf-ph-scroll .wf-ph-tail {
     padding: 14px 4px 8px;
     margin-top: 6px;
     border-top: 1px solid rgba(0, 0, 0, 0.06);
@@ -1022,7 +1030,8 @@ html, body {
     flex-shrink: 0;
 }
 
-[data-theme="dark"] .msg .wf-ph-tail {
+[data-theme="dark"] .msg .wf-ph-root > .wf-ph-tail,
+[data-theme="dark"] .msg .wf-ph-scroll .wf-ph-tail {
     border-top-color: rgba(255, 255, 255, 0.1);
 }
 

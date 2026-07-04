@@ -35,6 +35,7 @@ def try_knowledge_fast_reply(
         conversation_context,
         reply_lang,
         ctx=None,
+        preflight=True,
     )
     if resolved.get("action") != "answer_kb":
         return None

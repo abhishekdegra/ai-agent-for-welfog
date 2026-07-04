@@ -411,6 +411,20 @@ _ROUTE_HANDLER_TO_INTENT: dict[str, str] = {
     "order_details_api": "order",
     "refund_status_api": "refund",
     "pincode_delivery_api": "pincode_check",
+    "deals_api": "deals",
+    "categories_api": "categories",
+    "category_feed_api": "category_feed",
+}
+
+_INTENT_ALIAS_TO_SCHEMA: dict[str, str] = {
+    "catalog_deals": "deals",
+    "deals_today": "deals",
+    "top_deals": "deals",
+    "today_deals": "deals",
+    "catalog_categories": "categories",
+    "category_list": "categories",
+    "category_count": "categories",
+    "categories_list": "categories",
 }
 
 
@@ -421,6 +435,42 @@ def _coerce_brain_intent_to_schema(out: dict) -> dict:
     """
     intent = (out.get("intent") or "").strip().lower()
     if intent in _VALID_BRAIN_INTENTS:
+        return out
+
+    alias = _INTENT_ALIAS_TO_SCHEMA.get(intent)
+    if alias:
+        log_reasoning(
+            f"Brain schema reconcile — intent alias {intent!r} → {alias!r}."
+        )
+        out["intent"] = alias
+        if alias in ("deals", "categories", "category_feed"):
+            out.setdefault("data_channel", "live_api")
+            out["run_catalog_search"] = False
+            out["needs_order_id"] = False
+            out.setdefault(
+                "route_handler",
+                "deals_api" if alias == "deals" else "categories_api",
+            )
+        return out
+
+    if "deal" in intent:
+        log_reasoning(f"Brain schema reconcile — compound intent {intent!r} → deals.")
+        out["intent"] = "deals"
+        out.setdefault("data_channel", "live_api")
+        out["run_catalog_search"] = False
+        out["needs_order_id"] = False
+        out.setdefault("route_handler", "deals_api")
+        return out
+
+    if "categor" in intent:
+        log_reasoning(
+            f"Brain schema reconcile — compound intent {intent!r} → categories."
+        )
+        out["intent"] = "categories"
+        out.setdefault("data_channel", "live_api")
+        out["run_catalog_search"] = False
+        out["needs_order_id"] = False
+        out.setdefault("route_handler", "categories_api")
         return out
 
     alk = (out.get("account_list_kind") or "none").strip().lower()
@@ -904,12 +954,264 @@ _CATALOG_BLOCK_IN_BRAIN_BLOB = (
     "out of domain",
     "off-topic",
     "off topic",
+    "today's deal",
+    "todays deal",
+    "top deal",
+    "flash sale",
+    "deal of the day",
+    "how many categor",
+    "number of categor",
+    "categories on welfog",
+    "category list",
+    "what does welfog",
+    "customer care",
+    "contact support",
+    "contact welfog",
 )
+
+_DEALS_MEANING_MARKERS = (
+    "today's deal",
+    "todays deal",
+    "top deal",
+    "today deal",
+    "flash sale",
+    "deal of the day",
+    "show deals",
+    "best deals",
+    "daily deal",
+    "offers and discount",
+)
+
+_CATEGORIES_MEANING_MARKERS = (
+    "how many categor",
+    "number of categor",
+    "categories on welfog",
+    "welfog categor",
+    "list of categor",
+    "category list",
+    "shop categor",
+    "departments on welfog",
+    "browse categor",
+    "count categor",
+)
+
+def brain_turn_indicates_welfog_kb(route: dict | None) -> bool:
+    """Brain JSON already chose KB (channel/kb_keys/route_handler) — no keyword lists."""
+    return brain_route_prefers_kb_answer(route)
+
+
+def brain_route_indicates_informational_kb(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> bool:
+    """
+    Brain JSON or admin KB embeddings lock FAQ — not product catalog.
+    Never uses customer-text or user_meaning keyword lists.
+    """
+    if not isinstance(route, dict):
+        return False
+    scope = coerce_route_str(route.get("conversation_scope")).lower()
+    if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+        return False
+    if (route.get("intent") or "").strip().lower() == "out_of_domain":
+        return False
+    if route.get("is_welfog_related") is False:
+        return False
+    intent = (route.get("intent") or "").strip().lower()
+    channel = (route.get("data_channel") or "").strip().lower()
+    if intent == "product" and channel in ("catalog", ""):
+        return False
+    if route.get("run_catalog_search") is True:
+        return False
+    if _brain_route_has_shopping_entities(route):
+        return False
+    entities = route.get("_product_entities") or route.get("product_entities") or {}
+    if isinstance(entities, dict) and any(
+        v not in (None, "", [], {}) for v in entities.values()
+    ):
+        return False
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(route):
+            return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            return False
+    except ImportError:
+        pass
+    if brain_route_prefers_kb_answer(route):
+        return True
+    if original_msg or msg_en:
+        try:
+            from services.knowledge_query_pipeline import (
+                kb_embedding_indicates_informational_turn,
+            )
+
+            if kb_embedding_indicates_informational_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=route,
+            ):
+                return True
+        except ImportError:
+            pass
+    return False
 
 
 def _brain_meaning_blob(route: dict | None) -> str:
     r = route or {}
     return f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip().lower()
+
+
+def brain_turn_indicates_deals(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    if not isinstance(route, dict):
+        return False
+    intent = (route.get("intent") or "").strip().lower()
+    if intent in ("deals",):
+        return True
+    if "deal" in intent:
+        return True
+    blob = _brain_meaning_blob(route)
+    if any(m in blob for m in _DEALS_MEANING_MARKERS):
+        return True
+    sq = (route.get("search_query") or "").strip().lower()
+    if sq and re.search(r"\bdeals?\b", sq) and not re.search(
+        r"\b(?:cover|shirt|shoes|mobile|phone|jeans)\b", sq
+    ):
+        return True
+    if original_msg or msg_en:
+        try:
+            from services.conversation_followup import is_deals_request_message
+
+            return is_deals_request_message(original_msg, msg_en)
+        except ImportError:
+            pass
+    return False
+
+
+def brain_turn_indicates_categories(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    if not isinstance(route, dict):
+        return False
+    intent = (route.get("intent") or "").strip().lower()
+    if intent in ("categories", "category_feed"):
+        return True
+    blob = _brain_meaning_blob(route)
+    if any(m in blob for m in _CATEGORIES_MEANING_MARKERS):
+        return True
+    if original_msg or msg_en:
+        try:
+            from utils.helpers import message_asks_welfog_categories_list
+
+            comb = f"{original_msg or ''} {msg_en or ''}".strip()
+            return message_asks_welfog_categories_list(comb)
+        except ImportError:
+            pass
+    return False
+
+
+def brain_route_prefers_kb_answer(route: dict | None) -> bool:
+    """Brain already chose knowledge-base answer — do not re-run delivery micro-classifiers."""
+    if not isinstance(route, dict):
+        return False
+    ch = coerce_route_str(route.get("data_channel")).lower()
+    if ch == "kb":
+        return True
+    if route.get("kb_keys"):
+        return True
+    rh = coerce_route_str(route.get("route_handler")).lower()
+    if rh in ("kb", "knowledge", "faq", "faqs", "kb_search"):
+        return True
+    if route.get("_preflight_kb"):
+        return True
+    return False
+
+
+def reconcile_deals_from_brain_meaning(route: dict | None) -> dict:
+    out = dict(route or {})
+    out["intent"] = "deals"
+    out["data_channel"] = "live_api"
+    out["route_handler"] = "deals_api"
+    out["run_catalog_search"] = False
+    out["needs_order_id"] = False
+    out["search_query"] = ""
+    out["conversation_scope"] = "welfog_support"
+    out["is_welfog_related"] = True
+    out["scope_reply"] = ""
+    out["meta_kind"] = "none"
+    out.pop("_product_catalog_locked", None)
+    out.pop("_product_entities", None)
+    return out
+
+
+def reconcile_categories_from_brain_meaning(route: dict | None) -> dict:
+    out = dict(route or {})
+    out["intent"] = "categories"
+    out["data_channel"] = "live_api"
+    out["route_handler"] = "categories_api"
+    out["run_catalog_search"] = False
+    out["needs_order_id"] = False
+    out["search_query"] = ""
+    out["conversation_scope"] = "welfog_support"
+    out["is_welfog_related"] = True
+    out["scope_reply"] = ""
+    out["meta_kind"] = "none"
+    out.pop("_product_catalog_locked", None)
+    return out
+
+
+def reconcile_welfog_kb_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    out = dict(route or {})
+    out["intent"] = "general"
+    out["data_channel"] = "kb"
+    out["conversation_scope"] = "welfog_support"
+    out["is_welfog_related"] = True
+    out["run_catalog_search"] = False
+    out["needs_order_id"] = False
+    out["scope_reply"] = ""
+    out["meta_kind"] = "none"
+    keys = [k for k in (out.get("kb_keys") or []) if k]
+    if not keys:
+        try:
+            from services.kb_service import resolve_brain_kb_keys
+
+            keys = resolve_brain_kb_keys(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context=conversation_context,
+                ai_route=out,
+            )
+        except ImportError:
+            keys = []
+    out["kb_keys"] = keys
+    return out
 
 
 def _brain_product_name_is_noisy(name: str, route: dict | None = None) -> bool:
@@ -1450,10 +1752,15 @@ def _brain_product_entities_from_route(
     return ent
 
 
-def _catalog_search_query_from_brain_route(route: dict | None) -> str:
+def _catalog_search_query_from_brain_route(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> str:
     """English product-type search terms from ai_brain_route JSON only."""
     r = route or {}
-    ent = _brain_product_entities_from_route(r)
+    ent = _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en)
     if not ent and isinstance(r.get("_product_entities"), dict):
         ent = dict(r["_product_entities"])
 
@@ -1471,9 +1778,22 @@ def _catalog_search_query_from_brain_route(route: dict | None) -> str:
     def _norm(s: str) -> str:
         return (s or "").lower().strip()
 
-    candidates: list[str] = []
+    try:
+        from services.product_query_understanding import extract_focused_product_query
+
+        focused = extract_focused_product_query(
+            original_msg or (r.get("user_meaning") or ""),
+            msg_en or (r.get("user_meaning") or ""),
+        )
+        if focused and len(focused.strip()) >= 2:
+            return focused.strip()[:120]
+    except ImportError:
+        focused = ""
+
     if pn and pn.lower() not in ("products", "product"):
-        candidates.append(pn)
+        return pn[:120]
+
+    candidates: list[str] = []
     if sq:
         candidates.append(sq)
     if pi and _norm(pi) not in _norm(pn) and pi.lower() not in (
@@ -1482,14 +1802,18 @@ def _catalog_search_query_from_brain_route(route: dict | None) -> str:
         "search",
         "shop",
     ):
-        candidates.append(f"{pn} {pi}".strip() if pn else pi)
+        candidates.append(pi)
     if model and _norm(model) not in _norm(pn) and _norm(model) not in _norm(sq):
-        candidates.append(f"{pn} {model}".strip() if pn else model)
+        candidates.append(model)
     if related_s and _norm(related_s) not in _norm(pn):
         candidates.append(related_s)
 
     if candidates:
-        return max(candidates, key=lambda x: (len(x.split()), len(x)))[:120]
+        def _cand_rank(c: str) -> tuple:
+            words = len((c or "").split())
+            return (words if words <= 5 else 25, len(c or ""))
+
+        return min(candidates, key=_cand_rank)[:120]
 
     um = (r.get("user_meaning") or "").strip()
     if not um:
@@ -1549,6 +1873,10 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
     """
     if not isinstance(route, dict):
         return False
+    if brain_route_prefers_kb_answer(route):
+        return False
+    if (route.get("data_channel") or "").strip().lower() == "kb":
+        return False
     if ai_meaning_describes_delivery_serviceability(route):
         return False
     try:
@@ -1567,6 +1895,11 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
         pass
     intent = (route.get("intent") or "").strip().lower()
     channel = (route.get("data_channel") or "").strip().lower()
+    if intent == "category_browse" and not (route.get("category_browse") or "").strip():
+        if not (route.get("search_query") or "").strip() and not route.get("run_catalog_search"):
+            return False
+    if intent in ("categories", "category_feed"):
+        return False
     if intent in ("order", "refund", "order_history", "wishlist", "pincode_check", "delivery"):
         return False
     if channel == "live_api" or route.get("needs_order_id"):
@@ -1586,8 +1919,18 @@ def brain_route_indicates_product_catalog(route: dict | None) -> bool:
     if any(b in blob for b in _CATALOG_BLOCK_IN_BRAIN_BLOB):
         return False
     sq = (route.get("search_query") or "").strip()
-    if sq and intent not in ("order", "refund", "wishlist", "order_history", "pincode_check"):
-        return True
+    if sq:
+        if intent in ("order", "refund", "wishlist", "order_history", "pincode_check"):
+            return False
+        if intent == "product" or route.get("run_catalog_search") is True:
+            return True
+        if intent in ("general", "refund", "payment", "seller") and not route.get(
+            "run_catalog_search"
+        ):
+            return False
+        if channel == "catalog":
+            return True
+        return False
     if any(p in blob for p in _CATALOG_INTENT_IN_BRAIN_BLOB):
         return True
     if "product" in blob and any(
@@ -1679,6 +2022,8 @@ def reconcile_product_catalog_from_brain_meaning(
     Trust ai_brain_route JSON (user_meaning, search_query, entities) — not customer keywords.
     """
     out = dict(route or {})
+    if brain_route_indicates_informational_kb(out):
+        return out
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
@@ -1694,6 +2039,12 @@ def reconcile_product_catalog_from_brain_meaning(
             return out
     except ImportError:
         pass
+    if brain_turn_indicates_deals(out, original_msg=original_msg, msg_en=msg_en):
+        return reconcile_deals_from_brain_meaning(out)
+    if brain_turn_indicates_categories(
+        out, original_msg=original_msg, msg_en=msg_en
+    ):
+        return reconcile_categories_from_brain_meaning(out)
     if ai_meaning_describes_delivery_serviceability(out):
         return out
     if original_msg or msg_en:
@@ -1726,7 +2077,9 @@ def reconcile_product_catalog_from_brain_meaning(
     ent = _brain_product_entities_from_route(out, original_msg=original_msg, msg_en=msg_en)
     if ent:
         out["_product_entities"] = ent
-    sq = _catalog_search_query_from_brain_route(out)
+    sq = _catalog_search_query_from_brain_route(
+        out, original_msg=original_msg, msg_en=msg_en
+    )
     out["intent"] = "product"
     out["data_channel"] = "catalog"
     out["run_catalog_search"] = True
@@ -2125,6 +2478,31 @@ def _structural_track_goal_from_message(
     return ""
 
 
+def _message_is_personal_order_tracking_without_id(
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    """Personal track/ETA/not-arrived — no order id in text (brain enrich → ask id)."""
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb or re.search(r"\b\d{4,20}\b", comb):
+        return False
+    try:
+        from utils.helpers import (
+            _text_is_order_tracking_intent_leaf,
+            _text_is_undelivered_order_complaint,
+            message_is_general_delivery_policy_question,
+        )
+
+        if message_is_general_delivery_policy_question(comb):
+            return False
+        return bool(
+            _text_is_order_tracking_intent_leaf(comb)
+            or _text_is_undelivered_order_complaint(comb)
+        )
+    except ImportError:
+        return False
+
+
 def reconcile_structural_order_sub_intent_from_tracking_message(
     route: dict | None,
     *,
@@ -2142,6 +2520,10 @@ def reconcile_structural_order_sub_intent_from_tracking_message(
         if olk in ("invoice", "refund_status", "details", "order_details"):
             return out
     structural = _structural_track_goal_from_message(original_msg, msg_en)
+    if structural != "track" and _message_is_personal_order_tracking_without_id(
+        original_msg, msg_en
+    ):
+        structural = "track"
     if structural != "track":
         return out
     olk = (out.get("order_lookup_kind") or "none").strip().lower()
@@ -2358,18 +2740,15 @@ def resolve_order_live_goal_for_turn(
         except ImportError:
             pass
         try:
-            from services.semantic_intent import zero_llm_intent_guess_allowed
+            from utils.helpers import (
+                _text_is_order_tracking_intent_leaf,
+                _text_is_undelivered_order_complaint,
+            )
 
-            if zero_llm_intent_guess_allowed():
-                from utils.helpers import (
-                    _text_is_order_tracking_intent_leaf,
-                    _text_is_undelivered_order_complaint,
-                )
-
-                if _text_is_order_tracking_intent_leaf(
-                    comb
-                ) or _text_is_undelivered_order_complaint(comb):
-                    return "track"
+            if _text_is_order_tracking_intent_leaf(
+                comb
+            ) or _text_is_undelivered_order_complaint(comb):
+                return "track"
         except ImportError:
             pass
 

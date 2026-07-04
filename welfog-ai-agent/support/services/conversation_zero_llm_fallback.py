@@ -214,6 +214,52 @@ def try_embedding_kb_only_reply(
     return None
 
 
+def try_lightweight_conversational_reply(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    *,
+    reply_lang: str = "",
+    ctx: dict | None = None,
+) -> Optional[str]:
+    """
+    Scope AI reply when KB/API miss — any language/spelling, no keyword lists.
+    """
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+
+    try:
+        from services.conversation_scope import _has_definite_welfog_shopping_signal
+
+        if _has_definite_welfog_shopping_signal(comb):
+            return None
+    except ImportError:
+        pass
+
+    try:
+        from services.chitchat_resolver import try_scope_ai_early_reply
+
+        scope_hit = try_scope_ai_early_reply(
+            original_msg,
+            msg_en,
+            conversation_context or "",
+            reply_lang=reply_lang,
+            preflight=False,
+        )
+        if scope_hit:
+            body, _route = scope_hit
+            if body and body.strip():
+                log_reasoning(
+                    "Lightweight conversational reply — scope AI (deadline/KB miss)."
+                )
+                return body
+    except ImportError:
+        pass
+
+    return None
+
+
 def try_zero_llm_customer_reply(
     original_msg: str,
     msg_en: str = "",
@@ -221,11 +267,22 @@ def try_zero_llm_customer_reply(
     *,
     reply_lang: str = "",
     ai_route: dict | None = None,
+    ctx: dict | None = None,
 ) -> Optional[str]:
     """Semantic KB + chitchat + polite OOD — no routing LLM."""
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
         return None
+
+    conv_body = try_lightweight_conversational_reply(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang=reply_lang,
+        ctx=ctx,
+    )
+    if conv_body:
+        return conv_body
 
     if _zero_llm_kb_turn_blocked(
         original_msg, msg_en, conversation_context, ai_route=ai_route
