@@ -950,24 +950,6 @@ def _try_brain_first_chat_turn(
         conv_for_llm=conv_for_llm,
         chat_id=chat_id,
     )
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "H5",
-            "chat_routes.py:try_brain_first",
-            "early_brain_elapsed",
-            {
-                "elapsed_ms": int((time.perf_counter() - t_early) * 1000),
-                "hit": bool(body and str(body).strip()),
-                "intent": (route or {}).get("intent") if isinstance(route, dict) else None,
-                "msg_preview": (original_msg or "")[:80],
-            },
-        )
-    except ImportError:
-        pass
-    # #endregion
     if body:
         try:
             from services.chat_flow_telemetry import record_phase
@@ -1626,23 +1608,6 @@ def _fast_guard_ood_template_reply(
         )
         if body and str(body).strip():
             log_reasoning(f"Scope AI reply ({scope_l}) — no static template.")
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H9",
-                    "chat_routes.py:_fast_guard_ood_template_reply",
-                    "ai_scope_reply",
-                    {
-                        "scope": scope_l,
-                        "reply_len": len(str(body)),
-                        "msg_preview": (original_msg or "")[:60],
-                    },
-                )
-            except ImportError:
-                pass
-            # #endregion
             return str(body)
     except ImportError:
         pass
@@ -1673,19 +1638,6 @@ def _fast_guard_ood_template_reply(
             )
             tpl = sysmsg(key) or sysmsg("out_of_domain") or ""
         out = finalize_customer_reply(tpl, original_msg, rl) if tpl else ""
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H9",
-                "chat_routes.py:_fast_guard_ood_template_reply",
-                "template_fallback",
-                {"scope": scope_l, "msg_preview": (original_msg or "")[:60]},
-            )
-        except ImportError:
-            pass
-        # #endregion
         return out
     except ImportError:
         return ""
@@ -1774,19 +1726,6 @@ def _try_guard_account_list_fallback_dispatch(
             reset_context_fn=reset_context,
         )
         if body and str(body).strip():
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "B",
-                    "chat_routes.py:guard_dispatch",
-                    "account_fallback_hit",
-                    {"msg_preview": (original_msg or "")[:80]},
-                )
-            except ImportError:
-                pass
-            # #endregion
             log_reasoning(
                 "Guard — account-list fallback after brain dispatch miss."
             )
@@ -1809,7 +1748,6 @@ def _guard_brain_classify_with_deadline(
     Background timeout threads were continuing after deadline and causing
     lock contention on subsequent turns.
     """
-    t_start = time.perf_counter()
     pair = _guard_brain_ai_classify_and_dispatch(
         original_msg,
         msg_en,
@@ -1818,29 +1756,6 @@ def _guard_brain_classify_with_deadline(
         ctx,
         conv,
     )
-    elapsed = time.perf_counter() - t_start
-    try:
-        from services.chat_resilience import GUARD_PRELOCK_MAX_SEC
-    except ImportError:
-        GUARD_PRELOCK_MAX_SEC = 18.0
-    if elapsed > float(GUARD_PRELOCK_MAX_SEC):
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "E",
-                "chat_routes.py:guard_brain_deadline",
-                "brain_guard_soft_timeout",
-                {
-                    "limit_s": GUARD_PRELOCK_MAX_SEC,
-                    "elapsed_s": round(elapsed, 2),
-                    "msg_preview": (original_msg or "")[:80],
-                },
-            )
-        except ImportError:
-            pass
-        # #endregion
     if isinstance(pair, tuple) and len(pair) == 2:
         return pair
     return None, None
@@ -1869,24 +1784,6 @@ def _guard_brain_ai_classify_and_dispatch(
     brain = guard_fast_brain_classify(
         original_msg, conv, lang, msg_en=msg_en, ctx=ctx
     )
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "A",
-            "chat_routes.py:guard_dispatch",
-            "brain_classified",
-            {
-                "intent": (brain or {}).get("intent") if isinstance(brain, dict) else None,
-                "alk": (brain or {}).get("account_list_kind") if isinstance(brain, dict) else None,
-                "channel": (brain or {}).get("data_channel") if isinstance(brain, dict) else None,
-                "msg_preview": (original_msg or "")[:80],
-            },
-        )
-    except ImportError:
-        pass
-    # #endregion
     if not isinstance(brain, dict):
         return None, None
     if brain.get("llm_unavailable"):
@@ -1952,23 +1849,6 @@ def _guard_brain_ai_classify_and_dispatch(
         format_purchase_history_reply=format_purchase_history_reply,
         format_wishlist_reply=format_wishlist_reply,
     )
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "B",
-            "chat_routes.py:guard_dispatch",
-            "acct_dispatch_result",
-            {
-                "hit": bool(acct and str(acct).strip()),
-                "intent": intent,
-                "alk": brain.get("account_list_kind"),
-            },
-        )
-    except ImportError:
-        pass
-    # #endregion
     if acct and str(acct).strip():
         return str(acct), brain
 
@@ -2035,19 +1915,6 @@ def _guard_brain_ai_classify_and_dispatch(
     if acct_fb and str(acct_fb).strip():
         return str(acct_fb), brain
 
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "C",
-            "chat_routes.py:guard_dispatch",
-            "guard_dispatch_miss",
-            {"intent": intent, "channel": brain.get("data_channel")},
-        )
-    except ImportError:
-        pass
-    # #endregion
     return None, brain
 
 
@@ -2230,17 +2097,6 @@ def _guard_order_ask_id_prelock_reply(
         return None
     log_reasoning(f"Guard pre-lock — ask Order ID for goal={goal}.")
     try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "G",
-            "chat_routes.py:guard_order_ask_id",
-            "order_ask_id_prelock_hit",
-            {"goal": goal, "msg_preview": original_msg[:80]},
-        )
-    except ImportError:
-        pass
-    try:
         import threading
 
         from services.mysql_service import db_store_turn_pair
@@ -2291,22 +2147,6 @@ def _guard_order_live_ai_prelock_reply(
         return None
     log_reasoning("Guard pre-lock — order ID live API (invoice/details/track).")
     try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "F",
-            "chat_routes.py:guard_order_live",
-            "order_live_prelock_hit",
-            {
-                "goal": ((ctx.get("data") or {}).get("ai_route") or {}).get(
-                    "order_lookup_kind"
-                ),
-                "msg_preview": original_msg[:80],
-            },
-        )
-    except ImportError:
-        pass
-    try:
         import threading
 
         from services.mysql_service import db_store_turn_pair
@@ -2335,17 +2175,6 @@ def _guard_account_list_ai_prelock_reply(
     if _guard_quick_single_order_live_turn(original_msg):
         return None
     if _guard_quick_live_goal_no_order_id(original_msg):
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "A",
-                "chat_routes.py:guard_account_list",
-                "account_skip_live_goal_no_id",
-                {"goal": _guard_quick_live_goal_no_order_id(original_msg), "msg_preview": original_msg[:80]},
-            )
-        except ImportError:
-            pass
         return None
     chat_log(f"guard account-list AI start msg={original_msg[:60]!r}")
     lang = lang_hint or "en"
@@ -2357,17 +2186,6 @@ def _guard_account_list_ai_prelock_reply(
             log_reasoning(
                 "Guard account-list — wishlist structural fast path (zero LLM)."
             )
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "B",
-                    "chat_routes.py:guard_account_list",
-                    "account_structural_fast",
-                    {"kind": "wishlist", "msg_preview": original_msg[:80]},
-                )
-            except ImportError:
-                pass
             return jsonify({"chat_id": chat_id, "type": "text", "data": body})
     if _guard_quick_purchase_list_turn(original_msg):
         body = format_purchase_history_reply(user_id, page=1, append_only=False)
@@ -2375,17 +2193,6 @@ def _guard_account_list_ai_prelock_reply(
             log_reasoning(
                 "Guard account-list — purchase-history structural fast path (zero LLM)."
             )
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "B",
-                    "chat_routes.py:guard_account_list",
-                    "account_structural_fast",
-                    {"kind": "order_history", "msg_preview": original_msg[:80]},
-                )
-            except ImportError:
-                pass
             return jsonify({"chat_id": chat_id, "type": "text", "data": body})
     try:
         from services.account_list_fast_path import try_account_list_fast_reply
@@ -2424,19 +2231,6 @@ def _guard_account_list_ai_prelock_reply(
         return None
     if not (body or "").strip():
         return None
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "B",
-            "chat_routes.py:guard_account_list",
-            "account_guard_hit",
-            {"msg_preview": (original_msg or "")[:80]},
-        )
-    except ImportError:
-        pass
-    # #endregion
     log_reasoning("Guard pre-lock — account-list AI → live API (skip brain queue).")
     try:
         import threading
@@ -3801,20 +3595,6 @@ def _try_early_ai_brain_reply(
             return None, None
     try:
         from services.ai_first_router import early_universal_brain_route
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H6",
-                "chat_routes.py:_try_early_ai_brain_reply",
-                "before_early_universal_brain_route",
-                {"msg_preview": (original_msg or "")[:80], "awaiting": (ctx or {}).get("awaiting")},
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
 
         t_route = time.perf_counter()
         brain_route_data = early_universal_brain_route(
@@ -3827,28 +3607,6 @@ def _try_early_ai_brain_reply(
             _try_brain_pincode_direct_reply,
             try_brain_direct_dispatch,
         )
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H5",
-                "chat_routes.py:early_brain",
-                "early_universal_route_elapsed",
-                {
-                    "elapsed_ms": int((time.perf_counter() - t_route) * 1000),
-                    "intent": (brain_route_data or {}).get("intent")
-                    if isinstance(brain_route_data, dict)
-                    else None,
-                    "channel": (brain_route_data or {}).get("data_channel")
-                    if isinstance(brain_route_data, dict)
-                    else None,
-                    "msg_preview": (original_msg or "")[:80],
-                },
-            )
-        except ImportError:
-            pass
-        # #endregion
         if not isinstance(brain_route_data, dict):
             return None, None
         if brain_route_data.get("llm_unavailable"):
@@ -5170,22 +4928,6 @@ def _chat_request_guard(fn):
                 user_msg, chat_id, guard_user_id, lang_hint
             )
             if session_hit is not None:
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H1",
-                        "chat_routes.py:_chat_request_guard",
-                        "session_fast_early_hit",
-                        {
-                            "elapsed_s": round(time.perf_counter() - t0, 3),
-                            "msg_preview": (user_msg or "")[:80],
-                        },
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 chat_log(
                     f"guard session fast (early) done in {time.perf_counter() - t0:.2f}s"
                 )
@@ -5216,19 +4958,6 @@ def _chat_request_guard(fn):
         # AI-first: order-ask-id handled by ai_brain_route + brain dispatch (no keyword prelock).
         # AI-first: keep only deterministic order/session fast paths in guard.
         # All other intent understanding and routing runs once inside chat().
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H3",
-                "chat_routes.py:_chat_request_guard",
-                "guard_prellm_bypassed",
-                {"msg_preview": (user_msg or "")[:80]},
-            )
-        except ImportError:
-            pass
-        # #endregion
         # One ai_brain_route per turn inside chat() — reuses cached brain route.
         try:
             from services.chat_resilience import clear_turn_acquire_state
@@ -5251,22 +4980,6 @@ def _chat_request_guard(fn):
             chat_log(f"done in {time.perf_counter() - t0:.2f}s")
             return resp
         except ChatDeadlineExceeded:
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "E",
-                    "chat_routes.py:_chat_request_guard",
-                    "chat_deadline_exceeded",
-                    {
-                        "elapsed_s": round(time.perf_counter() - t0, 2),
-                        "msg_preview": (user_msg or "")[:80],
-                    },
-                )
-            except ImportError:
-                pass
-            # #endregion
             try:
                 from services.chat_flow_telemetry import record_timeout_point
 
@@ -5663,20 +5376,6 @@ def chat():
     user_msg = data.get("message", "").strip()
     user_id = _resolve_user_id()
     chat_log(f"POST user_id={user_id} msg={user_msg[:100]!r}")
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "H6",
-            "chat_routes.py:chat",
-            "chat_handler_entered",
-            {"msg_preview": (user_msg or "")[:80]},
-            run_id="post-fix",
-        )
-    except ImportError:
-        pass
-    # #endregion
 
     # 🔥 FIX 1: Frontend se chat_id fetch karo
     current_chat_id = data.get("chat_id") or getattr(g, "provisional_chat_id", None)
@@ -5710,20 +5409,6 @@ def chat():
             msg_en = original_msg.lower().strip()
         else:
             msg_en = to_en(original_msg).lower().strip()
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "H6",
-            "chat_routes.py:chat",
-            "post_translation",
-            {"lang": lang, "msg_preview": (original_msg or "")[:80]},
-            run_id="post-fix",
-        )
-    except ImportError:
-        pass
-    # #endregion
     _brain_route_first = _turn_should_prioritize_brain_route(
         original_msg, msg_en, "", ctx
     )
@@ -5960,21 +5645,6 @@ def chat():
 
     # === AI-FIRST STRICT MODE ===
     # Skip micro-LLM preflight classifiers; route once via universal brain below.
-    if _brain_route_first:
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H4",
-                "chat_routes.py:chat",
-                "pre_brain_live_preflight_skipped",
-                {"msg_preview": (original_msg or "")[:80]},
-            )
-        except ImportError:
-            pass
-        # #endregion
-
     # === AI BRAIN FIRST (one LLM — intent in any language, then dispatch) ===
     if _brain_route_first:
         bf_body, bf_route = _try_brain_first_chat_turn(

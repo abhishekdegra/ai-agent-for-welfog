@@ -294,6 +294,24 @@ html, body {
     flex: 1;
 }
 
+.main-header__contact {
+    flex-shrink: 0;
+    text-decoration: none;
+    color: var(--wf-primary);
+    border: 1px solid transparent;
+    transition: background 0.2s, border-color 0.2s, color 0.2s;
+}
+
+.main-header__contact:hover {
+    color: var(--wf-primary-hover);
+    background: var(--wf-secondary-soft);
+    border-color: var(--wf-border);
+}
+
+.main-header__contact:active {
+    transform: scale(0.94);
+}
+
 /* Font Awesome sets display on .fas, which beats the default [hidden] UA rule — force one icon */
 #themeToggle i[hidden],
 .theme-toggle > i[hidden] {

@@ -176,22 +176,6 @@ def extract_focused_product_query(
                     original_msg,
                 )
                 if terms and len(terms) >= 2:
-                    # #region agent log
-                    try:
-                        from services.debug_session_log import dbg97
-
-                        dbg97(
-                            "H16",
-                            "product_query_understanding.py:extract_focused_product_query",
-                            "ai_product_terms",
-                            {
-                                "msg_preview": comb[:60],
-                                "terms": terms[:60],
-                            },
-                        )
-                    except ImportError:
-                        pass
-                    # #endregion
                     return terms
         except Exception:
             pass

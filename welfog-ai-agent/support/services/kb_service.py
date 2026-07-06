@@ -1130,19 +1130,6 @@ def _finalize_kb_customer_reply(body: str, original_msg: str, lang: str) -> str:
             reply_lang=rl,
         )
         if grounded and grounded.strip():
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H11",
-                    "kb_service.py:_finalize_kb_customer_reply",
-                    "kb_localized",
-                    {"reply_lang": rl, "plain_len": len(plain)},
-                )
-            except ImportError:
-                pass
-            # #endregion
             return finalize_customer_reply(grounded, original_msg, rl)
     return finalize_customer_reply(body, original_msg, rl)
 
@@ -1538,25 +1525,6 @@ def format_direct_reply_from_kb_hit(
             kb_sources=src_list,
         )
         if grounded and grounded.strip():
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H13",
-                    "kb_service.py:format_direct_reply_from_kb_hit",
-                    "kb_ai_focus_grounded",
-                    {
-                        "reply_lang": rl_resolved,
-                        "source": src,
-                        "score": score,
-                        "fast_lane": fast_lane,
-                        "excerpt_len": len(excerpt),
-                    },
-                )
-            except ImportError:
-                pass
-            # #endregion
             return grounded
     body = _plain_text_to_html_body(excerpt)
     if not body:
@@ -1716,6 +1684,157 @@ def semantic_kb_search(
             selected_chunks=out,
         )
     return out
+
+
+def _faq_question_line_from_chunk(chunk: str) -> str:
+    plain = re.sub(r"<br\s*/?>", "\n", chunk or "").strip()
+    if not plain:
+        return ""
+    return plain.split("\n", 1)[0].strip()
+
+
+def _faq_question_similarity_boost(question: str, chunk: str) -> float:
+    """Rerank by embedding match to the FAQ question line (not keyword lists)."""
+    q_line = _faq_question_line_from_chunk(chunk)
+    if not q_line or not _looks_like_faq_question_line(q_line):
+        return 0.0
+    return _embedding_similarity(question, q_line) * 0.42
+
+
+def promote_route_from_semantic_kb_match(
+    route: dict,
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    min_score: float = 0.28,
+) -> dict | None:
+    """
+    Strong admin-KB embedding match → lock welfog_support (any language).
+    Prevents brain JSON from misrouting FAQ/policy turns to OOD or chitchat.
+    """
+    out = dict(route or {})
+    if out.get("run_catalog_search") or out.get("_product_catalog_locked"):
+        return None
+    combined = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not combined:
+        return None
+    try:
+        from services.ai_route_semantics import _brain_route_has_shopping_entities
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if _brain_route_has_shopping_entities(
+            out, original_msg=original_msg, msg_en=msg_en
+        ) or turn_is_obvious_product_shopping_turn(original_msg, msg_en, ""):
+            return None
+    except ImportError:
+        pass
+
+    q = build_kb_retrieval_query(original_msg, msg_en, "", ai_route=out)
+    best = retrieve_best_kb_chunk(
+        q or combined,
+        ai_route=out,
+        min_score=max(0.14, min_score - 0.12),
+    )
+    score = float((best or {}).get("score") or 0)
+    if not best or score < min_score:
+        return None
+
+    src = str(best.get("source") or "").strip().lower()
+    intent = (out.get("intent") or "general").strip().lower()
+    if src == "seller":
+        intent = "seller"
+    elif src == "refund":
+        intent = "refund"
+    elif src == "payment" and intent not in ("order", "order_history"):
+        intent = "payment"
+    elif intent not in ("seller", "refund", "payment"):
+        intent = "general"
+
+    keys = resolve_brain_kb_keys(out, original_msg, msg_en)
+    if src:
+        keys = list(dict.fromkeys([*(keys or []), src]))[:4]
+
+    out["intent"] = intent
+    out["data_channel"] = "kb"
+    out["conversation_scope"] = "welfog_support"
+    out["is_welfog_related"] = True
+    out["kb_keys"] = keys
+    out["run_catalog_search"] = False
+    out["search_query"] = ""
+    out["scope_reply"] = ""
+    out.pop("category_only_browse", None)
+    out.pop("category_browse", None)
+    out.pop("_product_catalog_locked", None)
+    out["_turn_promotions_done"] = True
+    return out
+
+
+def select_best_kb_hit_for_customer_question(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    conversation_context: str = "",
+    preferred_keys: list[str] | None = None,
+    ai_route: dict | None = None,
+    brain_locked_kb: bool = False,
+    min_score: float | None = None,
+) -> dict | None:
+    """
+    Pick the strongest embedding match across brain-hinted files + faqs + related admin KB.
+    Brain kb_keys are hints — a higher-scoring chunk in another file always wins.
+    """
+    floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
+    filter_q = build_kb_retrieval_query(
+        original_msg, msg_en, conversation_context, ai_route=ai_route
+    )
+    combined = filter_q or f"{original_msg or ''} {msg_en or ''}".strip()
+    if not combined:
+        return None
+
+    valid = [
+        k
+        for k in (preferred_keys or [])
+        if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS
+    ][:4]
+
+    key_sets: list[list[str] | None] = []
+    if valid:
+        key_sets.append(valid)
+    if "faqs" in kb_chunks_by_key:
+        key_sets.append(["faqs"])
+    for hint in ("seller", "privacy", "company", "payment", "refund", "shipping", "support"):
+        if hint in kb_chunks_by_key and hint not in valid:
+            key_sets.append([hint])
+    if not brain_locked_kb:
+        key_sets.append(None)
+
+    best_hit: dict | None = None
+    best_score = -1.0
+    seen: set[str] = set()
+    search_floor = max(0.12, floor - 0.12)
+
+    for keys in key_sets:
+        hit = retrieve_best_kb_chunk(
+            combined,
+            keys=keys,
+            ai_route=ai_route,
+            min_score=search_floor,
+        )
+        if not hit:
+            continue
+        norm = _chunk_dedup_key(hit.get("chunk") or "")
+        if norm and norm in seen:
+            continue
+        if norm:
+            seen.add(norm)
+        sc = float(hit.get("score") or 0)
+        if sc > best_score:
+            best_score = sc
+            best_hit = hit
+
+    if best_hit and best_score >= floor:
+        return best_hit
+    return None
 
 
 def retrieve_best_kb_chunk(
@@ -2230,14 +2349,27 @@ def _pick_best_kb_hit_for_query(
     """Rerank embedding hits with relevance adjustments; skip conflicting chunks."""
     best: dict | None = None
     best_score = -1.0
+    ranked: list[tuple[float, dict]] = []
     for hit in hits:
         chunk = hit.get("chunk") or ""
         if conflict_check and _faq_chunk_conflicts_with_query(question, chunk, ai_route=ai_route):
             continue
         sc = float(hit.get("score") or 0) + _kb_chunk_relevance_adjustment(question, chunk)
+        sc += _faq_question_similarity_boost(question, chunk)
+        ranked.append((sc, {**hit, "score": sc}))
         if sc > best_score:
             best_score = sc
             best = {**hit, "score": sc}
+    if len(ranked) >= 2:
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        top_sc, top_hit = ranked[0]
+        runner_sc, runner_hit = ranked[1]
+        if runner_sc >= top_sc - 0.07:
+            top_q = _faq_question_similarity_boost(question, top_hit.get("chunk") or "")
+            run_q = _faq_question_similarity_boost(question, runner_hit.get("chunk") or "")
+            if run_q > top_q + 0.03:
+                best = runner_hit
+                best_score = runner_sc
     floor = float(min_rerank_score if min_rerank_score is not None else KB_ANSWER_MIN_CONFIDENCE)
     if best and best_score < floor:
         return None
@@ -2495,7 +2627,29 @@ def format_kb_answer_from_brain_keys(
         and valid_key_set.issubset(brain_raw_keys)
     )
 
-    # Brain-locked admin files first — never let faqs.txt hijack company/support/shipping.
+    # Brain-hinted files + cross-file semantic winner (brain keys are hints, not prisons).
+    if valid or "faqs" in kb_chunks_by_key:
+        semantic_hit = select_best_kb_hit_for_customer_question(
+            original_msg,
+            msg_en,
+            conversation_context=conversation_context,
+            preferred_keys=valid,
+            ai_route=route,
+            brain_locked_kb=brain_locked_kb,
+            min_score=KB_ANSWER_MIN_CONFIDENCE,
+        )
+        if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
+            direct = format_direct_reply_from_kb_hit(
+                semantic_hit,
+                original_msg,
+                reply_lang=lang,
+                retrieval_query=filter_q or combined,
+                fast_lane=True,
+                conversation_context=conversation_context,
+            )
+            if direct:
+                return direct
+
     if valid:
         scoped_hit = retrieve_best_kb_chunk(
             filter_q or combined,
@@ -2578,24 +2732,6 @@ def format_kb_answer_from_brain_keys(
             elif not semantic_hit:
                 semantic_hit = faq_hit
     if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H15",
-                "kb_service.py:format_kb_answer_from_brain_keys",
-                "kb_semantic_hit",
-                {
-                    "source": str(semantic_hit.get("source") or ""),
-                    "score": float(semantic_hit.get("score") or 0),
-                    "search_scope": search_scope[:4],
-                    "keys_scoped": keys_scoped,
-                },
-            )
-        except ImportError:
-            pass
-        # #endregion
         direct = format_direct_reply_from_kb_hit(
             semantic_hit,
             original_msg,

@@ -2557,6 +2557,19 @@ def _reconcile_off_topic_brain_misroute(
                 ) and not turn_is_obvious_product_shopping_turn(
                     original_msg, msg_en, ""
                 ):
+                    try:
+                        from services.kb_service import promote_route_from_semantic_kb_match
+
+                        promoted = promote_route_from_semantic_kb_match(
+                            out, original_msg, msg_en=msg_en
+                        )
+                        if promoted:
+                            log_reasoning(
+                                "Brain KB reconcile — semantic match overrides OOD user_meaning."
+                            )
+                            return promoted
+                    except ImportError:
+                        pass
                     out["intent"] = "out_of_domain"
                     out["data_channel"] = "none"
                     out["conversation_scope"] = "out_of_domain"
@@ -2575,19 +2588,26 @@ def _reconcile_off_topic_brain_misroute(
     if um and "welfog" not in um.lower():
         ood_reasoning = _brain_reasoning_indicates_ood(reasoning)
         platform_kb = set(kb_keys) & {"payment", "refund", "shipping", "seller", "terms", "privacy"}
+        if channel == "kb" or intent in ("seller", "refund", "payment") or platform_kb:
+            try:
+                from services.kb_service import promote_route_from_semantic_kb_match
+
+                promoted = promote_route_from_semantic_kb_match(
+                    out, original_msg, msg_en=msg_en
+                )
+                if promoted:
+                    log_reasoning(
+                        "Brain KB reconcile — semantic match before non-Welfog user_meaning OOD."
+                    )
+                    return promoted
+            except ImportError:
+                pass
         if (
             ood_reasoning
-            or related is False
             or (
-                channel == "kb"
-                and intent == "general"
-                and related is not True
-            )
-            or (
-                channel == "kb"
-                and intent in ("refund", "payment", "seller")
-                and related is not True
-                and not platform_kb
+                related is False
+                and channel != "kb"
+                and intent not in ("seller", "refund", "payment")
             )
         ):
             out["intent"] = "out_of_domain"
@@ -2608,6 +2628,19 @@ def _reconcile_off_topic_brain_misroute(
         "catalog",
     ):
         if scope == "general_chitchat" and channel == "kb":
+            try:
+                from services.kb_service import promote_route_from_semantic_kb_match
+
+                promoted = promote_route_from_semantic_kb_match(
+                    out, original_msg, msg_en=msg_en
+                )
+                if promoted:
+                    log_reasoning(
+                        "Brain scope reconcile — semantic KB over general_chitchat+kb."
+                    )
+                    return promoted
+            except ImportError:
+                pass
             try:
                 from services.ai_route_semantics import (
                     brain_turn_indicates_welfog_kb,
@@ -2665,6 +2698,19 @@ def _reconcile_off_topic_brain_misroute(
             return out
 
     if intent == "general" and channel == "kb" and scope not in ("welfog_support",):
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            promoted = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if promoted:
+                log_reasoning(
+                    "Brain scope reconcile — semantic KB promotes welfog_support."
+                )
+                return promoted
+        except ImportError:
+            pass
         um = (out.get("user_meaning") or "").strip()
         generic_keys = not kb_keys or set(kb_keys) <= {"company", "faqs", "terms"}
         welfog_topic = bool(um and "welfog" in um.lower())
@@ -2683,18 +2729,6 @@ def _reconcile_off_topic_brain_misroute(
                     pass
             out["_turn_promotions_done"] = True
             return out
-        if um or kb_keys:
-            out["intent"] = "out_of_domain"
-            out["conversation_scope"] = "out_of_domain"
-            out["data_channel"] = "none"
-            out["is_welfog_related"] = False
-            out["kb_keys"] = []
-            out["scope_reply"] = ""
-            out["_turn_promotions_done"] = True
-            log_reasoning(
-                "Brain OOD reconcile — general+kb generic keys, no Welfog in user_meaning."
-            )
-            return out
         comb = f"{original_msg or ''} {msg_en or ''}".strip()
         echoed = um and comb and um.lower() == comb.lower()
         if echoed or scope in ("general_chitchat", ""):
@@ -2709,7 +2743,7 @@ def _reconcile_off_topic_brain_misroute(
             out["scope_reply"] = ""
             out["_turn_promotions_done"] = True
             log_reasoning(
-                "Brain OOD reconcile — general+kb without kb_keys or user_meaning."
+                "Brain scope reconcile — general+kb without resolvable KB match."
             )
     return out
 
@@ -3532,24 +3566,6 @@ def _try_brain_misroute_product_rescue_via_ai(
         log_reasoning(
             f"Product rescue (classifier): sq={sq!r} conf={conf:.2f} over brain misroute."
         )
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H16",
-                "ai_first_router.py:product_rescue",
-                "ood_product_rescue_ai",
-                {
-                    "msg_preview": (original_msg or "")[:60],
-                    "sq": sq[:60],
-                    "classifier_conf": conf,
-                    "brain_intent": (out.get("intent") or "")[:40],
-                },
-            )
-        except ImportError:
-            pass
-        # #endregion
         return promoted
     except ImportError:
         pass
@@ -3590,19 +3606,6 @@ def _fast_finalize_promote_catalog_menu(
             promoted = reconcile_deals_from_brain_meaning(out)
             promoted["_turn_promotions_done"] = True
             promoted["_universal_brain_route"] = True
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H17",
-                    "ai_first_router.py:catalog_menu_finalize",
-                    "deals_brain_promoted",
-                    {"msg_preview": (original_msg or "")[:80], "intent": promoted.get("intent")},
-                )
-            except ImportError:
-                pass
-            # #endregion
             return promoted
 
         if brain_turn_indicates_categories(
@@ -3611,19 +3614,6 @@ def _fast_finalize_promote_catalog_menu(
             promoted = reconcile_categories_from_brain_meaning(out)
             promoted["_turn_promotions_done"] = True
             promoted["_universal_brain_route"] = True
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H17",
-                    "ai_first_router.py:catalog_menu_finalize",
-                    "categories_brain_promoted",
-                    {"msg_preview": (original_msg or "")[:80], "intent": promoted.get("intent")},
-                )
-            except ImportError:
-                pass
-            # #endregion
             return promoted
 
         intent = (out.get("intent") or "").strip().lower()
@@ -3676,25 +3666,6 @@ def _fast_finalize_promote_catalog_menu(
         promoted["is_welfog_related"] = True
         promoted["conversation_scope"] = "welfog_support"
         promoted.pop("scope_reply", None)
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H17",
-                "ai_first_router.py:catalog_menu_finalize",
-                "catalog_menu_ai_rescue",
-                {
-                    "msg_preview": (original_msg or "")[:80],
-                    "kind": resolved.kind,
-                    "source": resolved.source,
-                    "brain_intent": intent,
-                    "rescue_misroute": rescue_misroute,
-                },
-            )
-        except ImportError:
-            pass
-        # #endregion
         return promoted
     except ImportError:
         pass
@@ -3770,23 +3741,6 @@ def _fast_finalize_promote_product_catalog(
                 promoted["is_welfog_related"] = True
                 promoted["conversation_scope"] = "welfog_support"
                 promoted.pop("scope_reply", None)
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H16",
-                        "ai_first_router.py:fast_finalize",
-                        "product_catalog_promoted",
-                        {
-                            "msg_preview": (original_msg or "")[:60],
-                            "sq": (promoted.get("search_query") or "")[:60],
-                            "source": "brain_json",
-                        },
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 return promoted
 
         if turn_requests_product_catalog(
@@ -3808,24 +3762,6 @@ def _fast_finalize_promote_product_catalog(
                 promoted["is_welfog_related"] = True
                 promoted["conversation_scope"] = "welfog_support"
                 promoted.pop("scope_reply", None)
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H16",
-                        "ai_first_router.py:fast_finalize",
-                        "product_catalog_promoted",
-                        {
-                            "msg_preview": (original_msg or "")[:60],
-                            "sq": (promoted.get("search_query") or "")[:60],
-                            "source": "resolver",
-                            "allow_llm": allow_product_llm,
-                        },
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 return promoted
     except ImportError:
         pass
@@ -3943,24 +3879,6 @@ def _try_fast_finalize_brain_route_after_ai(
             log_reasoning(
                 "Universal brain — KB fast finalize (brain locked kb channel)."
             )
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H8",
-                    "ai_first_router.py:fast_finalize",
-                    "welfog_kb_promoted",
-                    {
-                        "msg_preview": (original_msg or "")[:80],
-                        "kb_keys": out.get("kb_keys"),
-                        "early_kb_lock": True,
-                    },
-                    run_id="post-fix",
-                )
-            except ImportError:
-                pass
-            # #endregion
             return out
     except ImportError:
         pass
@@ -4010,23 +3928,6 @@ def _try_fast_finalize_brain_route_after_ai(
             log_reasoning(
                 "Universal brain — delivery/pincode fast finalize (area follow-up or serviceability)."
             )
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H14",
-                    "ai_first_router.py:fast_finalize",
-                    "delivery_route_kept",
-                    {
-                        "msg_preview": (original_msg or "")[:60],
-                        "intent": out.get("intent"),
-                        "channel": out.get("data_channel"),
-                    },
-                )
-            except ImportError:
-                pass
-            # #endregion
             return out
     except ImportError:
         pass
@@ -4136,19 +4037,6 @@ def _try_fast_finalize_brain_route_after_ai(
                 log_reasoning(
                     "Universal brain — chitchat promoted (was misrouted as OOD)."
                 )
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H10",
-                        "ai_first_router.py:fast_finalize",
-                        "chitchat_demoted_from_ood",
-                        {"msg_preview": (original_msg or "")[:60]},
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 return out
         except ImportError:
             pass
@@ -4324,22 +4212,6 @@ def _try_fast_finalize_brain_route_after_ai(
                     conversation_context,
                     ignore_routing_complete=True,
                 )
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H12",
-                        "ai_first_router.py:fast_finalize",
-                        "pincode_misroute_query_intent",
-                        {
-                            "msg_preview": (original_msg or "")[:60],
-                            "intent": getattr(qd, "detected_intent", None) if qd else None,
-                        },
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 if qd and qd.detected_intent == INTENT_HARM:
                     out["intent"] = "general"
                     out["conversation_scope"] = "harm_sensitive"
@@ -4419,23 +4291,6 @@ def _try_fast_finalize_brain_route_after_ai(
             out = reconcile_deals_from_brain_meaning(out)
             out["_turn_promotions_done"] = True
             log_reasoning("Universal brain — deals fast finalize from brain meaning.")
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H8",
-                    "ai_first_router.py:fast_finalize",
-                    "deals_promoted",
-                    {
-                        "msg_preview": (original_msg or "")[:80],
-                        "intent": out.get("intent"),
-                    },
-                    run_id="post-fix",
-                )
-            except ImportError:
-                pass
-            # #endregion
             return out
 
         if brain_turn_indicates_categories(
@@ -4446,23 +4301,6 @@ def _try_fast_finalize_brain_route_after_ai(
             log_reasoning(
                 "Universal brain — categories fast finalize from brain meaning."
             )
-            # #region agent log
-            try:
-                from services.debug_session_log import dbg97
-
-                dbg97(
-                    "H8",
-                    "ai_first_router.py:fast_finalize",
-                    "categories_promoted",
-                    {
-                        "msg_preview": (original_msg or "")[:80],
-                        "intent": out.get("intent"),
-                    },
-                    run_id="post-fix",
-                )
-            except ImportError:
-                pass
-            # #endregion
             return out
 
         if brain_turn_indicates_welfog_kb(out):
@@ -4517,23 +4355,6 @@ def _try_fast_finalize_brain_route_after_ai(
                 out = reconcile_welfog_kb_from_brain_meaning(out)
                 out["_turn_promotions_done"] = True
                 log_reasoning("Universal brain — Welfog KB fast finalize from brain meaning.")
-                # #region agent log
-                try:
-                    from services.debug_session_log import dbg97
-
-                    dbg97(
-                        "H8",
-                        "ai_first_router.py:fast_finalize",
-                        "welfog_kb_promoted",
-                        {
-                            "msg_preview": (original_msg or "")[:80],
-                            "kb_keys": out.get("kb_keys"),
-                        },
-                        run_id="post-fix",
-                    )
-                except ImportError:
-                    pass
-                # #endregion
                 return out
 
         um_low = f" {(out.get('user_meaning') or '').lower()} "
@@ -4726,35 +4547,6 @@ def early_universal_brain_route(
         if _mixed:
             original_msg = route_msg
             msg_en = route_msg_en
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H7",
-                "ai_first_router.py:early_universal_brain_route",
-                "after_strip_greeting",
-                {"msg_preview": (original_msg or "")[:80], "strict_ai": False},
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
-    else:
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H7",
-                "ai_first_router.py:early_universal_brain_route",
-                "strip_greeting_skipped_strict_ai",
-                {"msg_preview": (original_msg or "")[:80]},
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
 
     if not _strict_ai:
         ood_fast = _try_obvious_out_of_domain_route(
@@ -4827,41 +4619,10 @@ def early_universal_brain_route(
         except ImportError:
             pass
         log_reasoning("Universal brain — ai_brain_route starting (one LLM).")
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H7",
-                "ai_first_router.py:early_universal_brain_route",
-                "before_ai_brain_route",
-                {"msg_preview": (original_msg or "")[:80]},
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
         _t_brain_llm = time.perf_counter()
         route_data = ai_brain_route(
             original_msg, conv_for_llm, reply_lang=reply_lang, msg_en=msg_en
         )
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H5",
-                "ai_first_router.py:early_universal_brain_route",
-                "ai_brain_route_elapsed",
-                {
-                    "elapsed_ms": int((time.perf_counter() - _t_brain_llm) * 1000),
-                    "msg_preview": (original_msg or "")[:80],
-                },
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
         if isinstance(route_data, dict):
             try:
                 from services.chat_flow_telemetry import store_brain_route_result
@@ -4894,25 +4655,6 @@ def early_universal_brain_route(
     )
     if isinstance(fast_final, dict):
         route_data = fast_final
-        # #region agent log
-        try:
-            from services.debug_session_log import dbg97
-
-            dbg97(
-                "H5",
-                "ai_first_router.py:early_universal_brain_route",
-                "brain_fast_finalize",
-                {
-                    "post_brain_ms": int((time.perf_counter() - _t_post_brain) * 1000),
-                    "intent": route_data.get("intent"),
-                    "channel": route_data.get("data_channel"),
-                    "msg_preview": (original_msg or "")[:80],
-                },
-                run_id="post-fix",
-            )
-        except ImportError:
-            pass
-        # #endregion
         um = (route_data.get("user_meaning") or "").strip()
         log_reasoning(
             f"Universal brain route: intent={route_data.get('intent')} "

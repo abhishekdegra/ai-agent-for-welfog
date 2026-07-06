@@ -265,23 +265,6 @@ def _log_language_preservation(
     *,
     translation_applied: bool,
 ) -> None:
-    # #region agent log
-    try:
-        from services.debug_session_log import dbg97
-
-        dbg97(
-            "H18",
-            "translation_service.py:finalize_customer_reply",
-            "language_preservation",
-            {
-                "input_language": resolve_customer_reply_lang(user_msg, reply_lang),
-                "output_language": _infer_reply_text_language(body_out),
-                "translation_applied": translation_applied,
-            },
-        )
-    except ImportError:
-        pass
-    # #endregion
     log_reasoning(
         f"Language preservation: input={resolve_customer_reply_lang(user_msg, reply_lang)} "
         f"output={_infer_reply_text_language(body_out)} translated={translation_applied}"
