@@ -39,6 +39,7 @@ from services.mysql_service import (
     db_store_message,
     generate_chat_token,
     get_mysql_connection,
+    sql_collate,
 )
 from services.translation_service import (
     customer_reply_language,
@@ -4644,7 +4645,7 @@ def get_history():
             # List only sessions that still have rows in `chats` with real JSON messages.
             # Otherwise clearing `chats` in phpMyAdmin leaves "ghost" titles from `chat_sessions`.
             cur.execute(
-                """
+                f"""
                 SELECT DISTINCT
                     COALESCE(cs.chat_token, c.chat_token, CAST(c.chat_id AS CHAR)) AS chat_id,
                     COALESCE(
@@ -4654,11 +4655,11 @@ def get_history():
                     COALESCE(cs.created_at, c.created_at, c.updated_at) AS created_at
                 FROM chats c
                 LEFT JOIN chat_sessions cs ON (
-                    cs.chat_token = c.chat_token
-                    OR cs.chat_token = CAST(c.chat_id AS CHAR)
-                    OR CAST(cs.id AS CHAR) = CAST(c.chat_id AS CHAR)
+                    {sql_collate('cs.chat_token')} = {sql_collate('c.chat_token')}
+                    OR {sql_collate('cs.chat_token')} = {sql_collate('CAST(c.chat_id AS CHAR)')}
+                    OR {sql_collate('CAST(cs.id AS CHAR)')} = {sql_collate('CAST(c.chat_id AS CHAR)')}
                 )
-                WHERE (cs.user_id = %s OR c.user_id = %s)
+                WHERE ({sql_collate('cs.user_id')} = %s OR {sql_collate('c.user_id')} = %s)
                   AND COALESCE(cs.created_at, c.created_at, c.updated_at) >= %s
                   AND c.chat_data IS NOT NULL
                   AND CHAR_LENGTH(TRIM(c.chat_data)) > 5

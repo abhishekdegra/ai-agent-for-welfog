@@ -5,13 +5,21 @@ from secrets import token_hex
 
 import pymysql
 
+# One collation everywhere — avoids MySQL 8 (utf8mb4_0900_ai_ci) vs XAMPP/legacy (general_ci) mix errors.
+MYSQL_COLLATION = (os.getenv("MYSQL_COLLATION") or "utf8mb4_unicode_ci").strip()
+
+
+def sql_collate(expr: str) -> str:
+    """Wrap a SQL expression so string comparisons use MYSQL_COLLATION."""
+    return f"{expr} COLLATE {MYSQL_COLLATION}"
+
 
 def get_mysql_connection():
     """Public chat history MySQL (XAMPP). Override via .env: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE."""
     try:
-        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT", "3") or "3")
-        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT", "8") or "8")
-        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT", "8") or "8")
+        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT", "10") or "10")
+        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT", "30") or "30")
+        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT", "30") or "30")
         return pymysql.connect(
             host=os.getenv("MYSQL_HOST", "127.0.0.1"),
             port=int(os.getenv("MYSQL_PORT", "3306")),
@@ -19,6 +27,8 @@ def get_mysql_connection():
             password=os.getenv("MYSQL_PASSWORD", ""),
             database=os.getenv("MYSQL_DATABASE", "welfog_ai"),
             charset="utf8mb4",
+            collation=MYSQL_COLLATION,
+            init_command=f"SET NAMES utf8mb4 COLLATE {MYSQL_COLLATION}",
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
             connect_timeout=connect_timeout,
@@ -29,6 +39,42 @@ def get_mysql_connection():
         # Avoid emoji in logs (Windows console encoding can crash on unicode)
         print(f"MySQL Connection Error: {e}")
         return None
+
+
+def _ensure_mysql_database_exists() -> bool:
+    """Create welfog_ai (or MYSQL_DATABASE) if missing — common fresh XAMPP setup."""
+    db_name = (os.getenv("MYSQL_DATABASE") or "welfog_ai").strip()
+    if not db_name:
+        return False
+    try:
+        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT", "10") or "10")
+        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT", "30") or "30")
+        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT", "30") or "30")
+        conn = pymysql.connect(
+            host=os.getenv("MYSQL_HOST", "127.0.0.1"),
+            port=int(os.getenv("MYSQL_PORT", "3306")),
+            user=os.getenv("MYSQL_USER", "root"),
+            password=os.getenv("MYSQL_PASSWORD", ""),
+            charset="utf8mb4",
+            collation=MYSQL_COLLATION,
+            cursorclass=pymysql.cursors.DictCursor,
+            autocommit=True,
+            connect_timeout=connect_timeout,
+            read_timeout=read_timeout,
+            write_timeout=write_timeout,
+        )
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    f"CREATE DATABASE IF NOT EXISTS `{db_name}` "
+                    f"CHARACTER SET utf8mb4 COLLATE {MYSQL_COLLATION}"
+                )
+            return True
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"MySQL ensure database `{db_name}`: {e}")
+        return False
 
 
 def generate_chat_token():
@@ -85,7 +131,7 @@ def _create_chat_tables(cur) -> None:
             updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             INDEX idx_user_created (user_id, created_at),
             UNIQUE KEY uq_chat_token (chat_token)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE utf8mb4_unicode_ci
         """
     )
     cur.execute(
@@ -101,9 +147,29 @@ def _create_chat_tables(cur) -> None:
             UNIQUE KEY uq_chat_token (chat_token),
             INDEX idx_chat_messages (chat_token, id),
             INDEX idx_chat_id (chat_id)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE utf8mb4_unicode_ci
         """
     )
+
+
+def _align_chat_collations(cur) -> None:
+    """Normalize existing tables so JOIN/CAST comparisons do not mix collations."""
+    db_name = os.getenv("MYSQL_DATABASE", "welfog_ai")
+    try:
+        cur.execute(
+            f"ALTER DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE {MYSQL_COLLATION}"
+        )
+    except Exception as e:
+        print(f"MySQL collation align (database): {e}")
+    for table in ("chat_sessions", "chats"):
+        try:
+            cur.execute(f"SELECT 1 FROM `{table}` LIMIT 1")
+            cur.execute(
+                f"ALTER TABLE `{table}` CONVERT TO CHARACTER SET utf8mb4 COLLATE {MYSQL_COLLATION}"
+            )
+        except Exception as e:
+            if "1146" not in str(e):
+                print(f"MySQL collation align ({table}): {e}")
 
 
 def _remove_orphan_innodb_files() -> bool:
@@ -123,13 +189,18 @@ def _remove_orphan_innodb_files() -> bool:
             continue
         for fname in ("chats.ibd", "chat_sessions.ibd"):
             path = folder / fname
-            if path.is_file():
-                try:
-                    path.unlink()
-                    print(f"MySQL: removed orphan file {path}")
-                    removed = True
-                except OSError as e:
-                    print(f"MySQL: could not remove {path} ({e}). Stop XAMPP MySQL and delete manually.")
+            frm_path = folder / fname.replace(".ibd", ".frm")
+            if not path.is_file():
+                continue
+            # Orphan: .ibd on disk but no table metadata (.frm) — classic XAMPP #1813
+            if frm_path.is_file():
+                continue
+            try:
+                path.unlink()
+                print(f"MySQL: removed orphan file {path}")
+                removed = True
+            except OSError as e:
+                print(f"MySQL: could not remove {path} ({e}). Stop XAMPP MySQL and delete manually.")
         break
     return removed
 
@@ -143,6 +214,8 @@ def _recreate_welfog_ai_database() -> None:
         user=os.getenv("MYSQL_USER", "root"),
         password=os.getenv("MYSQL_PASSWORD", ""),
         charset="utf8mb4",
+        collation=MYSQL_COLLATION,
+        init_command=f"SET NAMES utf8mb4 COLLATE {MYSQL_COLLATION}",
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
     )
@@ -151,7 +224,7 @@ def _recreate_welfog_ai_database() -> None:
             cur.execute(f"DROP DATABASE IF EXISTS `{db_name}`")
             cur.execute(
                 f"CREATE DATABASE `{db_name}` "
-                "CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                f"CHARACTER SET utf8mb4 COLLATE {MYSQL_COLLATION}"
             )
             cur.execute(f"USE `{db_name}`")
             _create_chat_tables(cur)
@@ -182,6 +255,7 @@ def repair_mysql_chat_tables_if_broken() -> bool:
                     else:
                         raise
             if broken:
+                _remove_orphan_innodb_files()
                 try:
                     _drop_chat_tables(cur)
                     _create_chat_tables(cur)
@@ -221,6 +295,7 @@ def repair_mysql_chat_tables_if_broken() -> bool:
 
 def init_mysql_chat_schema():
     """chat_sessions = sidebar / chat id; chats = har message ka row (chat_id, chat_data JSON)."""
+    _ensure_mysql_database_exists()
     repair_mysql_chat_tables_if_broken()
 
     conn = get_mysql_connection()
@@ -241,7 +316,7 @@ def init_mysql_chat_schema():
                     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
                     INDEX idx_user_created (user_id, created_at),
                     UNIQUE KEY uq_chat_token (chat_token)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE utf8mb4_unicode_ci
                 """
             )
             cur.execute(
@@ -257,9 +332,10 @@ def init_mysql_chat_schema():
                     UNIQUE KEY uq_chat_token (chat_token),
                     INDEX idx_chat_messages (chat_token, id),
                     INDEX idx_chat_id (chat_id)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE utf8mb4_unicode_ci
                 """
             )
+            _align_chat_collations(cur)
             cur.execute("SHOW COLUMNS FROM chat_sessions LIKE 'customer_id'")
             if not cur.fetchone():
                 cur.execute("ALTER TABLE chat_sessions ADD COLUMN customer_id VARCHAR(128) NULL")
@@ -317,6 +393,10 @@ def init_mysql_chat_schema():
         conn.commit()
     except Exception as e:
         print(f"MySQL schema init error: {e}")
+        if _is_mysql_table_broken(e):
+            _remove_orphan_innodb_files()
+            if repair_mysql_chat_tables_if_broken():
+                print("MySQL: schema init recovered after chat table repair.")
     finally:
         conn.close()
 

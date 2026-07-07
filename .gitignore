@@ -38,7 +38,7 @@ desktop.ini
 *.log
 debug-*.log
 
-# Local runtime DB (optional history copy at repo root)
+# Local runtime DB (legacy SQLite history — chat uses MySQL)
 welfog_history.db
 
 # Test / temp caches

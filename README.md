@@ -1,16 +1,15 @@
-﻿# Welfog AI Agent
+# Welfog AI Agent
 
 AI-powered customer support and product search chatbot for Welfog.
 
-## Repository layout
-
-- welfog-ai-agent/support/ - Flask app (python app.py)
-- welfog-ai-agent/.env.example - copy to .env and add API keys
-
 ## Setup
 
-cd welfog-ai-agent
+```bash
 copy .env.example .env
-cd support
 pip install -r requirements.txt
 python app.py
+```
+
+## Deploy
+
+Upload this folder as-is. Set `.env` on the server, install dependencies, run `python app.py` (or gunicorn behind nginx).

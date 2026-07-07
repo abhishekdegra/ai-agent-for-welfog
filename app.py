@@ -22,9 +22,7 @@ from routes.chat_routes import register_chat_routes
 from services.mysql_service import init_mysql_chat_schema
 from support_paths import BASE_DIR, ENV_FILE
 
-# .env lives in welfog-ai-agent/ (parent of support/), not only in support/
 load_dotenv(ENV_FILE)
-load_dotenv(os.path.join(BASE_DIR, ".env"))  # optional support/.env overrides
 
 _hf_token = (os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN") or "").strip()
 if _hf_token:
