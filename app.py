@@ -23,6 +23,7 @@ from services.mysql_service import (
     init_mysql_chat_schema,
     init_mysql_knowledge_documents_schema,
 )
+from services.qdrant_service import init_qdrant_on_startup
 from support_paths import BASE_DIR, ENV_FILE
 
 load_dotenv(ENV_FILE)
@@ -106,6 +107,7 @@ def create_app():
 
     init_mysql_chat_schema()
     init_mysql_knowledge_documents_schema()
+    init_qdrant_on_startup()
     register_chat_routes(app)
     register_admin_routes(app)
 
