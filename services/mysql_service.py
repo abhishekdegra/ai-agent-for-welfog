@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import hashlib
 from pathlib import Path
 from secrets import token_hex
 
@@ -399,6 +401,357 @@ def init_mysql_chat_schema():
                 print("MySQL: schema init recovered after chat table repair.")
     finally:
         conn.close()
+
+
+def init_mysql_knowledge_documents_schema():
+    """
+    Step-1 knowledge schema migration.
+    Adds MySQL `knowledge_documents` without touching existing tables/logic.
+    """
+    _ensure_mysql_database_exists()
+    conn = get_mysql_connection()
+    if not conn:
+        print("MySQL unreachable — knowledge_documents schema init skipped.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS knowledge_documents (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    title VARCHAR(512) NOT NULL,
+                    category VARCHAR(128) NOT NULL,
+                    content LONGTEXT NOT NULL,
+                    language VARCHAR(32) NOT NULL DEFAULT 'en',
+                    status VARCHAR(32) NOT NULL DEFAULT 'active',
+                    version INT NOT NULL DEFAULT 1,
+                    index_status VARCHAR(32) NOT NULL DEFAULT 'pending',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    INDEX idx_kd_category_status_lang (category, status, language),
+                    INDEX idx_kd_updated_at (updated_at)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE {MYSQL_COLLATION}
+                """
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"MySQL knowledge_documents schema init error: {e}")
+    finally:
+        conn.close()
+
+
+def _infer_knowledge_category_from_title(title: str) -> str:
+    t = (title or "").strip().lower()
+    if not t:
+        return "general"
+    if "welfog-api" in t or "api" in t:
+        return "api"
+    if any(k in t for k in ("refund", "return")):
+        return "refund"
+    if any(k in t for k in ("payment", "invoice")):
+        return "payment"
+    if any(k in t for k in ("shipping", "delivery")):
+        return "shipping"
+    if "seller" in t:
+        return "seller"
+    if any(k in t for k in ("support", "faq", "faqs")):
+        return "support"
+    if any(k in t for k in ("policy", "privacy", "terms")):
+        return "policy"
+    if "company" in t:
+        return "company"
+    if "system-messages" in t:
+        return "system"
+    return "general"
+
+
+def import_knowledge_txt_files_to_mysql(knowledge_dir: str) -> dict:
+    """
+    One-time migration helper:
+    imports each *.txt from support/knowledge into knowledge_documents.
+    Duplicate policy: if same `title` already exists, skip.
+    """
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return {"imported": 0, "skipped_duplicates": 0, "total_rows": 0, "errors": 1}
+
+    imported = 0
+    skipped_duplicates = 0
+    errors = 0
+    kdir = Path(knowledge_dir)
+    txt_files = sorted(kdir.glob("*.txt"))
+    try:
+        with conn.cursor() as cur:
+            for fpath in txt_files:
+                try:
+                    title = fpath.stem.strip()
+                    if not title:
+                        continue
+                    cur.execute(
+                        "SELECT id FROM knowledge_documents WHERE title = %s LIMIT 1",
+                        (title,),
+                    )
+                    if cur.fetchone():
+                        skipped_duplicates += 1
+                        continue
+
+                    body = fpath.read_text(encoding="utf-8")
+                    cur.execute(
+                        """
+                        INSERT INTO knowledge_documents
+                            (title, category, content, language, status, version, index_status)
+                        VALUES
+                            (%s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (
+                            title,
+                            _infer_knowledge_category_from_title(title),
+                            body,
+                            "auto",
+                            "active",
+                            1,
+                            "pending",
+                        ),
+                    )
+                    imported += 1
+                except Exception as row_err:
+                    errors += 1
+                    print(f"knowledge import row error ({fpath.name}): {row_err}")
+
+            conn.commit()
+            cur.execute("SELECT COUNT(*) AS c FROM knowledge_documents")
+            total_rows = int((cur.fetchone() or {}).get("c") or 0)
+    except Exception as e:
+        print(f"knowledge import error: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        errors += 1
+        total_rows = 0
+    finally:
+        conn.close()
+
+    return {
+        "imported": imported,
+        "skipped_duplicates": skipped_duplicates,
+        "total_rows": total_rows,
+        "errors": errors,
+    }
+
+
+def init_mysql_knowledge_chunks_schema():
+    """Step-3 schema: deterministic cleaned/chunked documents (no vectors yet)."""
+    _ensure_mysql_database_exists()
+    conn = get_mysql_connection()
+    if not conn:
+        print("MySQL unreachable — knowledge_document_chunks schema init skipped.")
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS knowledge_document_chunks (
+                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+                    chunk_id VARCHAR(128) NOT NULL,
+                    doc_id BIGINT NOT NULL,
+                    version INT NOT NULL,
+                    chunk_no INT NOT NULL,
+                    title VARCHAR(512) NOT NULL,
+                    category VARCHAR(128) NOT NULL,
+                    language VARCHAR(32) NOT NULL,
+                    content LONGTEXT NOT NULL,
+                    content_hash CHAR(64) NOT NULL,
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                    UNIQUE KEY uq_kdc_chunk_id (chunk_id),
+                    UNIQUE KEY uq_kdc_doc_ver_chunk (doc_id, version, chunk_no),
+                    INDEX idx_kdc_doc_ver (doc_id, version),
+                    INDEX idx_kdc_category_lang (category, language)
+                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE {MYSQL_COLLATION}
+                """
+            )
+        conn.commit()
+    except Exception as e:
+        print(f"MySQL knowledge_document_chunks schema init error: {e}")
+    finally:
+        conn.close()
+
+
+def clean_knowledge_document_content(raw: str) -> str:
+    """
+    UTF-8-safe normalization:
+    - normalize line endings
+    - trim trailing spaces
+    - collapse duplicate blank lines
+    - normalize intra-line whitespace (spaces/tabs)
+    """
+    text = (raw or "").encode("utf-8", errors="replace").decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    lines = []
+    blank_run = 0
+    for ln in text.split("\n"):
+        ln = re.sub(r"[ \t]+", " ", ln).strip()
+        if not ln:
+            blank_run += 1
+            if blank_run > 1:
+                continue
+        else:
+            blank_run = 0
+        lines.append(ln)
+    return "\n".join(lines).strip()
+
+
+def chunk_knowledge_document_content(cleaned: str, chunk_size: int = 900, overlap: int = 120) -> list[str]:
+    """
+    Deterministic chunking with paragraph preference.
+    chunk_size/overlap are character-based.
+    """
+    content = (cleaned or "").strip()
+    if not content:
+        return []
+    size = max(200, int(chunk_size or 900))
+    ov = max(0, min(int(overlap or 120), size // 2))
+
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", content) if p.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    def _flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+            current = ""
+
+    for para in paragraphs:
+        if len(para) > size:
+            words = para.split()
+            seg = ""
+            for w in words:
+                cand = f"{seg} {w}".strip()
+                if len(cand) <= size:
+                    seg = cand
+                else:
+                    if seg:
+                        if current:
+                            _flush()
+                        chunks.append(seg.strip())
+                    seg = w
+            if seg:
+                if current:
+                    _flush()
+                chunks.append(seg.strip())
+            continue
+
+        candidate = para if not current else f"{current}\n\n{para}"
+        if len(candidate) <= size:
+            current = candidate
+        else:
+            _flush()
+            current = para
+    _flush()
+
+    if ov == 0 or len(chunks) <= 1:
+        return chunks
+
+    out: list[str] = []
+    for i, ch in enumerate(chunks):
+        if i == 0:
+            out.append(ch)
+            continue
+        tail = chunks[i - 1][-ov:]
+        merged = f"{tail}\n{ch}".strip()
+        out.append(merged[: size + ov])
+    return out
+
+
+def ingest_knowledge_documents_for_chunking(chunk_size: int = 900, overlap: int = 120) -> dict:
+    """
+    Step-3 ingestion pipeline (no vectors):
+    pending -> processing -> pending_ready
+    """
+    init_mysql_knowledge_documents_schema()
+    init_mysql_knowledge_chunks_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return {"documents": 0, "chunks": 0, "avg_chunk_size": 0.0, "errors": 1}
+
+    total_docs = 0
+    total_chunks = 0
+    chunk_chars = 0
+    errors = 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, title, category, content, language, version
+                FROM knowledge_documents
+                WHERE status = 'active' AND index_status = 'pending'
+                ORDER BY id ASC
+                """
+            )
+            docs = cur.fetchall() or []
+
+            for doc in docs:
+                doc_id = int(doc["id"])
+                version = int(doc.get("version") or 1)
+                title = (doc.get("title") or "").strip()
+                category = (doc.get("category") or "general").strip() or "general"
+                language = (doc.get("language") or "auto").strip() or "auto"
+                try:
+                    cur.execute(
+                        "UPDATE knowledge_documents SET index_status = 'processing' WHERE id = %s",
+                        (doc_id,),
+                    )
+                    cleaned = clean_knowledge_document_content(doc.get("content") or "")
+                    chunks = chunk_knowledge_document_content(cleaned, chunk_size=chunk_size, overlap=overlap)
+
+                    cur.execute(
+                        "DELETE FROM knowledge_document_chunks WHERE doc_id = %s AND version = %s",
+                        (doc_id, version),
+                    )
+
+                    for i, text in enumerate(chunks, start=1):
+                        content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+                        chunk_id = f"{doc_id}:{version}:{i}"
+                        cur.execute(
+                            """
+                            INSERT INTO knowledge_document_chunks
+                                (chunk_id, doc_id, version, chunk_no, title, category, language, content, content_hash)
+                            VALUES
+                                (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            """,
+                            (chunk_id, doc_id, version, i, title, category, language, text, content_hash),
+                        )
+                        total_chunks += 1
+                        chunk_chars += len(text)
+
+                    cur.execute(
+                        "UPDATE knowledge_documents SET index_status = 'pending_ready' WHERE id = %s",
+                        (doc_id,),
+                    )
+                    total_docs += 1
+                except Exception as row_err:
+                    errors += 1
+                    cur.execute(
+                        "UPDATE knowledge_documents SET index_status = 'pending' WHERE id = %s",
+                        (doc_id,),
+                    )
+                    print(f"knowledge chunking row error (doc_id={doc_id}): {row_err}")
+            conn.commit()
+    except Exception as e:
+        errors += 1
+        print(f"knowledge chunking pipeline error: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+    avg = float(chunk_chars / total_chunks) if total_chunks else 0.0
+    return {"documents": total_docs, "chunks": total_chunks, "avg_chunk_size": avg, "errors": errors}
 
 
 def _ensure_chat_session_row(cursor, chat_id: str, user_id, user_message: str) -> None:

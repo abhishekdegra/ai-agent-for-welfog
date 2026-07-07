@@ -19,7 +19,10 @@ from admin_models import AdminUser, AgentSettings  # noqa: F401 — register mod
 from extensions import db, login_manager
 from routes.admin_routes import register_admin_routes
 from routes.chat_routes import register_chat_routes
-from services.mysql_service import init_mysql_chat_schema
+from services.mysql_service import (
+    init_mysql_chat_schema,
+    init_mysql_knowledge_documents_schema,
+)
 from support_paths import BASE_DIR, ENV_FILE
 
 load_dotenv(ENV_FILE)
@@ -102,6 +105,7 @@ def create_app():
         return AdminUser.query.get(int(user_id))
 
     init_mysql_chat_schema()
+    init_mysql_knowledge_documents_schema()
     register_chat_routes(app)
     register_admin_routes(app)
 
