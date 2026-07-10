@@ -8840,13 +8840,22 @@ def extract_product_search_query(
         ai_sq = str(ai_sq or "").strip()
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
 
-        if isinstance(ai_route, dict) and product_catalog_route_is_locked(ai_route):
-            route_sq = (ai_route.get("search_query") or "").strip()
-            if route_sq:
-                return route_sq
-            if ai_sq and len(ai_sq) >= 2:
-                return ai_sq
+        if isinstance(ai_route, dict) and (
+            product_catalog_route_is_locked(ai_route)
+            or brain_route_indicates_product_catalog(ai_route)
+        ):
+            from services.ai_route_semantics import resolve_catalog_search_phrase
+
+            sq = resolve_catalog_search_phrase(
+                ai_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                ai_search_query=ai_sq,
+            )
+            if sq:
+                return sq
     except ImportError:
         pass
     if _message_looks_like_shopping_query(f"{original_msg} {msg_en}".strip()):

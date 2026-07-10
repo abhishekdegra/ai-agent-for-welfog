@@ -617,6 +617,13 @@ def should_bypass_conversation_scope(
             return False
     if rh in _WELFOG_API_HANDLERS or rh in _KB_SCOPE_BYPASS_HANDLERS:
         return True
+    try:
+        from services.chat_flow_telemetry import is_authoritative_kb_route_locked
+
+        if is_authoritative_kb_route_locked():
+            return True
+    except ImportError:
+        pass
     if ai_route and _substantive_welfog_intent(ai_route):
         return True
     if original_msg or msg_en:

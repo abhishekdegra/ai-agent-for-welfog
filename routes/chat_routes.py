@@ -1658,6 +1658,13 @@ def _try_guard_misclassified_general_kb_ood(
     """
     if not isinstance(brain, dict):
         return None
+    try:
+        from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
+
+        if should_skip_post_kb_ood_guard("_try_guard_misclassified_general_kb_ood"):
+            return None
+    except ImportError:
+        pass
     intent = (brain.get("intent") or "").strip().lower()
     channel = (brain.get("data_channel") or "").strip().lower()
     if intent not in ("general", "payment") or channel != "kb":
@@ -1789,6 +1796,13 @@ def _guard_brain_ai_classify_and_dispatch(
         return None, None
     if brain.get("llm_unavailable"):
         return None, brain
+    try:
+        from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
+
+        kb_locked = should_skip_post_kb_ood_guard("guard_brain_dispatch")
+    except ImportError:
+        kb_locked = (brain.get("data_channel") or "").strip().lower() == "kb"
+
     ctx.setdefault("data", {})["ai_route"] = brain
     intent = (brain.get("intent") or "").strip().lower()
     log_reasoning(
@@ -1799,7 +1813,7 @@ def _guard_brain_ai_classify_and_dispatch(
     )
 
     scope = (brain.get("conversation_scope") or "").strip().lower()
-    if (
+    if not kb_locked and (
         intent == "out_of_domain"
         or scope == "out_of_domain"
         or scope == "general_chitchat"
@@ -1834,13 +1848,15 @@ def _guard_brain_ai_classify_and_dispatch(
         except ImportError:
             pass
 
-    kb_misroute_ood = _try_guard_misclassified_general_kb_ood(
-        brain,
-        original_msg=original_msg,
-        msg_en=msg_en,
-        conv=conv,
-        lang=lang,
-    )
+    kb_misroute_ood = None
+    if not kb_locked:
+        kb_misroute_ood = _try_guard_misclassified_general_kb_ood(
+            brain,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conv=conv,
+            lang=lang,
+        )
     if kb_misroute_ood and str(kb_misroute_ood).strip():
         return str(kb_misroute_ood), brain
 
@@ -3641,28 +3657,95 @@ def _try_early_ai_brain_reply(
         _ch_early = (brain_route_data.get("data_channel") or "").strip().lower()
         _intent_early = (brain_route_data.get("intent") or "").strip().lower()
         _scope_ch_early = (brain_route_data.get("conversation_scope") or "").strip().lower()
-
-        mis_ood = _try_guard_misclassified_general_kb_ood(
-            brain_route_data,
-            original_msg=original_msg,
-            msg_en=msg_en,
-            conv=conv,
-            lang=lang,
+        _kb_keys_early = [
+            str(k).strip() for k in (brain_route_data.get("kb_keys") or []) if str(k).strip()
+        ]
+        _kb_authoritative_json = (
+            _ch_early == "kb"
+            and bool(_kb_keys_early)
+            and not brain_route_data.get("needs_order_id")
+            and _intent_early not in ("out_of_domain",)
+            and brain_route_data.get("is_welfog_related", True) is not False
         )
-        if mis_ood and mis_ood.strip():
-            log_reasoning("Brain early — misrouted off-topic → AI OOD reply.")
-            return _finish_early_brain(
-                mis_ood,
-                {
-                    "intent": "out_of_domain",
-                    "data_channel": "none",
-                    "conversation_scope": "out_of_domain",
-                    "is_welfog_related": False,
-                },
-            )
 
-        # OOD / chitchat — AI reply in customer language (never static template first).
+        # Authoritative KB route — must run before any OOD/chitchat override.
         if (
+            _kb_authoritative_json
+        ):
+            try:
+                from services.brain_direct_dispatch import _try_brain_kb_locked_reply
+
+                kb_brain = _try_brain_kb_locked_reply(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                )
+                if kb_brain:
+                    log_reasoning("Brain early — KB from AI JSON (authoritative, before OOD).")
+                    return _finish_early_brain(kb_brain, brain_route_data)
+            except ImportError:
+                pass
+            try:
+                from services.knowledge_query_pipeline import try_brain_semantic_kb_reply
+
+                kb_semantic_early = try_brain_semantic_kb_reply(
+                    original_msg,
+                    msg_en,
+                    conv,
+                    reply_lang=lang,
+                    brain_route=brain_route_data,
+                )
+                if kb_semantic_early and kb_semantic_early.strip():
+                    log_reasoning(
+                        "Brain early — semantic KB grounded answer (authoritative, before OOD)."
+                    )
+                    return _finish_early_brain(
+                        kb_semantic_early,
+                        {
+                            "intent": "general",
+                            "data_channel": "kb",
+                            "route_handler": "kb_brain_semantic",
+                        },
+                    )
+            except ImportError:
+                pass
+
+        try:
+            from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
+
+            _skip_ood = should_skip_post_kb_ood_guard("brain_early")
+        except ImportError:
+            _skip_ood = _ch_early == "kb"
+        _skip_ood = _skip_ood or _kb_authoritative_json
+
+        if not _skip_ood:
+            mis_ood = _try_guard_misclassified_general_kb_ood(
+                brain_route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv=conv,
+                lang=lang,
+            )
+            if mis_ood and mis_ood.strip():
+                log_reasoning("Brain early — misrouted off-topic → AI OOD reply.")
+                return _finish_early_brain(
+                    mis_ood,
+                    {
+                        "intent": "out_of_domain",
+                        "data_channel": "none",
+                        "conversation_scope": "out_of_domain",
+                        "is_welfog_related": False,
+                    },
+                )
+
+        # OOD / chitchat — only when authoritative KB route is not locked.
+        if not _skip_ood and (
             _intent_early == "out_of_domain"
             or _scope_ch_early == "out_of_domain"
             or _scope_ch_early == "harm_sensitive"
@@ -3707,13 +3790,8 @@ def _try_early_ai_brain_reply(
                 log_reasoning(f"Brain early — scope AI reply ({ood_scope}).")
                 return _finish_early_brain(ood_fast, brain_route_data)
 
-        # KB / scope from brain JSON — before pincode geocode (brain channel=kb only).
         if (
-            _ch_early == "kb"
-            and not brain_route_data.get("needs_order_id")
-            and _intent_early not in ("out_of_domain",)
-            and _scope_ch_early not in ("general_chitchat", "out_of_domain", "harm_sensitive")
-            and brain_route_data.get("is_welfog_related", True) is not False
+            _kb_authoritative_json
         ):
             try:
                 from services.brain_direct_dispatch import _try_brain_kb_locked_reply
@@ -7058,6 +7136,16 @@ def chat():
         if _is_live_api_structured_reply(text_data):
             return text_data
         try:
+            from services.knowledge_grounding_validator import apply_final_kb_fact_contract
+
+            text_data = apply_final_kb_fact_contract(
+                text_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+            )
+        except Exception:
+            pass
+        try:
             from services.catalog_turn_semantics import should_skip_catalog_for_conversational_turn
 
             if should_skip_catalog_for_conversational_turn(
@@ -7072,8 +7160,6 @@ def chat():
         meta = (ar.get("meta_kind") or "").strip().lower()
         channel = (ar.get("data_channel") or "").strip().lower()
         if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
-            return text_data
-        if channel == "kb" and not ar.get("needs_order_id"):
             return text_data
         if channel in ("catalog", "live_api"):
             return text_data
@@ -9916,6 +10002,17 @@ def chat():
                     is_welfog = ai_data.get("is_welfog_related", True)
                     search_query = ai_data.get("search_query") or msg_en
                     ai_response_text = ai_data.get("response", "")
+                    try:
+                        from services.knowledge_grounding_validator import ground_kb_llm_response
+
+                        ai_response_text = ground_kb_llm_response(
+                            ai_response_text,
+                            kb_context=kb_context,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                        )
+                    except ImportError:
+                        pass
                     # Final merge happens after cache branch; KB-first answers must not be overwritten by a second Groq call.
 
             # AI-first: do not replay cached routing/answers for different user questions
@@ -9981,9 +10078,15 @@ def chat():
 
                 log_reasoning(f"AI routing decision => intent={intent_route}, is_welfog_related={is_welfog}")
 
-                # Hard guard: if this turn is clearly off-topic / non-Welfog, force polite decline path.
+                # Hard guard: off-topic only when authoritative KB route is not locked.
                 comb_turn = f"{original_msg} {msg_en}".lower()
-                if not is_welfog or intent_route == "out_of_domain":
+                try:
+                    from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
+
+                    kb_locked = should_skip_post_kb_ood_guard("legacy_answer_router")
+                except ImportError:
+                    kb_locked = (route_data.get("data_channel") or "").strip().lower() == "kb"
+                if not kb_locked and (not is_welfog or intent_route == "out_of_domain"):
                     from services.off_topic_reply import build_off_topic_polite_reply
 
                     reset_context(ctx)
@@ -10000,7 +10103,7 @@ def chat():
                 from services.support_scope import resolve_support_request_scope
 
                 scope_now = resolve_support_request_scope(original_msg, msg_en, conversation_context=conv_for_llm)
-                if scope_now == "external":
+                if not kb_locked and scope_now == "external":
                     from services.off_topic_reply import build_off_topic_polite_reply
 
                     reset_context(ctx)
@@ -10091,6 +10194,17 @@ def chat():
                     intent = ai_data.get("intent", intent_route)
                     is_welfog = ai_data.get("is_welfog_related", is_welfog)
                     ai_response_text = ai_data.get("response", "")
+                    try:
+                        from services.knowledge_grounding_validator import ground_kb_llm_response
+
+                        ai_response_text = ground_kb_llm_response(
+                            ai_response_text,
+                            kb_context=kb_context,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                        )
+                    except ImportError:
+                        pass
 
             # Note: ai_data already normalized above
             
@@ -10143,6 +10257,16 @@ def chat():
             is_welfog = ai_data.get("is_welfog_related", True)
             search_query = ai_data.get("search_query") or msg_en 
             ai_response_text = ai_data.get("response", "")
+            try:
+                from services.knowledge_grounding_validator import apply_final_kb_fact_contract
+
+                ai_response_text = apply_final_kb_fact_contract(
+                    ai_response_text,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                )
+            except ImportError:
+                pass
 
             # Strict anti-stale guard:
             # If the user asks a factual "who/owner/founder/partner" style query,

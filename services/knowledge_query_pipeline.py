@@ -506,7 +506,15 @@ def _semantic_kb_match(
         keys = scoped_kb_keys_for_retrieval(category, ai_route=ai_route, user_meaning=q)
         if not keys:
             keys = get_customer_kb_keys()
-        hits = top_kb_hits(q, keys=keys, min_score=floor, top_n=8, log_retrieval=False)
+        hits = top_kb_hits(
+            q,
+            keys=keys,
+            min_score=floor,
+            top_n=8,
+            log_retrieval=False,
+            ai_route=ai_route,
+            kb_intent=bool(ai_route and (ai_route.get("data_channel") or "").strip().lower() == "kb"),
+        )
         hit = _pick_best_semantic_kb_hit(q, hits, query_category=category)
         if not hit:
             hit = retrieve_best_kb_chunk(q, keys=keys, ai_route=ai_route, min_score=floor)
@@ -2350,6 +2358,26 @@ def _try_knowledge_reply_before_interference_impl(
 
     if skip_answer_llm:
         return None
+
+    try:
+        from services.knowledge_answer_service import (
+            generate_grounded_kb_answer_from_qdrant,
+            should_generate_qdrant_kb_answer,
+        )
+
+        if should_generate_qdrant_kb_answer(ai_route):
+            qdrant_body = generate_grounded_kb_answer_from_qdrant(
+                original_msg,
+                msg_en=msg_en,
+                reply_lang=reply_lang,
+                conversation_context=conversation_context,
+                ai_route=ai_route,
+            )
+            if qdrant_body and qdrant_body.strip():
+                log_reasoning("Pre-scope Qdrant grounded KB answer.")
+                return qdrant_body
+    except ImportError:
+        pass
 
     if decision.handler == "kb_grounded_ai" and decision.kb_hit:
         src = (decision.kb_hit.get("source") or "").strip().lower()

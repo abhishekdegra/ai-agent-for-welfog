@@ -754,6 +754,306 @@ def ingest_knowledge_documents_for_chunking(chunk_size: int = 900, overlap: int 
     return {"documents": total_docs, "chunks": total_chunks, "avg_chunk_size": avg, "errors": errors}
 
 
+def get_knowledge_document_by_title(title: str) -> dict | None:
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, category, content, language, status, version, index_status "
+                "FROM knowledge_documents WHERE title = %s LIMIT 1",
+                ((title or "").strip(),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_knowledge_document_by_id(doc_id: int) -> dict | None:
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, title, category, content, language, status, version, index_status "
+                "FROM knowledge_documents WHERE id = %s LIMIT 1",
+                (int(doc_id),),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def create_knowledge_document_record(
+    title: str,
+    content: str,
+    *,
+    category: str | None = None,
+    language: str = "auto",
+) -> int | None:
+    """Insert active knowledge document with index_status=pending."""
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return None
+    t = (title or "").strip()
+    if not t:
+        return None
+    cat = (category or _infer_knowledge_category_from_title(t)).strip() or "general"
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO knowledge_documents
+                    (title, category, content, language, status, version, index_status)
+                VALUES
+                    (%s, %s, %s, %s, %s, %s, %s)
+                """,
+                (t, cat, content or "", language or "auto", "active", 1, "pending"),
+            )
+            doc_id = int(cur.lastrowid)
+        conn.commit()
+        return doc_id
+    except Exception as e:
+        print(f"create_knowledge_document_record error: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return None
+    finally:
+        conn.close()
+
+
+def delete_knowledge_document_record(doc_id: int) -> bool:
+    init_mysql_knowledge_documents_schema()
+    init_mysql_knowledge_chunks_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM knowledge_document_chunks WHERE doc_id = %s", (int(doc_id),))
+            cur.execute("DELETE FROM knowledge_documents WHERE id = %s", (int(doc_id),))
+        conn.commit()
+        return True
+    except Exception as e:
+        print(f"delete_knowledge_document_record error: {e}")
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        conn.close()
+
+
+def delete_knowledge_document_chunks(doc_id: int, *, version: int | None = None) -> int:
+    init_mysql_knowledge_chunks_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            if version is not None:
+                cur.execute(
+                    "DELETE FROM knowledge_document_chunks WHERE doc_id = %s AND version = %s",
+                    (int(doc_id), int(version)),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM knowledge_document_chunks WHERE doc_id = %s",
+                    (int(doc_id),),
+                )
+            deleted = int(cur.rowcount or 0)
+        conn.commit()
+        return deleted
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        conn.close()
+
+
+def set_knowledge_document_index_status(doc_id: int, status: str) -> None:
+    conn = get_mysql_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE knowledge_documents SET index_status = %s WHERE id = %s",
+                (status, int(doc_id)),
+            )
+        conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+    finally:
+        conn.close()
+
+
+def process_knowledge_document_chunks(
+    doc_id: int,
+    *,
+    chunk_size: int = 900,
+    overlap: int = 120,
+    replace_all_versions: bool = False,
+) -> dict:
+    """
+    Clean + chunk one document.
+    index_status: processing -> pending_ready (or failed).
+    """
+    init_mysql_knowledge_documents_schema()
+    init_mysql_knowledge_chunks_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return {"ok": False, "doc_id": doc_id, "chunks": 0, "error": "mysql_unreachable"}
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, title, category, content, language, version, status
+                FROM knowledge_documents
+                WHERE id = %s
+                LIMIT 1
+                FOR UPDATE
+                """,
+                (int(doc_id),),
+            )
+            doc = cur.fetchone()
+            if not doc:
+                conn.rollback()
+                return {"ok": False, "doc_id": doc_id, "chunks": 0, "error": "document_not_found"}
+
+            if (doc.get("status") or "").strip().lower() != "active":
+                conn.rollback()
+                return {"ok": False, "doc_id": doc_id, "chunks": 0, "error": "document_not_active"}
+
+            version = int(doc.get("version") or 1)
+            title = (doc.get("title") or "").strip()
+            category = (doc.get("category") or "general").strip() or "general"
+            language = (doc.get("language") or "auto").strip() or "auto"
+
+            cur.execute(
+                "UPDATE knowledge_documents SET index_status = 'processing' WHERE id = %s",
+                (doc_id,),
+            )
+
+            cleaned = clean_knowledge_document_content(doc.get("content") or "")
+            chunks = chunk_knowledge_document_content(cleaned, chunk_size=chunk_size, overlap=overlap)
+
+            if replace_all_versions:
+                cur.execute(
+                    "DELETE FROM knowledge_document_chunks WHERE doc_id = %s",
+                    (doc_id,),
+                )
+            else:
+                cur.execute(
+                    "DELETE FROM knowledge_document_chunks WHERE doc_id = %s AND version = %s",
+                    (doc_id, version),
+                )
+
+            for i, text in enumerate(chunks, start=1):
+                content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+                chunk_id = f"{doc_id}:{version}:{i}"
+                cur.execute(
+                    """
+                    INSERT INTO knowledge_document_chunks
+                        (chunk_id, doc_id, version, chunk_no, title, category, language, content, content_hash)
+                    VALUES
+                        (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """,
+                    (chunk_id, doc_id, version, i, title, category, language, text, content_hash),
+                )
+
+            cur.execute(
+                "UPDATE knowledge_documents SET index_status = 'pending_ready' WHERE id = %s",
+                (doc_id,),
+            )
+        conn.commit()
+        return {
+            "ok": True,
+            "doc_id": int(doc_id),
+            "version": version,
+            "chunks": len(chunks),
+        }
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        set_knowledge_document_index_status(doc_id, "failed")
+        return {"ok": False, "doc_id": doc_id, "chunks": 0, "error": str(exc)}
+    finally:
+        conn.close()
+
+
+def bump_knowledge_document_version(
+    doc_id: int,
+    content: str,
+    *,
+    category: str | None = None,
+) -> dict:
+    """
+    Update document content and increment version.
+    Sets index_status=processing (caller runs chunk + embed).
+    """
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return {"ok": False, "error": "mysql_unreachable"}
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT version, category FROM knowledge_documents WHERE id = %s FOR UPDATE",
+                (int(doc_id),),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return {"ok": False, "error": "document_not_found"}
+            old_version = int(row.get("version") or 1)
+            new_version = old_version + 1
+            cat = (category or row.get("category") or "general").strip() or "general"
+            cur.execute(
+                """
+                UPDATE knowledge_documents
+                SET content = %s, category = %s, version = %s, index_status = 'processing', updated_at = NOW()
+                WHERE id = %s
+                """,
+                (content or "", cat, new_version, int(doc_id)),
+            )
+        conn.commit()
+        return {
+            "ok": True,
+            "doc_id": int(doc_id),
+            "old_version": old_version,
+            "new_version": new_version,
+        }
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        set_knowledge_document_index_status(doc_id, "failed")
+        return {"ok": False, "error": str(exc)}
+    finally:
+        conn.close()
+
+
 def _ensure_chat_session_row(cursor, chat_id: str, user_id, user_message: str) -> None:
     """Sidebar row must exist before/with chats — history INNER JOIN depends on it."""
     if not chat_id:

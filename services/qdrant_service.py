@@ -235,3 +235,157 @@ def init_qdrant_on_startup() -> dict[str, Any]:
     else:
         print(f"[startup] Qdrant collection init failed: {collection.get('detail')}", flush=True)
     return {"health": health, "collection": collection}
+
+
+def retrieve_knowledge_point_hashes(collection: str, point_ids: list[str]) -> dict[str, str]:
+    """Return {point_id: content_hash} for existing points (skip re-index)."""
+    if not point_ids:
+        return {}
+    client = get_qdrant_client()
+    if client is None:
+        return {}
+    out: dict[str, str] = {}
+    batch = 128
+    for i in range(0, len(point_ids), batch):
+        ids = point_ids[i : i + batch]
+        try:
+            records = client.retrieve(
+                collection_name=collection,
+                ids=ids,
+                with_payload=["content_hash"],
+                with_vectors=False,
+            )
+            for rec in records or []:
+                pid = str(rec.id)
+                payload = rec.payload or {}
+                out[pid] = str(payload.get("content_hash") or "").strip()
+        except Exception:
+            continue
+    return out
+
+
+def upsert_knowledge_vectors(collection: str, points: list[dict]) -> int:
+    """
+    Upsert knowledge vectors into Qdrant.
+    Each point: {point_id, vector, payload}
+    """
+    if not points:
+        return 0
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+    from qdrant_client.models import PointStruct
+
+    qpoints = [
+        PointStruct(
+            id=p["point_id"],
+            vector=p["vector"],
+            payload=p.get("payload") or {},
+        )
+        for p in points
+    ]
+    client.upsert(collection_name=collection, points=qpoints, wait=True)
+    return len(qpoints)
+
+
+def search_knowledge_vectors(
+    collection: str,
+    query_vector: list[float],
+    *,
+    top_k: int = 5,
+    min_score: float | None = None,
+    category_filter: list[str] | None = None,
+    language_filter: str | None = None,
+    doc_id_filter: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Semantic search in the knowledge collection.
+    Returns list of {score, payload, point_id}.
+    """
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+    must: list[Any] = []
+    if category_filter:
+        scope_keys = [c.strip().lower() for c in category_filter if (c or "").strip()]
+        if scope_keys:
+            # kb_keys are document titles (file stems); category is a separate taxonomy field.
+            # Match either payload.title OR payload.category so brain hints scope correctly.
+            must.append(
+                Filter(
+                    should=[
+                        FieldCondition(key="title", match=MatchAny(any=scope_keys)),
+                        FieldCondition(key="category", match=MatchAny(any=scope_keys)),
+                    ]
+                )
+            )
+    if language_filter:
+        must.append(
+            FieldCondition(
+                key="language",
+                match=MatchAny(any=[language_filter.lower(), "auto"]),
+            )
+        )
+    if doc_id_filter:
+        must.append(FieldCondition(key="doc_id", match=MatchAny(any=[int(x) for x in doc_id_filter])))
+
+    query_filter = Filter(must=must) if must else None
+    limit = max(1, min(20, int(top_k)))
+    score_threshold = float(min_score) if min_score is not None else None
+
+    results = client.search(
+        collection_name=collection,
+        query_vector=query_vector,
+        limit=limit,
+        score_threshold=score_threshold,
+        query_filter=query_filter,
+        with_payload=True,
+    )
+
+    out: list[dict[str, Any]] = []
+    for rec in results or []:
+        payload = dict(rec.payload or {})
+        out.append(
+            {
+                "point_id": str(rec.id),
+                "score": float(rec.score or 0.0),
+                "payload": payload,
+            }
+        )
+    return out
+
+
+def delete_knowledge_vectors_by_point_ids(collection: str, point_ids: list[str]) -> int:
+    """Delete Qdrant points by deterministic IDs."""
+    if not point_ids:
+        return 0
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+    batch = 128
+    deleted = 0
+    for i in range(0, len(point_ids), batch):
+        ids = point_ids[i : i + batch]
+        client.delete(collection_name=collection, points_selector=ids, wait=True)
+        deleted += len(ids)
+    return deleted
+
+
+def delete_knowledge_vectors_by_doc_id(collection: str, doc_id: int) -> int:
+    """Delete all Qdrant vectors for a knowledge document (all versions)."""
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+    from qdrant_client.models import FieldCondition, Filter, FilterSelector, MatchValue
+
+    client.delete(
+        collection_name=collection,
+        points_selector=FilterSelector(
+            filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=int(doc_id)))])
+        ),
+        wait=True,
+    )
+    return 1

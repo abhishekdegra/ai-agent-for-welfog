@@ -1622,17 +1622,49 @@ def semantic_kb_search(
     min_score: float | None = None,
     customer_only: bool = True,
     log_retrieval: bool = True,
+    ai_route: dict | None = None,
+    kb_intent: bool = False,
 ) -> list[dict]:
     """
     Core semantic retrieval — cosine similarity on embeddings only (no keyword matching).
     Keyword fallback runs only when embeddings are disabled/unavailable.
+    When KB_RETRIEVAL_BACKEND=qdrant and intent is Knowledge Base, uses Qdrant retrieval.
     """
-    ensure_knowledge_cache_fresh()
-    ensure_kb_vectors()
     floor = float(min_score if min_score is not None else KB_SEMANTIC_MIN_SCORE)
     q = _normalize_retrieval_query(query)
     if not q:
         return []
+
+    try:
+        from services.knowledge_retriever import (
+            is_qdrant_kb_retrieval_enabled,
+            retrieve_knowledge_hits,
+            should_use_qdrant_retrieval,
+        )
+
+        if should_use_qdrant_retrieval(ai_route=ai_route, kb_intent=kb_intent):
+            scoped_keys = keys
+            if scoped_keys is None and customer_only:
+                scoped_keys = get_customer_kb_keys()
+            return retrieve_knowledge_hits(
+                q,
+                keys=scoped_keys,
+                top_n=top_n,
+                min_score=floor,
+                ai_route=ai_route,
+                kb_intent=kb_intent,
+                log_retrieval=log_retrieval,
+            )
+        if is_qdrant_kb_retrieval_enabled() and not should_use_qdrant_retrieval(
+            ai_route=ai_route, kb_intent=kb_intent
+        ):
+            # Qdrant enabled but non-KB probe — fall through to in-memory path.
+            pass
+    except ImportError:
+        pass
+
+    ensure_knowledge_cache_fresh()
+    ensure_kb_vectors()
 
     scoped_chunks, scoped_vectors, scoped_sources = _scoped_kb_index(keys, customer_only=customer_only)
     if not scoped_chunks:
@@ -1715,6 +1747,13 @@ def promote_route_from_semantic_kb_match(
     out = dict(route or {})
     if out.get("run_catalog_search") or out.get("_product_catalog_locked"):
         return None
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+        if brain_route_indicates_product_catalog(out):
+            return None
+    except ImportError:
+        pass
     combined = f"{original_msg or ''} {msg_en or ''}".strip()
     if not combined:
         return None
@@ -1766,6 +1805,16 @@ def promote_route_from_semantic_kb_match(
     out.pop("category_browse", None)
     out.pop("_product_catalog_locked", None)
     out["_turn_promotions_done"] = True
+    try:
+        from services.chat_flow_telemetry import lock_authoritative_kb_route_from_retrieval
+
+        lock_authoritative_kb_route_from_retrieval(
+            chunks=1,
+            top_score=score,
+            ai_route=out,
+        )
+    except ImportError:
+        pass
     return out
 
 
@@ -1849,7 +1898,7 @@ def retrieve_best_kb_chunk(
     floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
     search_floor = max(0.12, floor - 0.1)
     hits = semantic_kb_search(
-        query, keys=keys, top_n=8, min_score=search_floor, log_retrieval=False
+        query, keys=keys, top_n=8, min_score=search_floor, log_retrieval=False, ai_route=ai_route
     )
     return _pick_best_kb_hit_for_query(
         query,
@@ -2101,6 +2150,19 @@ def _ground_kb_excerpt_for_customer(
         )
         resp = (ai.get("response") or "").strip() if ai else ""
         if resp and not _ai_response_looks_like_placeholder(resp):
+            try:
+                from services.knowledge_grounding_validator import ground_kb_llm_response
+
+                resp = ground_kb_llm_response(
+                    resp,
+                    kb_context=excerpt,
+                    original_msg=original_msg,
+                    msg_en="",
+                )
+            except ImportError:
+                pass
+            if not resp:
+                resp = (ai.get("response") or "").strip() if ai else ""
             resp = polish_faq_reply_for_customer(resp, original_msg)
             if resp.strip().startswith("<"):
                 return finalize_customer_reply(resp, original_msg, rl)
@@ -2591,6 +2653,47 @@ def format_kb_answer_from_brain_keys(
     )
 
     route = ai_route or {}
+
+    # Step 7: Authoritative KB pipeline (retrieve → structured facts → grounded LLM).
+    try:
+        from services.knowledge_answer_service import resolve_authoritative_kb_answer
+
+        auth_answer = resolve_authoritative_kb_answer(
+            original_msg,
+            msg_en=msg_en,
+            keys=keys,
+            reply_lang=reply_lang,
+            conversation_context=conversation_context,
+            user_meaning_en=user_meaning_en,
+            ai_route=route,
+        )
+        if auth_answer is not None and auth_answer.strip():
+            return auth_answer
+    except ImportError:
+        pass
+
+    # Legacy Step 7 fallback (kept for import safety).
+    try:
+        from services.knowledge_answer_service import (
+            generate_grounded_kb_answer_from_qdrant,
+            should_generate_qdrant_kb_answer,
+        )
+
+        if should_generate_qdrant_kb_answer(route):
+            qdrant_answer = generate_grounded_kb_answer_from_qdrant(
+                original_msg,
+                msg_en=msg_en,
+                keys=keys,
+                reply_lang=reply_lang,
+                conversation_context=conversation_context,
+                user_meaning_en=user_meaning_en,
+                ai_route=route,
+            )
+            if qdrant_answer is not None:
+                return qdrant_answer
+    except ImportError:
+        pass
+
     if not keys:
         keys = resolve_brain_kb_keys(
             route,
@@ -3064,7 +3167,22 @@ def format_dynamic_kb_answer(
             )
             resp = (ai.get("response") or "").strip() if ai else ""
             if resp and not _ai_response_looks_like_placeholder(resp):
-                core_html = _plain_text_to_html_body(resp)
+                try:
+                    from services.knowledge_grounding_validator import ground_kb_llm_response
+
+                    kb_ctx = (
+                        f"AUTHORITATIVE KNOWLEDGE (live admin files: {', '.join(keys)}):\n{filtered}"
+                    )
+                    resp = ground_kb_llm_response(
+                        resp,
+                        kb_context=kb_ctx,
+                        original_msg=original_msg,
+                        msg_en=msg_en,
+                    )
+                except ImportError:
+                    pass
+                if resp:
+                    core_html = _plain_text_to_html_body(resp)
         except Exception:
             pass
 
@@ -4198,17 +4316,41 @@ def sysmsg(key: str, **kwargs):
 
 
 
-def get_knowledge_context(query, keys=None, top_k=3, min_score=None):
+def get_knowledge_context(query, keys=None, top_k=3, min_score=None, ai_route=None):
     """
     If keys provided, search within those knowledge files only; else customer KB files.
     Returns an HTML string to inject into the system prompt.
     """
+    floor = float(min_score if min_score is not None else KB_CONTEXT_MIN_SCORE)
+    norm_q = _normalize_retrieval_query(query)
+    if not norm_q:
+        return ""
+
+    try:
+        from services.knowledge_retriever import (
+            format_knowledge_context_string,
+            should_use_qdrant_retrieval,
+            retrieve_knowledge_context,
+        )
+
+        if should_use_qdrant_retrieval(ai_route=ai_route, kb_intent=True):
+            result = retrieve_knowledge_context(
+                norm_q,
+                top_k=top_k,
+                min_score=floor,
+                categories=keys,
+                ai_route=ai_route,
+                kb_intent=True,
+                log=True,
+            )
+            return format_knowledge_context_string(result.hits)
+    except ImportError:
+        pass
+
     ensure_knowledge_cache_fresh()
     if not all_chunks:
         return ""
 
-    floor = float(min_score if min_score is not None else KB_CONTEXT_MIN_SCORE)
-    norm_q = _normalize_retrieval_query(query)
     cache_key = (
         f"kbctx::{_KB_SNAPSHOT}::{norm_q}::{','.join(keys) if keys else 'CUSTOMER'}"
         f"::{top_k}::{floor}"
@@ -4223,6 +4365,8 @@ def get_knowledge_context(query, keys=None, top_k=3, min_score=None):
         top_n=top_k,
         min_score=floor,
         customer_only=not bool(keys),
+        ai_route=ai_route,
+        kb_intent=True,
     )
     if not hits:
         _cache_set(cache_key, "")
@@ -4300,10 +4444,23 @@ def top_kb_hits(
     min_score: float | None = None,
     top_n: int = 4,
     log_retrieval: bool = False,
+    ai_route: dict | None = None,
+    kb_intent: bool = False,
 ) -> list[dict]:
     """Top-N semantic KB chunks for reranking (multilingual queries)."""
-    if not all_chunks or not (query or "").strip():
+    if not (query or "").strip():
         return []
+    try:
+        from services.knowledge_retriever import should_use_qdrant_retrieval
+
+        if not should_use_qdrant_retrieval(ai_route=ai_route, kb_intent=kb_intent):
+            ensure_knowledge_cache_fresh()
+            if not all_chunks:
+                return []
+    except ImportError:
+        ensure_knowledge_cache_fresh()
+        if not all_chunks:
+            return []
     floor = float(min_score if min_score is not None else KB_CONTEXT_MIN_SCORE)
     return semantic_kb_search(
         query,
@@ -4312,6 +4469,8 @@ def top_kb_hits(
         min_score=floor,
         customer_only=not bool(keys),
         log_retrieval=log_retrieval,
+        ai_route=ai_route,
+        kb_intent=kb_intent,
     )
 
 

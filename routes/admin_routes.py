@@ -17,6 +17,11 @@ from services.agent_llm_settings import (
 from support_paths import KNOWLEDGE_DIR
 from extensions import db
 from services.kb_service import get_allowed_knowledge_filenames, refresh_knowledge_cache
+from services.knowledge_reindex_service import (
+    sync_admin_txt_create,
+    sync_admin_txt_delete,
+    sync_admin_txt_update,
+)
 from utils.validators import _safe_knowledge_filename
 
 
@@ -96,7 +101,15 @@ def register_admin_routes(app):
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(initial_content.strip())
             refresh_knowledge_cache()
-            flash(f"Created {filename} successfully.", "success")
+            sync_result = sync_admin_txt_create(safe_name, initial_content.strip())
+            if not sync_result.get("ok"):
+                flash(
+                    f"Created {filename} but knowledge re-index failed: "
+                    f"{sync_result.get('reindex', {}).get('error') or sync_result.get('error')}",
+                    "error",
+                )
+            else:
+                flash(f"Created {filename} and indexed to knowledge pipeline.", "success")
             return redirect(url_for("admin_knowledge"))
         return render_template("admin_new_file.html", nav_active="knowledge")
 
@@ -110,10 +123,20 @@ def register_admin_routes(app):
         if not file_path.startswith(os.path.abspath(KNOWLEDGE_DIR) + os.sep):
             abort(403)
         if request.method == "POST":
+            new_content = request.form["content"]
             with open(file_path, "w", encoding="utf-8") as f:
-                f.write(request.form["content"])
+                f.write(new_content)
             refresh_knowledge_cache()
-            flash(f"Saved {filename} and refreshed index.", "success")
+            title = os.path.splitext(filename)[0]
+            sync_result = sync_admin_txt_update(title, new_content)
+            if not sync_result.get("ok"):
+                flash(
+                    f"Saved {filename} but knowledge re-index failed: "
+                    f"{sync_result.get('reindex', {}).get('error') or sync_result.get('error')}",
+                    "error",
+                )
+            else:
+                flash(f"Saved {filename} and re-indexed knowledge pipeline.", "success")
             return redirect(url_for("admin_knowledge"))
 
         with open(file_path, "r", encoding="utf-8") as f:
@@ -135,7 +158,9 @@ def register_admin_routes(app):
             flash("Could not delete file.", "error")
             return redirect(url_for("admin_knowledge"))
         refresh_knowledge_cache()
-        flash(f"Deleted {filename}.", "success")
+        title = os.path.splitext(filename)[0]
+        sync_admin_txt_delete(title)
+        flash(f"Deleted {filename} and removed from knowledge pipeline.", "success")
         return redirect(url_for("admin_knowledge"))
 
     @app.route("/admin-logout")

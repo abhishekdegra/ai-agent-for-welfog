@@ -56,7 +56,183 @@ def begin_chat_turn() -> str:
     _TLS.llm_budget_exceeded = False
     _TLS.route_loop_guard = False
     _TLS._micro_defer_logged = False
+    _TLS.authoritative_route_lock = None
+    _TLS.kb_grounding_hits: list[dict[str, Any]] = []
+    _TLS.kb_grounding_corpus = ""
     return rid
+
+
+def set_kb_grounding_context(
+    hits: list[dict[str, Any]] | None = None,
+    *,
+    corpus: str = "",
+) -> None:
+    """Store authoritative KB chunks/corpus for final fact-contract enforcement."""
+    if hits:
+        _TLS.kb_grounding_hits = list(hits)
+    if corpus:
+        _TLS.kb_grounding_corpus = corpus.strip()
+    elif hits:
+        try:
+            from services.knowledge_grounding_validator import _chunk_corpus
+
+            _TLS.kb_grounding_corpus = _chunk_corpus(hits)
+        except ImportError:
+            pass
+
+
+def append_kb_grounding_corpus(corpus: str) -> None:
+    extra = (corpus or "").strip()
+    if not extra:
+        return
+    prev = (getattr(_TLS, "kb_grounding_corpus", "") or "").strip()
+    if prev and extra not in prev:
+        _TLS.kb_grounding_corpus = f"{prev}\n\n{extra}"
+    elif not prev:
+        _TLS.kb_grounding_corpus = extra
+
+
+def get_kb_grounding_context() -> tuple[list[dict[str, Any]], str]:
+    hits = getattr(_TLS, "kb_grounding_hits", None) or []
+    corpus = (getattr(_TLS, "kb_grounding_corpus", "") or "").strip()
+    return list(hits), corpus
+
+
+def _route_lock() -> dict[str, Any]:
+    lock = getattr(_TLS, "authoritative_route_lock", None)
+    if not isinstance(lock, dict):
+        lock = {}
+        _TLS.authoritative_route_lock = lock
+    return lock
+
+
+def brain_route_authoritative_kb_lock(ai_route: dict | None) -> bool:
+    """True when ai_brain_route locked an in-scope KB answer path."""
+    if not isinstance(ai_route, dict):
+        return False
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(ai_route) or brain_route_indicates_product_catalog(
+            ai_route
+        ):
+            return False
+    except ImportError:
+        pass
+    if ai_route.get("run_catalog_search"):
+        return False
+    channel = (ai_route.get("data_channel") or "").strip().lower()
+    if channel != "kb":
+        return False
+    if ai_route.get("needs_order_id"):
+        return False
+    intent = (ai_route.get("intent") or "").strip().lower()
+    if intent == "out_of_domain":
+        return False
+    scope = (ai_route.get("conversation_scope") or "").strip().lower()
+    if scope in ("out_of_domain", "harm_sensitive"):
+        return False
+    if ai_route.get("is_welfog_related") is False:
+        return False
+    return True
+
+
+def lock_authoritative_kb_route(
+    *,
+    source: str,
+    handler: str = "kb_grounded",
+    chunks: int = 0,
+    top_score: float = 0.0,
+    ai_route: dict | None = None,
+) -> None:
+    """Make KB routing immutable for this turn — later OOD/chitchat guards must not override."""
+    lock = _route_lock()
+    prev = lock.get("channel")
+    lock.update(
+        {
+            "channel": "kb",
+            "handler": handler or "kb_grounded",
+            "source": source or "brain_route",
+            "immutable": True,
+            "chunks": int(chunks or 0),
+            "top_score": float(top_score or 0.0),
+        }
+    )
+    if isinstance(ai_route, dict):
+        lock["intent"] = (ai_route.get("intent") or "general").strip().lower()
+        lock["kb_keys"] = list(ai_route.get("kb_keys") or [])
+    if prev != "kb":
+        log_reasoning(
+            f"Authoritative route lock: channel=kb source={lock.get('source')} "
+            f"handler={lock.get('handler')} chunks={lock.get('chunks')} "
+            f"top_score={lock.get('top_score'):.3f}"
+        )
+
+
+def lock_authoritative_kb_route_from_brain(ai_route: dict | None) -> None:
+    if brain_route_authoritative_kb_lock(ai_route):
+        lock_authoritative_kb_route(
+            source="brain_route",
+            handler="kb_brain_locked",
+            ai_route=ai_route,
+        )
+
+
+def lock_authoritative_kb_route_from_retrieval(
+    *,
+    chunks: int,
+    top_score: float,
+    ai_route: dict | None = None,
+) -> None:
+    lock_authoritative_kb_route(
+        source="kb_retrieval",
+        handler="kb_grounded",
+        chunks=chunks,
+        top_score=top_score,
+        ai_route=ai_route,
+    )
+
+
+def is_authoritative_kb_route_locked() -> bool:
+    lock = getattr(_TLS, "authoritative_route_lock", None)
+    return isinstance(lock, dict) and lock.get("channel") == "kb" and bool(lock.get("immutable"))
+
+
+def authoritative_route_lock_summary() -> str:
+    lock = getattr(_TLS, "authoritative_route_lock", None)
+    if not isinstance(lock, dict) or not lock.get("channel"):
+        return "-"
+    return (
+        f"{lock.get('channel')}:{lock.get('source')}:{lock.get('handler')}"
+        f":chunks={lock.get('chunks', 0)}:score={float(lock.get('top_score') or 0):.3f}"
+    )
+
+
+def should_skip_post_kb_ood_guard(
+    caller: str = "",
+    ai_route: dict | None = None,
+) -> bool:
+    """OOD/chitchat/general guards must not run after authoritative KB lock."""
+    if is_authoritative_kb_route_locked():
+        label = f" ({caller})" if caller else ""
+        log_reasoning(
+            f"OOD guard skipped{label} — authoritative KB route locked "
+            f"({authoritative_route_lock_summary()})."
+        )
+        return True
+    route = ai_route
+    if route is None:
+        route = get_cached_brain_route()
+    if brain_route_authoritative_kb_lock(route if isinstance(route, dict) else None):
+        lock_authoritative_kb_route_from_brain(route if isinstance(route, dict) else None)
+        label = f" ({caller})" if caller else ""
+        log_reasoning(
+            f"OOD guard skipped{label} — brain locked data_channel=kb "
+            f"({authoritative_route_lock_summary()})."
+        )
+        return True
+    return False
 
 
 def record_phase(phase: str, duration_ms: float) -> None:
@@ -144,6 +320,7 @@ def store_brain_route_result(result: dict | None) -> None:
     if isinstance(result, dict):
         _TLS.brain_route_result = dict(result)
         _TLS.brain_route_called = True
+        lock_authoritative_kb_route_from_brain(result)
         if not result.get("llm_unavailable"):
             mark_routing_complete()
 
@@ -296,6 +473,39 @@ def ensure_product_rescue_llm_slot() -> None:
     log_reasoning(
         f"LLM budget reset for product rescue (limit={MAX_LLM_CALLS_PER_TURN})."
     )
+
+
+def mark_kb_grounding_operation() -> None:
+    """Qdrant retrieval succeeded — grounding LLM is part of the same KB answer operation."""
+    _TLS.kb_grounding_reserved = True
+
+
+def clear_kb_grounding_operation() -> None:
+    if hasattr(_TLS, "kb_grounding_reserved"):
+        delattr(_TLS, "kb_grounding_reserved")
+
+
+def kb_grounding_reserved() -> bool:
+    return bool(getattr(_TLS, "kb_grounding_reserved", False))
+
+
+def ensure_kb_grounding_llm_slot() -> None:
+    """
+    Reserve one LLM call for ai_brain_answer after successful Qdrant retrieval.
+    Retrieval + grounded answer are one logical KB operation — not a separate budget surprise.
+    """
+    if not kb_grounding_reserved():
+        return
+    if not llm_budget_exceeded() and llm_calls_count() < MAX_LLM_CALLS_PER_TURN:
+        return
+    log_reasoning(
+        f"LLM call budget reset — reserving one slot for KB grounded answer "
+        f"(limit={MAX_LLM_CALLS_PER_TURN}; retrieval already succeeded)."
+    )
+    _TLS.llm_budget_exceeded = False
+    current = int(getattr(_TLS, "llm_calls", 0) or 0)
+    if current >= MAX_LLM_CALLS_PER_TURN:
+        _TLS.llm_calls = max(0, MAX_LLM_CALLS_PER_TURN - 1)
 
 
 def reset_llm_budget_for_recovery() -> None:

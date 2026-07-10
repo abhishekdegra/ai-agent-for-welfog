@@ -377,7 +377,11 @@ def ai_classify_product_search_turn(
                 if intent_b in ("out_of_domain",) or scope_b == "out_of_domain":
                     allow_ood_rescue = True
             if not allow_ood_rescue:
-                locked = _locked_product_turn_from_route(route)
+                locked = _locked_product_turn_from_route(
+                    route,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                )
                 if locked and locked.kind == KIND_PRODUCT_SEARCH:
                     log_reasoning(
                         f"Product-catalog LLM skipped — brain locked sq={locked.search_query!r}."
@@ -553,6 +557,8 @@ def _locked_product_turn_from_route(
     ai_route: dict | None,
     *,
     search_query: str = "",
+    original_msg: str = "",
+    msg_en: str = "",
 ) -> ResolvedProductSearchTurn | None:
     """Reuse main router product JSON — no duplicate product micro-classifier LLM."""
     if not isinstance(ai_route, dict):
@@ -560,6 +566,17 @@ def _locked_product_turn_from_route(
     intent = (ai_route.get("intent") or "").strip().lower()
     channel = (ai_route.get("data_channel") or "").strip().lower()
     sq = (search_query or ai_route.get("search_query") or "").strip()
+    if not sq:
+        try:
+            from services.ai_route_semantics import resolve_catalog_search_phrase
+
+            sq = resolve_catalog_search_phrase(
+                ai_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+            )
+        except ImportError:
+            sq = ""
     entities = dict(ai_route.get("_product_entities") or {})
     locked = product_catalog_route_is_locked(ai_route)
     brain_product = (
@@ -597,7 +614,12 @@ def understanding_from_locked_product_route(
     msg_en: str = "",
 ) -> dict[str, Any] | None:
     """Map locked product route → catalog understanding from AI entities only."""
-    locked = _locked_product_turn_from_route(ai_route, search_query=search_query)
+    locked = _locked_product_turn_from_route(
+        ai_route,
+        search_query=search_query,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
     if not locked or locked.kind != KIND_PRODUCT_SEARCH:
         return None
 
@@ -946,7 +968,11 @@ def resolve_product_search_turn(
     except ImportError:
         pass
 
-    locked_turn = _locked_product_turn_from_route(ai_route)
+    locked_turn = _locked_product_turn_from_route(
+        ai_route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
     if locked_turn:
         log_reasoning(
             f"Product resolver fast path ({locked_turn.source}): sq={locked_turn.search_query!r}"
@@ -1019,7 +1045,11 @@ def resolve_product_search_turn(
                         except ImportError:
                             pass
             if not brain_ood_misroute:
-                locked_brain = _locked_product_turn_from_route(brain_route)
+                locked_brain = _locked_product_turn_from_route(
+                    brain_route,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                )
                 if locked_brain and locked_brain.kind == KIND_PRODUCT_SEARCH:
                     log_reasoning(
                         f"Product-catalog: brain locked sq={locked_brain.search_query!r} "
@@ -1486,6 +1516,17 @@ def apply_product_catalog_to_route(
     )
     if not sq:
         try:
+            from services.ai_route_semantics import resolve_catalog_search_phrase
+
+            sq = resolve_catalog_search_phrase(
+                out,
+                original_msg=original_msg,
+                msg_en=msg_en,
+            )
+        except ImportError:
+            sq = ""
+    if not sq:
+        try:
             from services.product_browse_semantics import extract_browse_search_terms
 
             sq = extract_browse_search_terms(_combined(original_msg, msg_en), out)
@@ -1531,7 +1572,11 @@ def product_catalog_route_decision(
                 try:
                     from services.ai_route_semantics import _catalog_search_query_from_brain_route
 
-                    sq_locked = _catalog_search_query_from_brain_route(route_data)
+                    sq_locked = _catalog_search_query_from_brain_route(
+                        route_data,
+                        original_msg=original_msg,
+                        msg_en=msg_en,
+                    )
                 except ImportError:
                     sq_locked = ""
             log_reasoning(

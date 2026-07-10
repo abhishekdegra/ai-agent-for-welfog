@@ -679,6 +679,9 @@ def try_scope_ai_early_reply(
     if not comb:
         return None
 
+    if preflight:
+        return None
+
     try:
         from services.conversation_zero_llm_fallback import _zero_llm_kb_turn_blocked
 

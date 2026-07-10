@@ -124,13 +124,111 @@ def _try_brain_immediate_scope_or_kb_reply(
     scope = (brain_route.get("conversation_scope") or "").strip().lower()
     intent = (brain_route.get("intent") or "").strip().lower()
     channel = (brain_route.get("data_channel") or "").strip().lower()
+    kb_keys = [str(k).strip() for k in (brain_route.get("kb_keys") or []) if str(k).strip()]
+    authoritative_kb_json = (
+        channel == "kb"
+        and bool(kb_keys)
+        and not brain_route.get("needs_order_id")
+        and brain_route.get("is_welfog_related", True) is not False
+    )
+    try:
+        from services.chat_flow_telemetry import (
+            brain_route_authoritative_kb_lock,
+            is_authoritative_kb_route_locked,
+        )
+
+        kb_authoritative = (
+            is_authoritative_kb_route_locked()
+            or brain_route_authoritative_kb_lock(brain_route)
+        )
+    except ImportError:
+        kb_authoritative = channel == "kb"
+
+    if kb_authoritative and channel == "kb" and not brain_route.get("needs_order_id"):
+        if intent not in (
+            "order",
+            "order_history",
+            "wishlist",
+            "product",
+            "pincode_check",
+            "deals",
+            "categories",
+        ):
+            kb_body = _try_brain_kb_locked_reply(
+                brain_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                user_id=str((ctx or {}).get("user_id") or ""),
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn or (lambda _u: None),
+                reply_for_live_order_id_lookup=reply_for_live_order_id_lookup
+                or (lambda *a, **k: None),
+            )
+            if kb_body:
+                log_reasoning(
+                    "Brain immediate — authoritative KB route (OOD guards bypassed)."
+                )
+                return kb_body
+            meaning = (brain_route.get("user_meaning") or "").strip()
+            comb = f"{original_msg or ''} {msg_en or ''}".strip()
+            query = meaning or comb
+            keys = list(brain_route.get("kb_keys") or [])
+            rh = (brain_route.get("route_handler") or "").strip().lower()
+            try:
+                from services.kb_service import (
+                    KB_DIRECT_MIN_SCORE,
+                    direct_kb_search,
+                    format_kb_answer_from_brain_keys,
+                    format_welfog_social_media_reply_from_kb,
+                )
+
+                if keys:
+                    file_body = format_kb_answer_from_brain_keys(
+                        original_msg,
+                        msg_en,
+                        keys,
+                        reply_lang=lang,
+                        conversation_context=conv_for_llm,
+                        user_meaning_en=meaning,
+                        ai_route=brain_route,
+                    )
+                    if file_body:
+                        log_reasoning(
+                            "Brain immediate — authoritative KB grounded answer."
+                        )
+                        return file_body
+                if "social" in rh:
+                    social = format_welfog_social_media_reply_from_kb(
+                        original_msg,
+                        msg_en,
+                        reply_lang=lang,
+                        conversation_context=conv_for_llm,
+                        user_meaning_en=meaning,
+                        ai_confirmed=True,
+                    )
+                    if social:
+                        return social
+                if not keys:
+                    body = direct_kb_search(
+                        query,
+                        keys=keys or None,
+                        min_score=KB_DIRECT_MIN_SCORE,
+                        zero_llm_fast=True,
+                    )
+                    if body:
+                        return body
+            except ImportError:
+                pass
+
     if intent == "out_of_domain":
         scope = "out_of_domain"
     elif not scope and intent in ("general",):
         scope = "general_chitchat"
 
     # --- Pure chitchat — never KB vector / catalog ---
-    if scope == "general_chitchat":
+    if scope == "general_chitchat" and not authoritative_kb_json:
         if channel == "kb":
             channel = "none"
         if not _brain_is_pincode_delivery_turn(brain_route) and not _brain_is_product_catalog_turn(
@@ -167,8 +265,16 @@ def _try_brain_immediate_scope_or_kb_reply(
                 return scope_reply
 
     # --- OOD / chitchat before KB or transactional detours ---
-    if scope in ("out_of_domain", "harm_sensitive") or not brain_route.get(
-        "is_welfog_related", True
+    try:
+        from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
+
+        skip_ood = should_skip_post_kb_ood_guard("_try_brain_immediate_scope_or_kb_reply")
+    except ImportError:
+        skip_ood = kb_authoritative
+
+    if not skip_ood and (
+        scope in ("out_of_domain", "harm_sensitive")
+        or not brain_route.get("is_welfog_related", True)
     ):
         scope = scope or "out_of_domain"
         scope_reply = (brain_route.get("scope_reply") or "").strip()
@@ -621,17 +727,13 @@ def _prepare_brain_product_route(
     sq = ""
     entities: dict = {}
     try:
-        from services.ai_route_semantics import (
-            _brain_product_entities_from_route,
-            _catalog_search_query_from_brain_route,
-        )
+        from services.ai_route_semantics import _brain_product_entities_from_route
 
         entities = _brain_product_entities_from_route(route, original_msg=original_msg, msg_en=msg_en)
         if entities:
             route["_product_entities"] = entities
-        sq = _catalog_search_query_from_brain_route(route)
     except ImportError:
-        sq = (route.get("search_query") or "").strip()
+        pass
 
     try:
         from services.product_filter_pipeline import _enrich_brain_entities_structural
@@ -647,14 +749,23 @@ def _prepare_brain_product_route(
     except ImportError:
         pass
 
-    if not sq:
-        sq = (entities.get("product_name") or route.get("search_query") or "").strip()
+    try:
+        from services.ai_route_semantics import resolve_catalog_search_phrase
+
+        sq = resolve_catalog_search_phrase(
+            route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+    except ImportError:
+        sq = (route.get("search_query") or "").strip()
+
     if not sq:
         from utils.reasoning_log import log_reasoning
 
-        sq = "products"
         log_reasoning(
-            "Brain product turn missing product_name/search_query — generic browse fallback."
+            "Brain product turn — no usable product phrase; preserving empty search_query "
+            "(entities/filter browse may still apply)."
         )
 
     route["search_query"] = sq

@@ -1752,6 +1752,173 @@ def _brain_product_entities_from_route(
     return ent
 
 
+_GENERIC_CATALOG_PHRASES = frozenset(
+    {
+        "product",
+        "products",
+        "item",
+        "items",
+        "thing",
+        "things",
+        "show products",
+        "browse products",
+        "find products",
+        "search products",
+        "show product",
+        "browse product",
+        "list products",
+        "all products",
+        "shopping",
+        "shopping options",
+        "catalog",
+        "options",
+    }
+)
+
+
+def is_generic_catalog_search_phrase(phrase: str) -> bool:
+    """Reject meta browse phrases that must not become OpenSearch title_query."""
+    t = (phrase or "").strip().lower()
+    if not t or len(t) < 2:
+        return True
+    if t in _GENERIC_CATALOG_PHRASES:
+        return True
+    if t in ("show", "find", "search", "browse", "buy", "shop"):
+        return True
+    if re.search(r"\bbrowse\s+products?\b", t):
+        return True
+    if re.search(r"\bto\s+browse\s+products?\b", t):
+        return True
+    for prefix in (
+        "show products",
+        "browse products",
+        "find products",
+        "search products",
+        "customer wants ",
+        "user wants ",
+        "user is asking ",
+        "customer is asking ",
+        "customer is browsing ",
+        "user is browsing ",
+        "the customer is ",
+        "the user is ",
+        "customer wants to browse",
+        "user wants to browse",
+        "browsing the product catalog",
+        "browsing the catalog",
+    ):
+        if t.startswith(prefix):
+            return True
+    if "product catalog" in t and len(t.split()) >= 5:
+        return True
+    if len(t.split()) > 10:
+        return True
+    try:
+        from services.turn_intent_gate import is_non_catalog_meta_turn
+
+        if is_non_catalog_meta_turn(t):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
+def _usable_brain_search_query(sq: str, route: dict | None = None) -> str:
+    sq = (sq or "").strip()
+    if not sq or is_generic_catalog_search_phrase(sq):
+        return ""
+    try:
+        from services.product_filter_pipeline import brain_search_query_is_noisy
+
+        if brain_search_query_is_noisy(sq):
+            return ""
+    except ImportError:
+        pass
+    return sq[:120]
+
+
+def _usable_catalog_entity_phrase(phrase: str, route: dict | None = None) -> str:
+    cleaned = _clean_brain_product_name((phrase or "").strip())
+    if not cleaned or is_generic_catalog_search_phrase(cleaned):
+        return ""
+    if route and _brain_product_name_is_noisy(cleaned, route):
+        return ""
+    return cleaned[:120]
+
+
+def _original_user_product_phrase(
+    original_msg: str,
+    msg_en: str = "",
+    *,
+    route: dict | None = None,
+) -> str:
+    for raw in (original_msg, msg_en):
+        raw = (raw or "").strip()
+        if not raw or is_generic_catalog_search_phrase(raw):
+            continue
+        try:
+            from services.product_query_understanding import (
+                clean_product_part_label,
+                polish_search_terms,
+            )
+
+            cleaned = clean_product_part_label(
+                polish_search_terms(raw, original_msg or raw),
+                original_msg or raw,
+            )
+            cleaned = (cleaned or "").strip()
+            if cleaned and not is_generic_catalog_search_phrase(cleaned):
+                if not route or not _brain_product_name_is_noisy(cleaned, route):
+                    return cleaned[:120]
+        except ImportError:
+            if not is_generic_catalog_search_phrase(raw):
+                return raw[:120]
+    return ""
+
+
+def _raw_route_product_entities(route: dict | None) -> dict:
+    r = route or {}
+    for key in ("_product_entities", "product_entities"):
+        pe = r.get(key)
+        if isinstance(pe, dict):
+            return dict(pe)
+    return {}
+
+
+def resolve_catalog_search_phrase(
+    ai_route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    ai_search_query: str = "",
+) -> str:
+    """
+    Highest-quality catalog product phrase for OpenSearch title_query.
+
+    Priority (first usable wins):
+      brain.search_query → product_entities.product_name → user_meaning → original user query
+    """
+    r = ai_route or {}
+
+    sq = _usable_brain_search_query(r.get("search_query") or ai_search_query, r)
+    if sq:
+        return sq
+
+    for ent in (
+        _raw_route_product_entities(r),
+        _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en),
+    ):
+        pn = _usable_catalog_entity_phrase(ent.get("product_name") or "", r)
+        if pn:
+            return pn
+
+    um = _usable_catalog_entity_phrase(r.get("user_meaning") or "", r)
+    if um:
+        return um
+
+    return _original_user_product_phrase(original_msg, msg_en, route=r)
+
+
 def _catalog_search_query_from_brain_route(
     route: dict | None,
     *,
@@ -1759,82 +1926,11 @@ def _catalog_search_query_from_brain_route(
     msg_en: str = "",
 ) -> str:
     """English product-type search terms from ai_brain_route JSON only."""
-    r = route or {}
-    ent = _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en)
-    if not ent and isinstance(r.get("_product_entities"), dict):
-        ent = dict(r["_product_entities"])
-
-    pn = (ent.get("product_name") or "").strip()
-    sq = (r.get("search_query") or "").strip()
-    model = (ent.get("model") or "").strip()
-    pi = (ent.get("product_intent") or "").strip()
-    related = ent.get("related_search_terms")
-    related_s = ""
-    if isinstance(related, list) and related:
-        related_s = " ".join(str(x).strip() for x in related[:3] if str(x).strip())
-    elif isinstance(related, str) and related.strip():
-        related_s = related.strip()
-
-    def _norm(s: str) -> str:
-        return (s or "").lower().strip()
-
-    try:
-        from services.product_query_understanding import extract_focused_product_query
-
-        focused = extract_focused_product_query(
-            original_msg or (r.get("user_meaning") or ""),
-            msg_en or (r.get("user_meaning") or ""),
-        )
-        if focused and len(focused.strip()) >= 2:
-            return focused.strip()[:120]
-    except ImportError:
-        focused = ""
-
-    if pn and pn.lower() not in ("products", "product"):
-        return pn[:120]
-
-    candidates: list[str] = []
-    if sq:
-        candidates.append(sq)
-    if pi and _norm(pi) not in _norm(pn) and pi.lower() not in (
-        "browse",
-        "buy",
-        "search",
-        "shop",
-    ):
-        candidates.append(pi)
-    if model and _norm(model) not in _norm(pn) and _norm(model) not in _norm(sq):
-        candidates.append(model)
-    if related_s and _norm(related_s) not in _norm(pn):
-        candidates.append(related_s)
-
-    if candidates:
-        def _cand_rank(c: str) -> tuple:
-            words = len((c or "").split())
-            return (words if words <= 5 else 25, len(c or ""))
-
-        return min(candidates, key=_cand_rank)[:120]
-
-    um = (r.get("user_meaning") or "").strip()
-    if not um:
-        return ""
-    low = um.lower()
-    for prefix in (
-        "show me ",
-        "show ",
-        "find ",
-        "search for ",
-        "search ",
-        "looking for ",
-        "need a ",
-        "need ",
-        "customer wants ",
-        "user wants ",
-        "wants ",
-    ):
-        if low.startswith(prefix):
-            return um[len(prefix) :].strip()[:120]
-    return um[:120].strip()
+    return resolve_catalog_search_phrase(
+        route,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
 
 
 def _brain_route_has_shopping_entities(

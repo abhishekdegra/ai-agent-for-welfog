@@ -195,6 +195,19 @@ def synthesize_grounded_reply(
     if not body:
         return ""
     rl = resolve_customer_reply_lang(original_msg, reply_lang)
+    try:
+        from services.knowledge_grounding_validator import ground_kb_llm_response
+
+        body = ground_kb_llm_response(
+            body,
+            kb_context=combined_context,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+    except ImportError:
+        pass
+    if not body:
+        return ""
     return finalize_customer_reply(body, original_msg, rl)
 
 

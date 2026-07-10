@@ -2447,6 +2447,16 @@ def _reconcile_off_topic_brain_misroute(
     Trusts: is_welfog_related, conversation_scope, intent, data_channel, kb_keys, user_meaning.
     """
     out = dict(route or {})
+    try:
+        from services.chat_flow_telemetry import is_authoritative_kb_route_locked
+
+        if is_authoritative_kb_route_locked():
+            log_reasoning(
+                "Brain OOD reconcile — skip; authoritative KB route already locked."
+            )
+            return out
+    except ImportError:
+        pass
     if out.get("_zero_llm_fast") or out.get("_preflight_api") or out.get(
         "_preflight_catalog_menu"
     ) or out.get("_pincode_delivery_fast"):
@@ -2568,6 +2578,20 @@ def _reconcile_off_topic_brain_misroute(
                                 "Brain KB reconcile — semantic match overrides OOD user_meaning."
                             )
                             return promoted
+                    except ImportError:
+                        pass
+                    try:
+                        from services.chat_flow_telemetry import (
+                            brain_route_authoritative_kb_lock,
+                            lock_authoritative_kb_route_from_brain,
+                        )
+
+                        if brain_route_authoritative_kb_lock(out):
+                            lock_authoritative_kb_route_from_brain(out)
+                            log_reasoning(
+                                "Brain OOD reconcile — skip demotion; brain locked KB route."
+                            )
+                            return out
                     except ImportError:
                         pass
                     out["intent"] = "out_of_domain"
@@ -3284,7 +3308,20 @@ def guard_fast_brain_classify(
 
     comb_guard = f"{original_msg or ''} {msg_en or ''}".strip()
     intent_ub = (route_data.get("intent") or "").strip().lower()
-    if comb_guard and _text_is_obvious_off_topic(comb_guard):
+    try:
+        from services.chat_flow_telemetry import (
+            brain_route_authoritative_kb_lock,
+            is_authoritative_kb_route_locked,
+        )
+
+        kb_locked = (
+            is_authoritative_kb_route_locked()
+            or brain_route_authoritative_kb_lock(route_data)
+        )
+    except ImportError:
+        kb_locked = (route_data.get("data_channel") or "").strip().lower() == "kb"
+
+    if comb_guard and _text_is_obvious_off_topic(comb_guard) and not kb_locked:
         welfog_live = intent_ub in (
             "product",
             "order",
@@ -3296,7 +3333,7 @@ def guard_fast_brain_classify(
             "pincode_check",
             "refund",
         )
-        if not welfog_live or (route_data.get("data_channel") or "").strip().lower() == "kb":
+        if not welfog_live:
             ood_post = _try_obvious_out_of_domain_route(
                 original_msg,
                 msg_en,
@@ -3311,6 +3348,10 @@ def guard_fast_brain_classify(
                 except ImportError:
                     pass
                 return ood_post
+    elif comb_guard and _text_is_obvious_off_topic(comb_guard) and kb_locked:
+        log_reasoning(
+            "Guard brain — skip OOD post-check; authoritative KB route from brain."
+        )
 
     intent_ub = (route_data.get("intent") or "").strip().lower()
     if intent_ub == "order_history":
@@ -3786,11 +3827,21 @@ def _try_fast_finalize_brain_route_after_ai(
     scope = (out.get("conversation_scope") or "").strip().lower()
     olk = (out.get("order_lookup_kind") or "").strip().lower()
     meta = (out.get("meta_kind") or "none").strip().lower()
+    kb_keys = [str(k).strip() for k in (out.get("kb_keys") or []) if str(k).strip()]
+    authoritative_kb_json = (
+        channel == "kb"
+        and bool(kb_keys)
+        and not out.get("needs_order_id")
+        and out.get("is_welfog_related", True) is not False
+    )
 
     if (
-        intent == "out_of_domain"
-        or scope in ("general_chitchat", "out_of_domain", "harm_sensitive")
-        or out.get("is_welfog_related") is False
+        not authoritative_kb_json
+        and (
+            intent == "out_of_domain"
+            or scope in ("general_chitchat", "out_of_domain", "harm_sensitive")
+            or out.get("is_welfog_related") is False
+        )
     ):
         out["_turn_promotions_done"] = True
         out["_universal_brain_route"] = True

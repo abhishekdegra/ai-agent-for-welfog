@@ -58,6 +58,21 @@ def _suspicious_product_search_for_menu(ai_route: dict | None) -> bool:
     return any(tok in sq for tok in menu_tokens)
 
 
+def brain_route_locked_kb_answer(ai_route: dict | None) -> bool:
+    """Brain already routed to admin KB — catalog-menu micro-LLM is redundant."""
+    if not isinstance(ai_route, dict):
+        return False
+    channel = (ai_route.get("data_channel") or "").strip().lower()
+    if channel != "kb":
+        return False
+    if ai_route.get("needs_order_id"):
+        return False
+    if list(ai_route.get("kb_keys") or []):
+        return True
+    intent = (ai_route.get("intent") or "").strip().lower()
+    return intent in ("general", "payment", "seller", "refund")
+
+
 def _brain_catalog_menu_resolution(ai_route: dict | None) -> Optional[ResolvedCatalogMenuTurn]:
     """Trust ai_brain_route when it already chose deals / categories."""
     if not isinstance(ai_route, dict):
@@ -309,6 +324,18 @@ def resolve_catalog_menu_turn(
     if not comb:
         return ResolvedCatalogMenuTurn(kind=KIND_NONE)
 
+    if brain_route_locked_kb_answer(ai_route):
+        none = ResolvedCatalogMenuTurn(kind=KIND_NONE)
+        _RESOLVE_CACHE.key = (
+            f"{hash(comb)}|{hash((conversation_context or '')[-200:])}|"
+            f"{hash(str((ai_route or {}).get('intent')))}|{allow_llm}|{force_llm}"
+        )
+        _RESOLVE_CACHE.result = none
+        log_reasoning(
+            "Catalog-menu: skip — brain locked KB answer path (no catalog-menu LLM)."
+        )
+        return none
+
     if force_llm:
         try:
             from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
@@ -468,6 +495,11 @@ def guard_reconcile_catalog_menu_route(
     """
     if not isinstance(route_data, dict):
         return route_data
+    if brain_route_locked_kb_answer(route_data):
+        log_reasoning(
+            "Guard catalog-menu: skip — brain locked KB (retrieval + grounded answer)."
+        )
+        return route_data
     comb = _combined(original_msg, msg_en)
     brain_res = _brain_catalog_menu_resolution(route_data)
     if brain_res:
@@ -481,16 +513,6 @@ def guard_reconcile_catalog_menu_route(
     )
     intent = (route_data.get("intent") or "").strip().lower()
     channel = (route_data.get("data_channel") or "").strip().lower()
-    if (
-        not needs_ai
-        and channel == "kb"
-        and intent in ("general", "payment", "seller", "refund")
-        and route_data.get("is_welfog_related", True) is not False
-    ):
-        needs_ai = True
-        log_reasoning(
-            "Guard catalog-menu: brain KB channel — verify with catalog-menu LLM."
-        )
     if (
         not needs_ai
         and intent == "general"
