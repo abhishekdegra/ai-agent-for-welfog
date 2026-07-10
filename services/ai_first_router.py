@@ -3290,7 +3290,7 @@ def guard_fast_brain_classify(
     try:
         from services.account_list_semantics import reconcile_account_list_from_brain_meaning
 
-        route_data = reconcile_account_list_from_brain_meaning(route_data)
+        route_data = reconcile_account_list_from_brain_meaning(route_data, msg_en=msg_en)
     except ImportError:
         pass
     try:
@@ -4729,7 +4729,7 @@ def early_universal_brain_route(
     try:
         from services.account_list_semantics import reconcile_account_list_from_brain_meaning
 
-        route_data = reconcile_account_list_from_brain_meaning(route_data)
+        route_data = reconcile_account_list_from_brain_meaning(route_data, msg_en=msg_en)
         if (route_data.get("intent") or "").strip().lower() == "wishlist":
             route_data["data_channel"] = "live_api"
             route_data.setdefault("account_list_kind", "wishlist_in_chat")

@@ -488,6 +488,18 @@ def _coerce_brain_intent_to_schema(out: dict) -> dict:
             out.setdefault("data_channel", "kb")
         return out
 
+  # Brain JSON intent typos (wishlisst, whishlist) — token from LLM only, not customer text.
+    if intent not in _VALID_BRAIN_INTENTS and intent and intent.startswith("wish"):
+        log_reasoning(
+            f"Brain schema reconcile — intent typo token {intent!r} → wishlist."
+        )
+        out["intent"] = "wishlist"
+        out.setdefault("data_channel", "live_api")
+        out["needs_order_id"] = False
+        out["run_catalog_search"] = False
+        out.setdefault("account_list_kind", "wishlist_in_chat")
+        return out
+
     rh = (out.get("route_handler") or "").strip().lower()
     mapped = _ROUTE_HANDLER_TO_INTENT.get(rh)
     if mapped:
@@ -562,6 +574,8 @@ def repair_brain_json_quality(route: dict | None, user_msg: str = "", msg_en: st
                 "Brain user_meaning echoed customer text — backend will use "
                 "order_lookup_kind/route_handler/field_focus only."
             )
+    elif en and len(en) >= 3 and not um:
+        out["user_meaning"] = en[:300]
 
     nc = coerce_route_str(out.get("numeric_context"), "none")
     if re.fullmatch(r"\d{4,20}", nc):
@@ -597,8 +611,27 @@ def repair_brain_json_quality(route: dict | None, user_msg: str = "", msg_en: st
     if ch in ("order", "order_details", "order_tracking", "tracking"):
         out["data_channel"] = "live_api"
 
+    try:
+        from services.account_list_semantics import (
+            account_list_route_is_locked,
+            reconcile_account_list_from_brain_meaning,
+        )
+
+        out = reconcile_account_list_from_brain_meaning(out, msg_en=msg_en)
+        if account_list_route_is_locked(out):
+            return out
+    except ImportError:
+        pass
+
     intent = (out.get("intent") or "").strip().lower()
     if intent == "product" and (out.get("meta_kind") or "none") == "none":
+        try:
+            from services.account_list_semantics import account_list_route_is_locked
+
+            if account_list_route_is_locked(out):
+                return out
+        except ImportError:
+            pass
         out["data_channel"] = "catalog"
         out["run_catalog_search"] = True
         ent = _brain_product_entities_from_route(
@@ -606,9 +639,13 @@ def repair_brain_json_quality(route: dict | None, user_msg: str = "", msg_en: st
         )
         if ent:
             out["_product_entities"] = ent
-            pn = (ent.get("product_name") or "").strip()
-            if pn and pn.lower() not in ("products", "product"):
-                out["search_query"] = pn
+        sq = resolve_catalog_search_phrase(
+            out,
+            original_msg=user_msg,
+            msg_en=msg_en,
+        )
+        if sq:
+            out["search_query"] = sq
 
     return out
 
@@ -1837,6 +1874,36 @@ def _usable_brain_search_query(sq: str, route: dict | None = None) -> str:
     return sq[:120]
 
 
+def _usable_brain_category_browse(route: dict | None) -> str:
+    """Brain category_browse / category_only_browse — normalized department name."""
+    r = route or {}
+    cb = (r.get("category_browse") or "").strip()
+    if not cb or is_generic_catalog_search_phrase(cb):
+        return ""
+    return cb[:120]
+
+
+def _usable_brain_entity_category(ent: dict | None) -> str:
+    cat = _coerce_brain_scalar_field((ent or {}).get("category"))
+    if not cat or is_generic_catalog_search_phrase(cat):
+        return ""
+    return cat[:120]
+
+
+def _brain_provided_catalog_phrase(route: dict | None) -> bool:
+    """True when brain JSON already named a catalog target (never fall back to raw user text)."""
+    r = route or {}
+    if _usable_brain_search_query(r.get("search_query") or "", r):
+        return True
+    if _usable_brain_category_browse(r):
+        return True
+    if _usable_brain_entity_category(_raw_route_product_entities(r)):
+        return True
+    if _usable_catalog_entity_phrase(r.get("user_meaning") or "", r):
+        return True
+    return False
+
+
 def _usable_catalog_entity_phrase(phrase: str, route: dict | None = None) -> str:
     cleaned = _clean_brain_product_name((phrase or "").strip())
     if not cleaned or is_generic_catalog_search_phrase(cleaned):
@@ -1896,13 +1963,26 @@ def resolve_catalog_search_phrase(
     Highest-quality catalog product phrase for OpenSearch title_query.
 
     Priority (first usable wins):
-      brain.search_query → product_entities.product_name → user_meaning → original user query
+      brain.search_query → category_browse → product_entities.category →
+      product_entities.product_name → user_meaning → original user query (last resort only)
     """
     r = ai_route or {}
 
     sq = _usable_brain_search_query(r.get("search_query") or ai_search_query, r)
     if sq:
         return sq
+
+    cb = _usable_brain_category_browse(r)
+    if cb:
+        return cb
+
+    for ent in (
+        _raw_route_product_entities(r),
+        _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en),
+    ):
+        cat = _usable_brain_entity_category(ent)
+        if cat:
+            return cat
 
     for ent in (
         _raw_route_product_entities(r),
@@ -1915,6 +1995,9 @@ def resolve_catalog_search_phrase(
     um = _usable_catalog_entity_phrase(r.get("user_meaning") or "", r)
     if um:
         return um
+
+    if _brain_provided_catalog_phrase(r):
+        return ""
 
     return _original_user_product_phrase(original_msg, msg_en, route=r)
 
@@ -3741,7 +3824,7 @@ def enrich_universal_brain_route(
     try:
         from services.account_list_semantics import reconcile_account_list_from_brain_meaning
 
-        out = reconcile_account_list_from_brain_meaning(out)
+        out = reconcile_account_list_from_brain_meaning(out, msg_en=msg_en)
     except ImportError:
         pass
 
