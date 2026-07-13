@@ -115,9 +115,12 @@ def _product_slugs_from_rows(rows: list) -> frozenset[str]:
 
 def _rest_category_filter_trustworthy(category_id, rows: list) -> bool:
     """
-    Welfog products/search often ignores category= and returns the default home pool.
-    Reject near-identical unfiltered dumps; allow smaller real category pages even if
-    some SKUs also appear on the home page.
+    Welfog products/search often ignores category=/category_id= and returns the
+    default home pool. `categories=` usually works.
+
+    Trust when the page is clearly different from the unfiltered home feed.
+    Do NOT reject a real department page just because some of its SKUs also
+    appear on the homepage (homepage often features fashion + electronics).
     """
     global _REST_CATEGORY_BASELINE_SLUGS
     if not rows:
@@ -130,32 +133,70 @@ def _rest_category_filter_trustworthy(category_id, rows: list) -> bool:
         _REST_CATEGORY_BASELINE_SLUGS = _product_slugs_from_rows(baseline or [])
     baseline = _REST_CATEGORY_BASELINE_SLUGS or frozenset()
     if not baseline:
+        # REST cards often omit category ids — allow non-empty when no baseline.
         return True
     if slugs == baseline:
         return False
+
     overlap = len(slugs & baseline)
-    # Same-sized (or nearly) dump with mostly the same items → ignored category filter.
-    if len(slugs) >= max(12, len(baseline) - 2) and overlap / max(len(slugs), 1) >= 0.8:
+    ratio = overlap / max(len(slugs), 1)
+    excluded = len(baseline - slugs)
+
+    # Near-full home dump (API ignored the filter).
+    if abs(len(slugs) - len(baseline)) <= 2 and ratio >= 0.85:
         return False
-    if abs(len(slugs) - len(baseline)) <= 2 and overlap / max(len(slugs), 1) >= 0.85:
+    if len(slugs) >= max(len(baseline) - 1, 1) and ratio >= 0.9:
         return False
+
+    # Has products outside the home feed → definitely filtered.
+    if not slugs <= baseline:
+        return True
+
+    # Pure subset of home, but many home items were removed → real category page
+    # (e.g. Men Fashion on a homepage that also features phone covers).
+    if excluded >= max(3, len(baseline) // 4):
+        return True
+
+    # Tiny leftover slice of home with almost nothing excluded → untrusted.
+    if ratio >= 0.95 and excluded <= 2:
+        return False
+
     return True
+
+
+def _rest_rows_mention_category(category_id, rows: list) -> bool:
+    """When baseline is unavailable, require rows to carry the requested category id."""
+    cid = str(category_id or "").strip()
+    if not cid:
+        return False
+    for row in (rows or [])[:20]:
+        if not isinstance(row, dict):
+            continue
+        for key in ("category_id", "categories", "main_category_id", "cat_id"):
+            val = row.get(key)
+            if val is None:
+                continue
+            if isinstance(val, (list, tuple)):
+                if any(str(v).strip() == cid for v in val):
+                    return True
+            elif str(val).strip() == cid:
+                return True
+    return False
 
 
 def _catalog_search_with_category(base_params: dict, category_id) -> list:
     """
-    Welfog search API: `categories=` is the reliable department filter for many ids;
-    `category` / `category_id` often return the default home pool.
+    Welfog search API: only `categories=` reliably scopes a department.
+    `category` / `category_id` usually ignore the filter and return the home pool.
     """
     if not category_id:
         return _catalog_search_get(base_params)
     cid = str(category_id).strip()
-    for key in ("categories", "category", "category_id"):
-        params = dict(base_params)
-        params[key] = cid
-        rows = _catalog_search_get(params)
-        if rows and _rest_category_filter_trustworthy(cid, rows):
-            return rows
+    params = dict(base_params)
+    params["categories"] = cid
+    rows = _catalog_search_get(params)
+    if rows and _rest_category_filter_trustworthy(cid, rows):
+        return rows
     return []
 
 
@@ -1456,6 +1497,14 @@ def message_requests_category_browse(text: str) -> bool:
             return False
     except ImportError:
         pass
+
+    # Explicit department ask + resolvable nav id wins over typo leftovers
+    # ("dika"≈dikha) that would otherwise look like a specific product search.
+    if _user_explicitly_browses_category(text):
+        cid = resolve_nav_category_id_fast(text)
+        if cid and not _message_has_concrete_product_intent(text):
+            return True
+
     if _message_has_product_search_filters(text):
         return False
     if _user_explicitly_browses_category(text):
@@ -1463,6 +1512,43 @@ def message_requests_category_browse(text: str) -> bool:
     if not _message_has_browse_signals(text):
         return False
     return bool(resolve_nav_category_id_fast(text))
+
+
+def _message_has_concrete_product_intent(text: str) -> bool:
+    """
+    True only for a real product/SKU/brand ask — not department browse with typos.
+    Unlike _message_targets_specific_product, ignores leftover filler misspellings.
+    """
+    if not (text or "").strip():
+        return False
+    low = (text or "").lower()
+    try:
+        from services.opensearch_products import (
+            _extract_product_keywords,
+            _PRODUCT_NOUNS,
+            _extract_price_bounds,
+            color_hue_mentioned_in_text,
+            normalize_color_fuzzy,
+        )
+
+        if _extract_product_keywords(low):
+            return True
+        words = set(re.findall(r"[a-z0-9]{3,}", low))
+        if words & set(_PRODUCT_NOUNS):
+            return True
+        if words & PHONE_BRANDS:
+            return True
+        pmax, pmin = _extract_price_bounds(text, low)
+        if pmax is not None or pmin is not None:
+            return True
+        hue = normalize_color_fuzzy(low)
+        if hue and color_hue_mentioned_in_text(hue, low):
+            return True
+    except ImportError:
+        pass
+    if re.search(r"\bsku\b", low):
+        return True
+    return False
 
 
 def resolve_nav_category_id_fast(text: str, ctx=None) -> Optional[str]:
@@ -2139,9 +2225,16 @@ def _category_fuzzy_lookup(input_text: str, mapping: dict, main_hint: str = None
     nav_map = nav_map or {}
     id_meta = id_meta or {}
 
+    # Prefer stripped browse phrasing so "womes fashion ke products" → "womes fashion"
+    # before single-token typos collapse to bare "women".
+    stripped = _strip_message_for_category_lookup(input_text)
+    work_text = stripped or _normalize_cat_name(input_text)
+    if not work_text:
+        return None
+
     substring_hits = []
     for name in mapping.keys():
-        if name and name in input_text:
+        if name and name in work_text:
             cid = str(mapping[name])
             substring_hits.append((name, cid, _category_match_score(name, cid, main_hint, id_meta, nav_map)))
 
@@ -2154,25 +2247,48 @@ def _category_fuzzy_lookup(input_text: str, mapping: dict, main_hint: str = None
             return None
         return substring_hits[0][1]
 
-    words = [w for w in input_text.split() if len(w) >= 4]
+    # Collect fuzzy candidates from full phrase first, then tokens — prefer longer
+    # department names (womes fashion → women fashion, not bare women).
     names = list(mapping.keys())
-    for w in words:
+    fuzzy_hits: list[tuple[str, str, int]] = []
+    seen_cid_name: set[tuple[str, str]] = set()
+
+    def _add_hits(query: str, cutoff: float) -> None:
+        q = (query or "").strip()
+        if not q:
+            return
+        for hit in difflib.get_close_matches(q, names, n=5, cutoff=cutoff):
+            cid = str(mapping[hit])
+            key = (hit, cid)
+            if key in seen_cid_name:
+                continue
+            seen_cid_name.add(key)
+            fuzzy_hits.append(
+                (hit, cid, _category_match_score(hit, cid, main_hint, id_meta, nav_map))
+            )
+
+    _add_hits(work_text, 0.72)
+    toks = work_text.split()
+    # Adjacent bigrams before unigrams (preserves "womes fashion").
+    for i in range(len(toks) - 1):
+        _add_hits(f"{toks[i]} {toks[i + 1]}", 0.72)
+    for w in toks:
+        if len(w) < 4:
+            continue
         if w in PHONE_BRANDS or w in FASHION_BRANDS:
             continue
-        best = difflib.get_close_matches(w, names, n=5, cutoff=0.82)
-        for hit in best:
-            cid = str(mapping[hit])
+        # 0.78 tolerates common typos (beuty→beauty, womes→women) without keyword lists.
+        _add_hits(w, 0.78)
+
+    if not fuzzy_hits:
+        return None
+    fuzzy_hits.sort(key=lambda x: x[2], reverse=True)
+    if main_hint:
+        for _name, cid, _sc in fuzzy_hits:
             if _category_matches_main(cid, main_hint, id_meta, nav_map):
                 return cid
-    phrase = difflib.get_close_matches(input_text, names, n=5, cutoff=0.75)
-    for hit in phrase:
-        cid = str(mapping[hit])
-        if _category_matches_main(cid, main_hint, id_meta, nav_map):
-            return cid
-    if not main_hint:
-        for hit in phrase:
-            return str(mapping[hit])
-    return None
+        return None
+    return fuzzy_hits[0][1]
 
 
 def _is_category_browse_filler_token(tok: str) -> bool:
@@ -2191,13 +2307,22 @@ def _is_category_browse_filler_token(tok: str) -> bool:
         for f in _CATEGORY_BROWSE_FILLER:
             if len(f) > len(t) and f.startswith(t):
                 return True
+    # Spelling variants of browse verbs (dika≈dikha). Keep short dept tokens
+    # like "men"/"home" out of fuzzy filler matching.
+    if len(t) >= 4:
+        verb_fillers = [f for f in _CATEGORY_BROWSE_FILLER if len(f) >= 4]
+        close = difflib.get_close_matches(t, verb_fillers, n=1, cutoff=0.8)
+        if close and abs(len(t) - len(close[0])) <= 2:
+            return True
     return False
 
 
 def _strip_message_for_category_lookup(text: str) -> str:
+    # Expand mens→men / aliases before stripping so leftover plurals don't look like product nouns.
+    expanded = _expand_category_query_text(text) or _normalize_cat_name(text)
     words = [
         w
-        for w in _normalize_cat_name(text).split()
+        for w in expanded.split()
         if w and len(w) >= 2 and not _is_category_browse_filler_token(w)
     ]
     return " ".join(words).strip()
@@ -2465,6 +2590,11 @@ def _message_targets_specific_product(text: str) -> bool:
                     pass
                 if not leftover:
                     return False
+                # Explicit department browse + only fuzzy noise left → not a SKU ask.
+                if _user_explicitly_browses_category(text) and not _message_has_concrete_product_intent(
+                    text
+                ):
+                    return False
         except Exception:
             pass
         return True
@@ -2479,21 +2609,24 @@ def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]
     from utils.helpers import _text_requests_category_product_browse
 
     ctx = ctx or {}
-    prior = (ctx.get("data") or {}).get("selected_category_id")
-    if prior:
-        return str(prior)
 
     if _message_has_product_search_filters(text):
         return None
 
+    # Fresh category browse in this message always wins over sticky prior dept.
     cid = get_category_id_from_text(text, ctx)
+    if cid and (
+        _text_requests_category_product_browse(text, ctx)
+        or _user_explicitly_browses_category(text)
+    ):
+        return cid
+
+    prior = (ctx.get("data") or {}).get("selected_category_id")
+    if prior:
+        return str(prior)
+
     if not cid:
         return None
-
-    if _text_requests_category_product_browse(text, ctx) or _user_explicitly_browses_category(text):
-        if _message_has_product_search_filters(text):
-            return None
-        return cid
 
     if _message_targets_specific_product(text):
         return None
@@ -2565,6 +2698,79 @@ def department_catalog_label_names(category_id, ctx=None) -> list[str]:
     return names
 
 
+def department_leaf_category_ids(category_id, ctx=None) -> list[str]:
+    """
+    All known category ids under a nav department (main + parent + leaf children).
+    OpenSearch documents usually carry leaf ids, not the top-level nav id.
+    """
+    cid = str(category_id or "").strip()
+    if not cid:
+        return []
+    main = resolve_search_category_id(cid, ctx) or cid
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(raw) -> None:
+        s = str(raw or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    _add(main)
+    _add(cid)
+    try:
+        _, meta, _ = _get_inner_categories_flat_map(ctx)
+        for child_id, m in (meta or {}).items():
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("main_category_id") or "").strip() != str(main):
+                continue
+            _add(child_id)
+            _add(m.get("id"))
+    except Exception:
+        pass
+    return out
+
+
+def cross_department_ambiguous_label_keys(ctx=None) -> set[str]:
+    """
+    Normalized leaf/parent labels that appear under 2+ nav departments in the live
+    category tree. Those names alone cannot safely scope an OpenSearch filter
+    (e.g. "Accessories" under Fashion and Electronics) — no keyword lists.
+    """
+    mains_by_label: dict[str, set[str]] = {}
+    try:
+        _, meta, _ = _get_inner_categories_flat_map(ctx)
+        for _cid, m in (meta or {}).items():
+            if not isinstance(m, dict):
+                continue
+            main = str(m.get("main_category_id") or "").strip()
+            name = _normalize_cat_name(str(m.get("name") or ""))
+            if not main or not name:
+                continue
+            mains_by_label.setdefault(name, set()).add(main)
+    except Exception:
+        return set()
+    return {name for name, mains in mains_by_label.items() if len(mains) >= 2}
+
+
+def department_unique_catalog_label_names(category_id, ctx=None) -> list[str]:
+    """
+    Department labels that are unique to this nav department in the live tree.
+    Used only when leaf ids are unavailable as an OpenSearch name bridge.
+    """
+    ambiguous = cross_department_ambiguous_label_keys(ctx)
+    out: list[str] = []
+    seen: set[str] = set()
+    for label in department_catalog_label_names(category_id, ctx):
+        key = _normalize_cat_name(label)
+        if not key or key in ambiguous or key in seen:
+            continue
+        seen.add(key)
+        out.append(label.strip())
+    return out
+
+
 def fetch_products_by_category_browse(category_id, ctx=None, page=1, color=None):
     """
     Category-only product browse via search API with resolved main category id.
@@ -2595,6 +2801,56 @@ def fetch_products_by_category_browse(category_id, ctx=None, page=1, color=None)
                 f"Category browse REST ignored category={try_cid} "
                 f"(default catalog dump — skipped)."
             )
+
+    # Main nav id empty/untrusted — try a few live parent groups under the department
+    # (some catalogs only honor subcategory `categories=` filters).
+    try:
+        _, _, by_main = _get_inner_categories_flat_map(ctx)
+        parents = by_main.get(str(search_cid)) or by_main.get(str(cid)) or []
+        parent_ids: list[str] = []
+        for parent in parents:
+            if not isinstance(parent, dict):
+                continue
+            pid = str(parent.get("id") or "").strip()
+            if pid and pid not in parent_ids:
+                parent_ids.append(pid)
+            if len(parent_ids) >= 8:
+                break
+        if parent_ids:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+
+            merged: list = []
+            seen_fp: set[str] = set()
+
+            def _fetch_parent(pid: str):
+                rows = fetch_products_from_api("", category_id=pid, color=color, page=page)
+                if rows and _rest_category_filter_trustworthy(pid, rows):
+                    return pid, rows
+                return pid, []
+
+            with ThreadPoolExecutor(max_workers=min(6, len(parent_ids))) as pool:
+                futs = {pool.submit(_fetch_parent, pid): pid for pid in parent_ids}
+                for fut in as_completed(futs):
+                    try:
+                        _pid, rows = fut.result()
+                    except Exception:
+                        continue
+                    for row in rows or []:
+                        fp = next(iter(_product_slugs_from_rows([row])), "")
+                        if not fp or fp in seen_fp:
+                            continue
+                        seen_fp.add(fp)
+                        merged.append(row)
+                    if len(merged) >= 15:
+                        break
+            if merged:
+                log_reasoning(
+                    f"Category browse parent merge main={search_cid} "
+                    f"({len(merged)} items via subcategory filters)."
+                )
+                return merged[:15], search_cid
+    except Exception:
+        pass
 
     # Trusted name+category only (same fingerprint gate). Never name-only.
     label = category_name_for_id(cid, ctx) or category_name_for_id(search_cid, ctx)

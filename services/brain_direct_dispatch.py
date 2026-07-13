@@ -828,18 +828,15 @@ def _resolve_browse_category_id_fast(
     *,
     ctx: dict | None = None,
 ) -> Optional[str]:
-    """Top-level nav departments only — never inner_categories fanout."""
+    """Top-level nav departments only — never inner_categories fanout.
+
+    Resolve from live nav text (category_browse / user message). Brain category_id
+    is only accepted when it matches that nav resolution (models often invent ids).
+    """
     try:
         from services.welfog_api import resolve_nav_category_id_fast
     except ImportError:
         return None
-
-    cat_id_raw = brain_route.get("category_id") or brain_route.get("extracted_category_id")
-    if cat_id_raw is not None and str(cat_id_raw).strip():
-        try:
-            return str(int(str(cat_id_raw).strip()))
-        except (TypeError, ValueError):
-            pass
 
     texts: list[str] = []
     for raw in (
@@ -853,10 +850,37 @@ def _resolve_browse_category_id_fast(
         t = (raw or "").strip()
         if t and t not in texts:
             texts.append(t)
+
+    nav_cid: Optional[str] = None
     for t in texts:
         cid = resolve_nav_category_id_fast(t, ctx=ctx)
         if cid:
-            return cid
+            nav_cid = cid
+            break
+
+    cat_id_raw = brain_route.get("category_id") or brain_route.get("extracted_category_id")
+    brain_cid: Optional[str] = None
+    if cat_id_raw is not None and str(cat_id_raw).strip():
+        try:
+            brain_cid = str(int(str(cat_id_raw).strip()))
+        except (TypeError, ValueError):
+            brain_cid = None
+
+    if nav_cid:
+        # Prefer grounded nav id; only keep brain id when it agrees.
+        if brain_cid and brain_cid == nav_cid:
+            return nav_cid
+        return nav_cid
+
+    # No text match — accept brain id only if it is a real top-level nav department.
+    if brain_cid:
+        try:
+            from services.welfog_api import is_top_level_main_category
+
+            if is_top_level_main_category(brain_cid, ctx):
+                return brain_cid
+        except ImportError:
+            pass
     return None
 
 
@@ -992,9 +1016,10 @@ def _try_brain_category_browse_direct_reply(
     if not cid:
         return None
 
-    cat_label = (cat_browse or "").strip().title()
+    # Always label from the resolved id so title and product cards stay aligned.
+    cat_label = category_name_for_id(str(cid), ctx=ctx) or (cat_browse or "").strip().title()
     if not cat_label:
-        cat_label = category_name_for_id(str(cid), ctx=ctx) or f"Category {cid}"
+        cat_label = f"Category {cid}"
 
     import time as _time
 

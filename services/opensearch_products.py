@@ -2341,7 +2341,59 @@ def apply_catalog_post_filters(
     if mats:
         products = filter_products_by_material_tokens(products, mats)
 
+    if _is_category_only_browse_spec(spec) and spec.get("category_id"):
+        products = _filter_products_to_department(products, spec["category_id"])
+
     return products
+
+
+def _filter_products_to_department(products: list[dict], category_id) -> list[dict]:
+    """
+    Drop cards that clearly belong to another department after a category browse.
+    Membership is by live leaf category_id (or exact unique department label).
+    Keeps rows with unknown/missing category metadata (REST often omits it).
+    """
+    if not products or not category_id:
+        return products
+    try:
+        from services.welfog_api import (
+            department_leaf_category_ids,
+            department_unique_catalog_label_names,
+            _normalize_cat_name,
+        )
+
+        leaf_ids = {str(x) for x in department_leaf_category_ids(category_id)}
+        unique_labels = {
+            _normalize_cat_name(n)
+            for n in department_unique_catalog_label_names(category_id)
+            if n
+        }
+    except Exception:
+        return products
+    if not leaf_ids and not unique_labels:
+        return products
+
+    kept: list[dict] = []
+    for p in products:
+        if not isinstance(p, dict):
+            continue
+        raw_cid = p.get("category_id")
+        if raw_cid is None and isinstance(p.get("data"), dict):
+            raw_cid = p["data"].get("category_id")
+        if raw_cid is not None and str(raw_cid).strip():
+            if str(raw_cid).strip() in leaf_ids:
+                kept.append(p)
+            continue
+        cname = (p.get("category_name") or "").strip()
+        if not cname and isinstance(p.get("data"), dict):
+            cname = (p["data"].get("category_name") or "").strip()
+        if cname:
+            if _normalize_cat_name(cname) in unique_labels:
+                kept.append(p)
+            continue
+        # No category metadata on card — keep (REST rows often lack it; trust gate already ran).
+        kept.append(p)
+    return kept
 
 
 def _title_token_in_name(tok: str, name_lower: str) -> bool:
@@ -3151,15 +3203,6 @@ def parse_product_filters_from_text(
 _OS_CATEGORY_NAME_CACHE: dict[str, Any] = {"ts": 0.0, "names": []}
 
 
-def _normalize_category_label_tokens(text: str) -> set[str]:
-    low = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
-    # Soft split common ecommerce compounds so Flipflops ↔ Flip Flops overlap.
-    low = re.sub(r"\bflipflops?\b", "flip flop", low)
-    low = re.sub(r"\b([a-z]{4,})s\b", r"\1", low)
-    toks = {w for w in low.split() if len(w) >= 3 and w not in {"and", "the", "for", "with"}}
-    return toks
-
-
 def _os_indexed_category_names() -> list[str]:
     """Distinct category_name values currently in the OpenSearch index (small agg)."""
     import time as _time
@@ -3195,42 +3238,57 @@ def _os_indexed_category_names() -> list[str]:
         return list(_OS_CATEGORY_NAME_CACHE["names"] or [])
 
 
-def _os_category_names_for_department(labels: list[str]) -> list[str]:
-    """Match live department/inner labels to indexed category_name values (token overlap)."""
-    if not labels:
+def _os_category_names_for_department(category_id, ctx=None) -> list[str]:
+    """
+    Fallback name bridge when leaf category ids are unavailable.
+    Exact match only between live department-unique labels and indexed category_name
+    values — no keyword blocklists; cross-department labels are skipped via the
+    live category tree.
+    """
+    try:
+        from services.welfog_api import (
+            department_unique_catalog_label_names,
+            _normalize_cat_name,
+        )
+    except ImportError:
         return []
-    label_tok_sets = [_normalize_category_label_tokens(x) for x in labels if x]
-    label_tok_sets = [t for t in label_tok_sets if t]
+
+    unique_labels = department_unique_catalog_label_names(category_id, ctx)
+    if not unique_labels:
+        return []
+
+    by_key: dict[str, str] = {}
+    for lab in unique_labels:
+        key = _normalize_cat_name(lab)
+        if key and key not in by_key:
+            by_key[key] = lab.strip()
+
     matched: list[str] = []
     seen: set[str] = set()
     for os_name in _os_indexed_category_names():
-        ot = _normalize_category_label_tokens(os_name)
-        if not ot:
+        key = _normalize_cat_name(os_name)
+        if not key or key not in by_key:
             continue
-        ok = False
-        for lt in label_tok_sets:
-            if ot == lt or lt <= ot or ot <= lt:
-                ok = True
-                break
-            overlap = ot & lt
-            if overlap and len(overlap) >= max(1, min(2, len(lt))):
-                ok = True
-                break
-        if ok and os_name not in seen:
-            seen.add(os_name)
-            matched.append(os_name)
-    # Exact label strings that already match index keywords
-    for lab in labels:
-        if lab and lab not in seen and lab in (_OS_CATEGORY_NAME_CACHE.get("names") or []):
-            seen.add(lab)
-            matched.append(lab)
+        # Prefer the live catalog spelling when present in the index; else OS key.
+        pick = by_key[key]
+        if pick in (_OS_CATEGORY_NAME_CACHE.get("names") or []):
+            out = pick
+        else:
+            out = str(os_name).strip()
+        if out and out not in seen:
+            seen.add(out)
+            matched.append(out)
     return matched
 
 
 def _opensearch_category_filter_clause(spec: dict[str, Any]) -> Optional[dict]:
     """
-    Prefer exact category_id; also OR leaf category_name values under the department.
-    Nav main ids (10/16) are often absent from the index — names bridge the gap.
+    Scope OpenSearch to a nav department.
+
+    Nav/inner category ids and OpenSearch category_id values are different
+    namespaces — never rely on leaf-id-only filters. Prefer exact
+    category_name matches from live department-unique labels; also OR the
+    requested id (and leaf ids) in case some docs use that space.
     """
     if not spec.get("category_id"):
         return None
@@ -3238,15 +3296,27 @@ def _opensearch_category_filter_clause(spec: dict[str, Any]) -> Optional[dict]:
         cid = int(spec["category_id"])
     except (TypeError, ValueError):
         return None
+
     should: list[dict] = [{"term": {"category_id": cid}}]
     try:
-        from services.welfog_api import department_catalog_label_names
+        from services.welfog_api import department_leaf_category_ids
 
-        labels = department_catalog_label_names(cid)
-        for name in _os_category_names_for_department(labels):
+        id_set: list[int] = [cid]
+        for lid in department_leaf_category_ids(cid):
+            try:
+                lid_i = int(lid)
+            except (TypeError, ValueError):
+                continue
+            if lid_i not in id_set:
+                id_set.append(lid_i)
+        if len(id_set) > 1:
+            should[0] = {"terms": {"category_id": id_set}}
+
+        for name in _os_category_names_for_department(cid):
             should.append({"term": {"category_name": name}})
     except Exception:
         pass
+
     if len(should) == 1:
         return should[0]
     return {"bool": {"should": should, "minimum_should_match": 1}}
@@ -3327,8 +3397,29 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
     if spec.get("in_stock_only"):
         filters.append({"range": {"stock": {"gt": 0}}})
 
-    filters.append({"term": {"published": 1}})
-    filters.append({"term": {"approved": 1}})
+    # Index often omits published/approved — treat missing as visible, keep explicit 0 out.
+    filters.append(
+        {
+            "bool": {
+                "should": [
+                    {"term": {"published": 1}},
+                    {"bool": {"must_not": {"exists": {"field": "published"}}}},
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+    )
+    filters.append(
+        {
+            "bool": {
+                "should": [
+                    {"term": {"approved": 1}},
+                    {"bool": {"must_not": {"exists": {"field": "approved"}}}},
+                ],
+                "minimum_should_match": 1,
+            }
+        }
+    )
 
     title = (spec.get("title_query") or "").strip()
     if spec.get("sku") and not title:
