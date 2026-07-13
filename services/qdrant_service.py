@@ -174,7 +174,7 @@ def ensure_qdrant_collection() -> dict[str, Any]:
             )
             created = True
 
-        # Payload indexes for future filtered retrieval (metadata from chunk pipeline).
+        # Payload indexes for filtered + hybrid (dense + lexical) retrieval.
         for field_name, schema in (
             ("doc_id", PayloadSchemaType.INTEGER),
             ("version", PayloadSchemaType.INTEGER),
@@ -183,6 +183,7 @@ def ensure_qdrant_collection() -> dict[str, Any]:
             ("language", PayloadSchemaType.KEYWORD),
             ("title", PayloadSchemaType.KEYWORD),
             ("content_hash", PayloadSchemaType.KEYWORD),
+            ("content", PayloadSchemaType.TEXT),
         ):
             try:
                 client.create_payload_index(
@@ -358,6 +359,107 @@ def search_knowledge_vectors(
     return out
 
 
+def lexical_knowledge_search(
+    collection: str,
+    query: str,
+    *,
+    top_k: int = 8,
+    doc_id_filter: list[int] | None = None,
+    language_filter: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Full-text hybrid leg via Qdrant TEXT index on payload.content.
+
+    Uses the analyzer on the raw query first; if that is too strict (AND over
+    multilingual filler), falls back to OR over whitespace tokens filtered only
+    by length/shape (no curated keyword/stopword lists). Merged with dense via RRF.
+    """
+    import re
+
+    q = (query or "").strip()
+    if len(q) < 2:
+        return []
+
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchText
+
+    def _base_must() -> list[Any]:
+        must: list[Any] = []
+        if language_filter:
+            must.append(
+                FieldCondition(
+                    key="language",
+                    match=MatchAny(any=[language_filter.lower(), "auto"]),
+                )
+            )
+        if doc_id_filter:
+            must.append(
+                FieldCondition(
+                    key="doc_id", match=MatchAny(any=[int(x) for x in doc_id_filter])
+                )
+            )
+        return must
+
+    def _scroll(text_condition: FieldCondition | Filter) -> list[Any]:
+        must = _base_must()
+        must.append(text_condition)
+        try:
+            records, _next = client.scroll(
+                collection_name=collection,
+                scroll_filter=Filter(must=must),
+                limit=max(1, min(20, int(top_k))),
+                with_payload=True,
+                with_vectors=False,
+            )
+            return list(records or [])
+        except Exception:
+            return []
+
+    # 1) Whole-query MatchText (best when query terms all appear in a chunk).
+    records = _scroll(FieldCondition(key="content", match=MatchText(text=q[:500])))
+
+    # 2) If empty: OR over content-shaped tokens (length/shape only — not a stop list).
+    if not records:
+        raw_toks = re.findall(r"[A-Za-z0-9]+", q)
+        shaped: list[str] = []
+        seen: set[str] = set()
+        for tok in raw_toks:
+            key = tok.lower()
+            if key in seen:
+                continue
+            # IR heuristic: keep content-like tokens; drop 1–2 char noise.
+            if len(tok) >= 4 or (tok.isupper() and len(tok) >= 2) or any(ch.isdigit() for ch in tok):
+                seen.add(key)
+                shaped.append(tok)
+        if shaped:
+            records = _scroll(
+                Filter(
+                    should=[
+                        FieldCondition(key="content", match=MatchText(text=t))
+                        for t in shaped[:8]
+                    ]
+                )
+            )
+
+    limit = max(1, min(20, int(top_k)))
+    out: list[dict[str, Any]] = []
+    for i, rec in enumerate(records[:limit]):
+        payload = dict(rec.payload or {})
+        score = max(0.22, 0.48 - (0.02 * i))
+        out.append(
+            {
+                "point_id": str(rec.id),
+                "score": float(score),
+                "payload": payload,
+                "match_type": "fulltext",
+            }
+        )
+    return out
+
+
 def delete_knowledge_vectors_by_point_ids(collection: str, point_ids: list[str]) -> int:
     """Delete Qdrant points by deterministic IDs."""
     if not point_ids:
@@ -385,6 +487,43 @@ def delete_knowledge_vectors_by_doc_id(collection: str, doc_id: int) -> int:
         collection_name=collection,
         points_selector=FilterSelector(
             filter=Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=int(doc_id)))])
+        ),
+        wait=True,
+    )
+    return 1
+
+
+def delete_knowledge_vectors_by_doc_id_except_version(
+    collection: str,
+    doc_id: int,
+    keep_version: int,
+) -> int:
+    """
+    Delete Qdrant vectors for a document except the keep_version points.
+    Used after a successful reindex upsert so old vectors are removed atomically.
+    """
+    client = get_qdrant_client()
+    if client is None:
+        raise RuntimeError("Qdrant client unavailable")
+    from qdrant_client.models import (
+        FieldCondition,
+        Filter,
+        FilterSelector,
+        MatchValue,
+    )
+
+    client.delete(
+        collection_name=collection,
+        points_selector=FilterSelector(
+            filter=Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=int(doc_id)))],
+                must_not=[
+                    FieldCondition(
+                        key="version",
+                        match=MatchValue(value=int(keep_version)),
+                    )
+                ],
+            )
         ),
         wait=True,
     )

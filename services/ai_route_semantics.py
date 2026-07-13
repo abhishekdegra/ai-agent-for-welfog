@@ -570,10 +570,35 @@ def repair_brain_json_quality(route: dict | None, user_msg: str = "", msg_en: st
                 "Brain user_meaning echoed customer text — substituted English translation."
             )
         else:
-            log_reasoning(
-                "Brain user_meaning echoed customer text — backend will use "
-                "order_lookup_kind/route_handler/field_focus only."
-            )
+            try:
+                from services.translation_service import (
+                    text_usable_as_english_retrieval,
+                    to_en_for_retrieval,
+                )
+
+                if not text_usable_as_english_retrieval(raw):
+                    gloss = to_en_for_retrieval(raw, str(out.get("reply_lang") or ""))
+                    if gloss and gloss.lower() != raw.lower():
+                        out["user_meaning"] = gloss[:300]
+                        log_reasoning(
+                            "Brain user_meaning echoed non-English customer text — "
+                            "substituted retrieval EN gloss."
+                        )
+                    else:
+                        log_reasoning(
+                            "Brain user_meaning echoed customer text — backend will use "
+                            "order_lookup_kind/route_handler/field_focus only."
+                        )
+                else:
+                    log_reasoning(
+                        "Brain user_meaning echoed customer text — backend will use "
+                        "order_lookup_kind/route_handler/field_focus only."
+                    )
+            except ImportError:
+                log_reasoning(
+                    "Brain user_meaning echoed customer text — backend will use "
+                    "order_lookup_kind/route_handler/field_focus only."
+                )
     elif en and len(en) >= 3 and not um:
         out["user_meaning"] = en[:300]
 
@@ -1243,7 +1268,6 @@ def reconcile_welfog_kb_from_brain_meaning(
                 original_msg,
                 msg_en,
                 conversation_context=conversation_context,
-                ai_route=out,
             )
         except ImportError:
             keys = []
@@ -1306,20 +1330,45 @@ def _clean_brain_product_name(name: str) -> str:
 
 
 def _product_noun_from_brain_english(blob: str) -> str:
-    """Extract product type from brain English fields only (not customer Hinglish)."""
+    """
+    Extract product type from brain English fields only (not customer Hinglish).
+    Never rewrite a brand+cover ask into generic "mobile cover".
+    """
     low = (blob or "").lower()
+    if not low:
+        return ""
+    # Prefer brand/device + cover|case as a unit (iphone cover, samsung case).
+    m = re.search(
+        r"\b([a-z0-9]+(?:\s+[a-z0-9]+)?)\s+(mobile\s+)?(cover|case|back\s+cover)s?\b",
+        low,
+    )
+    if m:
+        head = (m.group(1) or "").strip()
+        kind = (m.group(3) or "cover").replace("back cover", "cover")
+        skip = {
+            "a", "an", "the", "my", "for", "want", "show", "need", "buy", "some",
+            "mobile", "phone", "back", "best", "any",
+        }
+        if head and head not in skip and head not in ("cover", "case"):
+            return f"{head} {kind}".strip()
+        return kind if kind != "back cover" else "cover"
     patterns: tuple[tuple[re.Pattern[str], str], ...] = (
-        (re.compile(r"mobile\s+cover|phone\s+cover|back\s+cover", re.I), "mobile cover"),
-        (re.compile(r"\bcovers?\b", re.I), "mobile cover"),
         (re.compile(r"\bjeans?\b", re.I), "jeans"),
         (re.compile(r"\b(pajama|pajami|nightwear|night\s*wear)\b", re.I), "pajama"),
         (re.compile(r"water\s+bottle", re.I), "water bottle"),
         (re.compile(r"track\s+pants?|\blower\b", re.I), "track pants"),
         (re.compile(r"\biphones?\b", re.I), "iphone"),
+        (re.compile(r"\b(flip\s*flops?|flipflops?)\b", re.I), "flip flops"),
+        (re.compile(r"\b(vest|baniyan|banyan)\b", re.I), "vest"),
     )
     for pattern, canonical in patterns:
         if pattern.search(low):
             return canonical
+    # Bare cover/case — keep as cover, NOT "mobile cover" (that drops brand context).
+    if re.search(r"\bcovers?\b", low):
+        return "cover"
+    if re.search(r"\bcases?\b", low):
+        return "case"
     return ""
 
 
@@ -1738,9 +1787,10 @@ def _brain_product_entities_from_route(
             continue
         ent[k] = s
 
-    sq = _coerce_brain_scalar_field(r.get("search_query"))
-    if not ent.get("product_name") and sq:
-        ent["product_name"] = sq
+    # Do NOT copy brain.search_query into product_name — search_query is often a
+    # paraphrased English sentence (user_meaning style). Product Entity Extraction
+    # owns the searchable noun phrase / title_query. Keep filter fields only.
+    _ = _coerce_brain_scalar_field(r.get("search_query"))
 
     pid = ent.get("product_id") or ent.get("pro_id")
     if pid is not None:
@@ -1960,46 +2010,27 @@ def resolve_catalog_search_phrase(
     ai_search_query: str = "",
 ) -> str:
     """
-    Highest-quality catalog product phrase for OpenSearch title_query.
+    Optional Brain *structured* product_entities.product_name hint only.
 
-    Priority (first usable wins):
-      brain.search_query → category_browse → product_entities.category →
-      product_entities.product_name → user_meaning → original user query (last resort only)
+    OpenSearch title_query must NOT come from user_meaning / reasoning / search_query
+    paraphrases / category_browse / raw customer text. Prefer explicit product_name
+    from Brain product_entities JSON. Product Entity Extraction
+    (extract_semantic_product_entities) owns title_query when this returns empty.
     """
     r = ai_route or {}
+    _ = (original_msg, msg_en, ai_search_query)
 
-    sq = _usable_brain_search_query(r.get("search_query") or ai_search_query, r)
-    if sq:
-        return sq
+    # Explicit product_entities.product_name only (not synthesized from search_query).
+    ent = _raw_route_product_entities(r)
+    pn = _usable_catalog_entity_phrase(ent.get("product_name") or "", r)
+    if pn:
+        um = (r.get("user_meaning") or "").strip().lower()
+        # Reject when Brain stuffed its paraphrase sentence into product_name.
+        if um and pn.lower() == um:
+            return ""
+        return pn
 
-    cb = _usable_brain_category_browse(r)
-    if cb:
-        return cb
-
-    for ent in (
-        _raw_route_product_entities(r),
-        _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en),
-    ):
-        cat = _usable_brain_entity_category(ent)
-        if cat:
-            return cat
-
-    for ent in (
-        _raw_route_product_entities(r),
-        _brain_product_entities_from_route(r, original_msg=original_msg, msg_en=msg_en),
-    ):
-        pn = _usable_catalog_entity_phrase(ent.get("product_name") or "", r)
-        if pn:
-            return pn
-
-    um = _usable_catalog_entity_phrase(r.get("user_meaning") or "", r)
-    if um:
-        return um
-
-    if _brain_provided_catalog_phrase(r):
-        return ""
-
-    return _original_user_product_phrase(original_msg, msg_en, route=r)
+    return ""
 
 
 def _catalog_search_query_from_brain_route(
@@ -2008,7 +2039,7 @@ def _catalog_search_query_from_brain_route(
     original_msg: str = "",
     msg_en: str = "",
 ) -> str:
-    """English product-type search terms from ai_brain_route JSON only."""
+    """Structured product-type entity from Brain JSON only (never user_meaning)."""
     return resolve_catalog_search_phrase(
         route,
         original_msg=original_msg,
@@ -2133,14 +2164,14 @@ def reconcile_pincode_delivery_from_brain_meaning(
     out = dict(route or {})
     out = correct_delivery_vs_tracking_from_ai_meaning(out)
 
-    if ai_meaning_describes_delivery_serviceability(out):
+    def _lock_live_delivery(src: str) -> dict:
         out["intent"] = "pincode_check"
         out["data_channel"] = "live_api"
         out["route_handler"] = "pincode_delivery_api"
         out["needs_order_id"] = False
         out["numeric_context"] = "pincode"
         out["run_catalog_search"] = False
-        out["search_query"] = ""
+        out["search_query"] = out.get("search_query") or ""
         out["order_lookup_kind"] = "none"
         out["scope_reply"] = ""
         out["conversation_scope"] = "welfog_support"
@@ -2148,13 +2179,34 @@ def reconcile_pincode_delivery_from_brain_meaning(
         out["is_welfog_related"] = True
         out.pop("_product_catalog_locked", None)
         out["_pincode_delivery_locked"] = True
+        try:
+            from services.chat_flow_telemetry import lock_authoritative_pincode_route
+
+            lock_authoritative_pincode_route(source=src, ai_route=out)
+        except ImportError:
+            pass
+        return out
+
+    if ai_meaning_describes_delivery_serviceability(out):
+        _lock_live_delivery("brain_json")
         log_reasoning(
             "Brain delivery reconcile — pincode_check from ai_brain_route JSON."
         )
         return out
 
-    if brain_route_indicates_product_catalog(out):
-        return out
+    # Hard product lock from shopping only — soft Brain catalog mislabels must still
+    # reach the delivery semantic classifier (city serviceability ≠ product search).
+    if out.get("_product_catalog_locked"):
+        try:
+            from utils.helpers import turn_is_obvious_product_shopping_turn
+
+            if turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conversation_context
+            ):
+                return out
+        except ImportError:
+            if brain_route_indicates_product_catalog(out):
+                return out
 
     if original_msg or msg_en:
         try:
@@ -2162,7 +2214,7 @@ def reconcile_pincode_delivery_from_brain_meaning(
 
             if turn_is_obvious_product_shopping_turn(
                 original_msg, msg_en, conversation_context
-            ):
+            ) and brain_route_indicates_product_catalog(out):
                 return out
         except ImportError:
             pass
@@ -2178,12 +2230,12 @@ def reconcile_pincode_delivery_from_brain_meaning(
                 conversation_context,
             )
             if (promoted.get("intent") or "").strip().lower() == "pincode_check":
-                promoted["_pincode_delivery_locked"] = True
-                promoted.pop("_product_catalog_locked", None)
+                out = promoted
+                _lock_live_delivery("delivery_semantic")
                 log_reasoning(
                     "Brain delivery reconcile — delivery AI classifier locked pincode_check."
                 )
-                return promoted
+                return out
         except ImportError:
             pass
 
@@ -3391,24 +3443,8 @@ def promote_informational_kb_from_ai_meaning(route: dict | None) -> dict:
     out["kb_keys"] = _default_kb_keys_for_intent(
         intent, list(out.get("kb_keys") or []), route=out
     )
-    try:
-        from services.query_understanding import infer_kb_query_category, scoped_kb_keys_for_retrieval
-
-        meaning = (out.get("user_meaning") or "").strip()
-        if len(out.get("kb_keys") or []) > 4:
-            cat = infer_kb_query_category(
-                meaning,
-                "",
-                ai_route=out,
-                conversation_context="",
-            )
-            scoped = scoped_kb_keys_for_retrieval(
-                cat, ai_route=out, user_meaning=meaning
-            )
-            if scoped:
-                out["kb_keys"] = scoped[:4]
-    except ImportError:
-        pass
+    # Do not trim Brain keys to a predefined category catalog — semantic retrieval
+    # ranks among all active Admin docs; Brain keys remain soft hints only.
     out.pop("route_handler", None)
 
     if intent == "order" and channel != "live_api":
@@ -3679,13 +3715,15 @@ def enrich_universal_brain_route(
                 msg_en=msg_en,
             )
             out["_product_catalog_locked"] = True
-            out["_needs_product_nlu_llm"] = False
+            # Routing is locked; title_query still requires Product Entity Extraction.
+            out["_needs_product_nlu_llm"] = True
             out["_ai_single_pass"] = True
             out["_turn_promotions_done"] = True
             if isinstance(ctx, dict) and ctx.get("last"):
                 out["_ctx_last"] = ctx.get("last")
             log_reasoning(
-                "Universal brain — AI product catalog locked; skip enrich/embed stack."
+                "Universal brain — AI product catalog locked; skip enrich/embed stack "
+                "(Product Entity Extraction owns title_query)."
             )
             return out
     except ImportError:
@@ -3746,6 +3784,12 @@ def enrich_universal_brain_route(
         (out.get("intent") or "").strip().lower() == "pincode_check"
         and (out.get("data_channel") or "").strip().lower() == "live_api"
     ):
+        try:
+            from services.chat_flow_telemetry import lock_authoritative_pincode_route
+
+            lock_authoritative_pincode_route(source="universal_enrich", ai_route=out)
+        except ImportError:
+            pass
         out["_turn_promotions_done"] = True
         if isinstance(ctx, dict) and ctx.get("last"):
             out["_ctx_last"] = ctx.get("last")

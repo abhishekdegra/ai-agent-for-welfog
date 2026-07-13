@@ -37,17 +37,18 @@ Saved/liked/heart ≠ purchased/order history — user_meaning and account_list_
 | Privacy / terms / shipping policy / FAQ / company info | general | kb | knowledge files |
 | Customer care phone / email | general | kb | support contact files |
 | Amazon / Flipkart order (other company) | out_of_domain | none | polite decline |
-| Random non-shopping (recipe, cricket, girlfriend, life advice) | out_of_domain | none | polite decline — NEVER product catalog |
-| Seller account / seller login / sell on Welfog | seller | kb | seller.txt + support |
+| Random non-shopping (recipe, cricket, girlfriend, life advice) with no Admin KB match | out_of_domain | none | polite decline — NEVER product catalog |
+| Any Admin knowledge catalog topic (including newly added titles) | general (or matching) | kb | welfog_support — never OOD solely because the topic is unfamiliar |
+| Seller account / seller login / sell on Welfog | seller | kb | seller knowledge + support |
 | Hi / namaste / small talk | general | none | conversation_scope=general_chitchat + scope_reply in customer language |
-| Random non-shopping (any language, unseen wording) | out_of_domain | none | conversation_scope=out_of_domain + scope_reply — NEVER catalog/KB |
+| Random non-shopping (any language, unseen wording) with no Admin KB match | out_of_domain | none | conversation_scope=out_of_domain + scope_reply — NEVER catalog; allow KB only when Admin docs ground the answer |
 
 CONVERSATION_SCOPE (AI — semantic, NOT keyword lists)
 -----------------------------------------------------
 Every route JSON must set conversation_scope + scope_reply when not shopping:
-- welfog_support: normal table above; scope_reply empty.
+- welfog_support: normal table above; scope_reply empty. Includes ANY topic covered by Admin knowledge documents.
 - general_chitchat: greeting, thanks, who is this bot, light talk — warm short scope_reply; meta_kind conversational or assistant_intro.
-- out_of_domain: weather, sports, recipes, other apps, life advice, personal stories — polite scope_reply; intent=out_of_domain; NEVER product search.
+- out_of_domain: weather, sports, recipes, other apps, life advice, personal stories — polite scope_reply; intent=out_of_domain; NEVER product search. Exception: Welfog platform policy questions answered by Admin knowledge → kb / welfog_support.
 
 DISAMBIGUATION (critical — same words, different topics)
 ------------------------------------------------------

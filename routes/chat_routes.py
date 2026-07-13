@@ -3223,20 +3223,31 @@ def _try_ai_classified_product_catalog_reply(
             "_universal_brain_route": True,
             "_zero_llm_fast": True,
             "_ai_single_pass": True,
-            "_needs_product_nlu_llm": False,
+            # Product Entity Extraction owns title — never stamp user_meaning as search_query.
+            "_needs_product_nlu_llm": True,
             "user_meaning": um,
-            "search_query": um,
+            "search_query": "",
         }
         sq = resolve_catalog_search_terms_for_message(
             original_msg, msg_en, ai_route=product_route
         )
-        if not sq:
-            sq = um
-        if not sq or len(str(sq).strip()) < 2:
-            return None, None
+        if sq and len(str(sq).strip()) >= 2:
+            product_route["search_query"] = str(sq).strip()
+            product_route["_product_nlu_from_ai"] = True
+            product_route["_needs_product_nlu_llm"] = False
+            product_route["_product_entities"] = {"product_name": str(sq).strip()}
+        if not (product_route.get("search_query") or "").strip():
+            # Leave empty — _prepare_brain_product_route will enable entity extraction.
+            pass
         product_route, sq = _prepare_brain_product_route(
             product_route, original_msg, msg_en
         )
+        if not sq or len(str(sq).strip()) < 2:
+            # Entity extraction still runs inside catalog flow when flag is True.
+            if not product_route.get("_needs_product_nlu_llm") and not product_route.get(
+                "_product_nlu_from_ai"
+            ):
+                return None, None
         log_reasoning(
             f"KB AI product_search sq={sq!r} → OpenSearch (skip brain wait)."
         )

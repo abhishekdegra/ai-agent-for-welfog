@@ -1080,15 +1080,20 @@ def _extract_product_keywords(low: str) -> str:
 
 
 def _post_filter_mode_for_spec(spec: dict[str, Any]) -> str:
-    """Strict when brain/user named brand, product nouns, or locked single-pass catalog."""
-    if spec.get("title_match_strict") or spec.get("brand"):
+    """
+    Strict only when brand / mandatory tokens / explicit title_match_strict.
+    Otherwise os_filters_only: light title relevance + brand/colour — do NOT force
+    strict all-token wipe on every locked `_ai_single_pass` noun search.
+    """
+    if spec.get("title_match_strict"):
         return "strict"
     if spec.get("mandatory_match_tokens"):
         return "strict"
-    if spec.get("_ai_single_pass") and (spec.get("title_query") or "").strip():
-        return "strict"
-    if (spec.get("product_type") or "").strip():
-        return "strict"
+    # Brand-named searches stay strict for title+brand alignment.
+    if (spec.get("brand") or "").strip() and spec.get("title_match_strict") is not False:
+        if spec.get("title_match_strict") or (spec.get("match_mode") or "").strip().lower() == "strict":
+            return "strict"
+    # Soft noun searches: OpenSearch ranks; post-filter keeps colour/brand lightly.
     return "os_filters_only"
 
 
@@ -1173,17 +1178,42 @@ def format_filter_display_label(spec: dict[str, Any]) -> str:
     return " ".join(parts).strip() or "your filters"
 
 
+_GENERIC_TITLE_MODIFIERS = frozenset(
+    {
+        "men",
+        "man",
+        "mens",
+        "women",
+        "woman",
+        "womens",
+        "kids",
+        "boy",
+        "boys",
+        "girl",
+        "girls",
+        "male",
+        "female",
+        "unisex",
+        "for",
+        "adult",
+        "adults",
+    }
+)
+
+
 def _title_match_tokens(title_query: str) -> list[str]:
-    """Product-type words that must appear in result names (shirt, rice, wheat…)."""
+    """Distinctive searchable tokens from the product title query (any catalog language/spelling)."""
     if not title_query:
         return []
     tokens = []
-    for w in re.findall(r"[a-z]{3,}", title_query.lower()):
-        if w in _COLOR_NAME_TOKENS or w in _FILTER_STOP:
+    for w in re.findall(r"[a-z0-9]{3,}", title_query.lower()):
+        if w in _COLOR_NAME_TOKENS or w in _FILTER_STOP or w in _GENERIC_TITLE_MODIFIERS:
             continue
-        if w in _PRODUCT_NOUNS or w.endswith("s") and w[:-1] in _PRODUCT_NOUNS:
+        if w in _MATERIAL_TITLE_TOKENS:
+            continue
+        if w in _PRODUCT_NOUNS or (w.endswith("s") and w[:-1] in _PRODUCT_NOUNS):
             tokens.append(w.rstrip("s") if w.endswith("s") and w[:-1] in _PRODUCT_NOUNS else w)
-        elif len(w) >= 4 and w not in ("basmati", "organic", "premium"):
+        elif len(w) >= 3:
             tokens.append(w)
     seen: set[str] = set()
     out = []
@@ -1191,7 +1221,159 @@ def _title_match_tokens(title_query: str) -> list[str]:
         if t not in seen:
             seen.add(t)
             out.append(t)
-    return out[:4]
+    return out[:6]
+
+
+def _compound_space_variants(token: str) -> list[str]:
+    """
+    Generate spaced splits for compound tokens (flipflops → flip flops).
+    No synonym dictionary — all alphabetic split points; OpenSearch BM25 ranks the useful ones.
+    """
+    t = re.sub(r"[^a-z0-9]", "", (token or "").lower())
+    if len(t) < 7:
+        return []
+    out: list[str] = []
+    for i in range(3, len(t) - 2):
+        left, right = t[:i], t[i:]
+        if left.isalpha() and right.isalpha():
+            out.append(f"{left} {right}")
+        if len(out) >= 8:
+            break
+    return out
+
+
+def _soft_collapse_repeated_letters(text: str) -> str:
+    try:
+        from services.product_query_understanding import soft_collapse_repeated_letters
+
+        return soft_collapse_repeated_letters(text)
+    except ImportError:
+        t = (text or "").lower()
+        t = re.sub(r"([aeiou])\1+", r"\1", t)
+        t = re.sub(r"([b-df-hj-np-tv-z])\1{2,}", r"\1", t)
+        return t
+
+
+def _expand_title_query_variants(title: str) -> list[str]:
+    """
+    Typo-softened primary + compound-split variants for robust BM25 matching.
+    No product keyword lists — algorithmic repeats/splits only.
+
+    Prefer soft-collapsed form first: raw keysmash + fuzziness:2 can make OpenSearch
+    reject/empty the whole bool query even when a good alt variant is present.
+    """
+    base = re.sub(r"\s+", " ", (title or "").strip().lower())
+    if not base:
+        return []
+    collapsed = _soft_collapse_repeated_letters(base)
+    # Collapsed first when it differs — matching quality, not keyword maps.
+    variants: list[str] = []
+    if collapsed:
+        variants.append(collapsed)
+    if base and base not in variants:
+        variants.append(base)
+
+    def _add(alt: str) -> None:
+        alt = re.sub(r"\s+", " ", (alt or "").strip().lower())
+        if alt and alt not in variants:
+            variants.append(alt)
+
+    # Prefer balanced spaced splits early (flipflops → flip flops).
+    for source in list(variants[:2]):
+        for tok in source.split():
+            soft = _soft_collapse_repeated_letters(tok)
+            if soft != tok:
+                _add(source.replace(tok, soft, 1))
+            splits = _compound_space_variants(soft if soft != tok else tok)
+            # Rank by length balance so "flip flops" beats "fliipf lops".
+            ranked = sorted(
+                splits,
+                key=lambda s: abs(len(s.split()[0]) - len(s.split()[-1])) if " " in s else 99,
+            )
+            for split in ranked[:4]:
+                _add(source.replace(tok, split, 1))
+        compact = re.sub(r"[^a-z0-9]", "", source)
+        if len(compact) >= 7:
+            ranked = sorted(
+                _compound_space_variants(compact),
+                key=lambda s: abs(len(s.split()[0]) - len(s.split()[-1])) if " " in s else 99,
+            )
+            for split in ranked[:3]:
+                _add(split)
+    return variants[:6]
+
+
+def _build_title_match_clause(title: str) -> dict[str, Any]:
+    """
+    Precision-first OpenSearch text query.
+
+    - Searches product name / sku / brand (NOT category_name — that caused Men Fashion pollution).
+    - Primary = typo-softened form when available (avoids fuzzy blow-ups on keysmash).
+    - Uses compound-split variants as soft should clauses.
+    """
+    variants = _expand_title_query_variants(title)
+    if not variants:
+        return {"match_all": {}}
+    primary = variants[0]
+    token_count = len(re.findall(r"[a-z0-9]+", primary))
+    # Soft-collapsed long tokens: mild AUTO fuzz is enough; avoid fuzziness:2
+    # on raw keysmash (can empty the whole query).
+    fuzz: Any = "AUTO"
+    prefix_len = 0 if token_count == 1 else 1
+    if token_count <= 1:
+        msm: Any = "1"
+    elif token_count == 2:
+        msm = "2"
+    else:
+        msm = "2<75%"
+
+    should: list[dict[str, Any]] = [
+        {
+            "multi_match": {
+                "query": primary,
+                "fields": ["name^5", "sku^2", "brand^1.5"],
+                "type": "best_fields",
+                "fuzziness": fuzz,
+                "prefix_length": prefix_len,
+                "minimum_should_match": msm,
+            }
+        },
+        {
+            "match_phrase": {
+                "name": {
+                    "query": primary,
+                    "boost": 4.0,
+                    "slop": 2,
+                }
+            }
+        },
+    ]
+    for alt in variants[1:]:
+        # Exact/phrase + light AUTO only — never expensive fuzziness:2 on alts.
+        should.append(
+            {
+                "multi_match": {
+                    "query": alt,
+                    "fields": ["name^5", "sku^2", "brand"],
+                    "type": "best_fields",
+                    "fuzziness": "AUTO",
+                    "prefix_length": 1,
+                    "boost": 1.4,
+                }
+            }
+        )
+        should.append(
+            {
+                "match_phrase": {
+                    "name": {
+                        "query": alt,
+                        "boost": 2.8,
+                        "slop": 2,
+                    }
+                }
+            }
+        )
+    return {"bool": {"should": should, "minimum_should_match": 1}}
 
 
 def color_hue_mentioned_in_text(color_name: str, text: str) -> bool:
@@ -1492,6 +1674,19 @@ def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
     tq = (spec.get("title_query") or "").strip().lower()
     if tq in _FILTER_STOP or tq in ("your", "search", "kesa", "kaise", "hello"):
         spec["title_query"] = ""
+    # Algorithmic typo soften on the way into catalog (echoed keysmash → matchable).
+    tq = (spec.get("title_query") or "").strip()
+    if tq and re.search(r"(.)\1", tq.lower()):
+        try:
+            from services.product_query_understanding import soften_echoed_typo_search_terms
+
+            soft = soften_echoed_typo_search_terms(tq)
+            if soft:
+                spec["title_query"] = soft
+        except ImportError:
+            soft = _soft_collapse_repeated_letters(tq)
+            if soft:
+                spec["title_query"] = soft
     if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
         spec["_landed_price_filter"] = True
     return spec
@@ -1623,16 +1818,17 @@ def filter_products_by_ai_mandatory_tokens(
 
 
 def _phone_brand_vocab() -> frozenset:
+    """Phone + lifestyle brands for message infer (nike shoes, samsung cover, …)."""
     try:
-        from services.product_query_understanding import _PHONE_BRANDS
+        from services.product_query_understanding import _ALL_KNOWN_BRANDS
 
-        return _PHONE_BRANDS
+        return _ALL_KNOWN_BRANDS
     except ImportError:
         return frozenset(
             {
                 "samsung", "iphone", "apple", "vivo", "oppo", "realme", "redmi", "mi", "xiaomi",
                 "oneplus", "poco", "nothing", "google", "motorola", "nokia", "honor", "infinix",
-                "lg", "tecno", "itel",
+                "lg", "tecno", "itel", "nike", "adidas", "puma", "reebok", "bata", "skechers",
             }
         )
 
@@ -2110,6 +2306,13 @@ def apply_catalog_post_filters(
             strict = bool(spec.get("title_match_strict"))
             if title_q:
                 products = filter_products_by_title_relevance(products, title_q, strict=strict)
+                products = filter_products_by_relevance_score_gap(products)
+
+    if mode in ("os_filters_only", "light"):
+        title_q = (spec.get("title_query") or "").strip()
+        if title_q and not _is_category_only_browse_spec(spec):
+            products = filter_products_by_title_relevance(products, title_q, strict=False)
+            products = filter_products_by_relevance_score_gap(products, min_ratio=0.28)
 
     req_brand = (spec.get("_requested_brand") or spec.get("brand") or "").strip()
     req_aliases = spec.get("_requested_brand_aliases") or spec.get("brand_aliases") or []
@@ -2142,12 +2345,22 @@ def apply_catalog_post_filters(
 
 
 def _title_token_in_name(tok: str, name_lower: str) -> bool:
+    """True when token (or a compound split of it) appears in the product name."""
+    tok = (tok or "").strip().lower()
+    if not tok or not name_lower:
+        return False
     if tok in name_lower:
         return True
-    if tok.endswith("s") and tok[:-1] in name_lower:
+    if tok.endswith("s") and len(tok) > 3 and tok[:-1] in name_lower:
         return True
     if not tok.endswith("s") and f"{tok}s" in name_lower:
         return True
+    # Compound without spaces: flipflops ↔ "flip flops"
+    if " " not in tok and len(tok) >= 7:
+        for split in _compound_space_variants(tok):
+            parts = split.split()
+            if len(parts) == 2 and parts[0] in name_lower and parts[1] in name_lower:
+                return True
     return False
 
 
@@ -2159,7 +2372,10 @@ def filter_products_by_title_relevance(
     mandatory_tokens: Optional[list[str]] = None,
 ) -> list[dict]:
     """
-    Drop irrelevant catalog hits. Prefer mandatory_tokens from AI when present.
+    Keep products whose names cover the distinctive query tokens.
+
+    Soft mode no longer keeps hits that only share a gender/department word
+    (e.g. "men") — that caused Men Fashion flip-flops to pollute vest/baniyan results.
     """
     if mandatory_tokens:
         return filter_products_by_ai_mandatory_tokens(products, mandatory_tokens)
@@ -2169,25 +2385,50 @@ def filter_products_by_title_relevance(
     if not need or not products:
         return products
 
-    product_nouns = [t for t in need if t in _PRODUCT_NOUNS or (t.endswith("s") and t[:-1] in _PRODUCT_NOUNS)]
-
-    if strict:
-        matched = []
-        for p in products:
-            name = (p.get("name") or "").lower()
-            if not all(_title_token_in_name(tok, name) for tok in need):
-                continue
-            if product_nouns and not any(_title_token_in_name(n, name) for n in product_nouns):
-                continue
-            matched.append(p)
-        return matched
+    # Prefer tokens that are not ultra-generic single adjectives.
+    distinctive = [t for t in need if t not in _GENERIC_TITLE_MODIFIERS]
+    require = distinctive if distinctive else need
 
     matched = []
     for p in products:
         name = (p.get("name") or "").lower()
-        if any(_title_token_in_name(tok, name) for tok in need):
-            matched.append(p)
+        if not name:
+            continue
+        if strict:
+            if all(_title_token_in_name(tok, name) for tok in require):
+                matched.append(p)
+        elif len(require) >= 2:
+            # Soft multi-token: all distinctive tokens (gender already stripped).
+            if all(_title_token_in_name(tok, name) for tok in require):
+                matched.append(p)
+        else:
+            # Soft single noun (baniyan, flipflops, vest): compound-aware match.
+            if any(_title_token_in_name(tok, name) for tok in require):
+                matched.append(p)
     return matched
+
+
+def filter_products_by_relevance_score_gap(
+    products: list[dict],
+    *,
+    min_ratio: float = 0.35,
+    absolute_floor: float = 1.0,
+) -> list[dict]:
+    """
+    Drop weak BM25 outliers relative to the top hit.
+
+    Scalable for any catalog size — no product-type rules. When the best vest
+    scores ~20 and flip-flops score ~3 from a leftover category leak, flip-flops go.
+    """
+    if not products or len(products) <= 1:
+        return products
+    scores = [float(p.get("score") or 0) for p in products]
+    top = max(scores)
+    if top <= 0:
+        return products
+    floor = max(absolute_floor, top * float(min_ratio))
+    kept = [p for p in products if float(p.get("score") or 0) >= floor]
+    return kept if kept else products[:1]
 
 
 def _ensure_project_dotenv_loaded() -> None:
@@ -2251,7 +2492,7 @@ def _normalize_brand_label(token: str) -> str:
 
 
 def _infer_brand_from_message(text: str) -> Optional[str]:
-    """Detect phone/device brand in Hinglish/English (samsung ke liye cover)."""
+    """Detect phone/device brand in Hinglish/English (samsung ke liye cover, sam sung)."""
     low = (text or "").lower()
     if not low:
         return None
@@ -2269,6 +2510,12 @@ def _infer_brand_from_message(text: str) -> Optional[str]:
             earliest = (m.start(), b)
     if earliest:
         return _normalize_brand_label(earliest[1])
+    # Space/typo tolerant: "sam sung", "one plus", "red mi" → brand vocab.
+    compact = re.sub(r"[^a-z0-9]", "", low)
+    for b in vocab:
+        bc = re.sub(r"[^a-z0-9]", "", b.lower())
+        if len(bc) >= 4 and bc in compact:
+            return _normalize_brand_label(b)
     return None
 
 
@@ -2901,6 +3148,110 @@ def parse_product_filters_from_text(
     return spec
 
 
+_OS_CATEGORY_NAME_CACHE: dict[str, Any] = {"ts": 0.0, "names": []}
+
+
+def _normalize_category_label_tokens(text: str) -> set[str]:
+    low = re.sub(r"[^a-z0-9]+", " ", (text or "").lower())
+    # Soft split common ecommerce compounds so Flipflops ↔ Flip Flops overlap.
+    low = re.sub(r"\bflipflops?\b", "flip flop", low)
+    low = re.sub(r"\b([a-z]{4,})s\b", r"\1", low)
+    toks = {w for w in low.split() if len(w) >= 3 and w not in {"and", "the", "for", "with"}}
+    return toks
+
+
+def _os_indexed_category_names() -> list[str]:
+    """Distinct category_name values currently in the OpenSearch index (small agg)."""
+    import time as _time
+
+    now = _time.time()
+    if _OS_CATEGORY_NAME_CACHE["names"] and now - float(_OS_CATEGORY_NAME_CACHE["ts"] or 0) < 300:
+        return list(_OS_CATEGORY_NAME_CACHE["names"] or [])
+    cfg = _env_opensearch_config()
+    if not cfg:
+        return []
+    body = {
+        "size": 0,
+        "aggs": {"cats": {"terms": {"field": "category_name", "size": 200}}},
+    }
+    try:
+        r = requests.post(
+            cfg["url"],
+            auth=cfg.get("auth"),
+            json=body,
+            timeout=8,
+            headers={"Content-Type": "application/json"},
+        )
+        if r.status_code >= 400:
+            return list(_OS_CATEGORY_NAME_CACHE["names"] or [])
+        buckets = (
+            ((r.json() or {}).get("aggregations") or {}).get("cats") or {}
+        ).get("buckets") or []
+        names = [str(b.get("key") or "").strip() for b in buckets if b.get("key")]
+        _OS_CATEGORY_NAME_CACHE["ts"] = now
+        _OS_CATEGORY_NAME_CACHE["names"] = names
+        return names
+    except Exception:
+        return list(_OS_CATEGORY_NAME_CACHE["names"] or [])
+
+
+def _os_category_names_for_department(labels: list[str]) -> list[str]:
+    """Match live department/inner labels to indexed category_name values (token overlap)."""
+    if not labels:
+        return []
+    label_tok_sets = [_normalize_category_label_tokens(x) for x in labels if x]
+    label_tok_sets = [t for t in label_tok_sets if t]
+    matched: list[str] = []
+    seen: set[str] = set()
+    for os_name in _os_indexed_category_names():
+        ot = _normalize_category_label_tokens(os_name)
+        if not ot:
+            continue
+        ok = False
+        for lt in label_tok_sets:
+            if ot == lt or lt <= ot or ot <= lt:
+                ok = True
+                break
+            overlap = ot & lt
+            if overlap and len(overlap) >= max(1, min(2, len(lt))):
+                ok = True
+                break
+        if ok and os_name not in seen:
+            seen.add(os_name)
+            matched.append(os_name)
+    # Exact label strings that already match index keywords
+    for lab in labels:
+        if lab and lab not in seen and lab in (_OS_CATEGORY_NAME_CACHE.get("names") or []):
+            seen.add(lab)
+            matched.append(lab)
+    return matched
+
+
+def _opensearch_category_filter_clause(spec: dict[str, Any]) -> Optional[dict]:
+    """
+    Prefer exact category_id; also OR leaf category_name values under the department.
+    Nav main ids (10/16) are often absent from the index — names bridge the gap.
+    """
+    if not spec.get("category_id"):
+        return None
+    try:
+        cid = int(spec["category_id"])
+    except (TypeError, ValueError):
+        return None
+    should: list[dict] = [{"term": {"category_id": cid}}]
+    try:
+        from services.welfog_api import department_catalog_label_names
+
+        labels = department_catalog_label_names(cid)
+        for name in _os_category_names_for_department(labels):
+            should.append({"term": {"category_name": name}})
+    except Exception:
+        pass
+    if len(should) == 1:
+        return should[0]
+    return {"bool": {"should": should, "minimum_should_match": 1}}
+
+
 def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: int = 0) -> dict:
     must: list[dict] = []
     filters: list[dict] = []
@@ -2924,7 +3275,9 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
                 }
             )
     if spec.get("category_id"):
-        filters.append({"term": {"category_id": int(spec["category_id"])}})
+        cat_clause = _opensearch_category_filter_clause(spec)
+        if cat_clause:
+            filters.append(cat_clause)
     if spec.get("color"):
         c = str(spec["color"]).strip()
         color_values: list[str] = []
@@ -2981,16 +3334,7 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
     if spec.get("sku") and not title:
         pass
     elif title:
-        must.append(
-            {
-                "multi_match": {
-                    "query": title,
-                    "fields": ["name^3", "sku^2", "brand", "category_name"],
-                    "type": "best_fields",
-                    "fuzziness": "AUTO",
-                }
-            }
-        )
+        must.append(_build_title_match_clause(title))
 
     if must or filters:
         query: dict = {"bool": {}}
@@ -3209,6 +3553,29 @@ def search_opensearch_catalog(
             return cards, pro_spec, len(cards), more
 
     if spec.get("category_id") and not (spec.get("title_query") or "").strip():
+        # Live department feed first when the REST categories= filter is trustworthy.
+        # OpenSearch often lacks top-level nav ids; name-expansion is the fallback.
+        try:
+            from services.welfog_api import _rest_category_filter_trustworthy, fetch_products_by_category_browse
+
+            rest_rows, eff = fetch_products_by_category_browse(
+                spec["category_id"], page=page, color=spec.get("color")
+            )
+            if rest_rows and _rest_category_filter_trustworthy(eff or spec["category_id"], rest_rows):
+                log_reasoning(
+                    f"Category browse REST first category_id={eff or spec['category_id']}: "
+                    f"{len(rest_rows)} product(s)."
+                )
+                out_spec = dict(spec)
+                out_spec["category_id"] = eff or spec["category_id"]
+                out_spec["_category_only_browse"] = True
+                pf = "light"
+                rest_rows = apply_catalog_post_filters(rest_rows, out_spec, post_filter_mode=pf)
+                if rest_rows:
+                    has_more = len(rest_rows) >= page_size
+                    return rest_rows[:page_size], out_spec, len(rest_rows), has_more
+        except Exception:
+            pass
         pf = "light"
         cards, n, more = _search_opensearch_page(
             spec, page=page, page_size=page_size, post_filter_mode=pf
@@ -3736,10 +4103,20 @@ def catalog_search_live(
             )
             if cat_rest[0]:
                 return cat_rest
-        log_reasoning(
-            "Catalog AI single-pass: 0 OS hits — fast not-found (skip slow REST on locked path)."
-        )
-        return [], spec, 0, False
+        # OpenSearch index can lag the live catalog (vest/baniyan found on REST,
+        # zero on OS). Locked path must still try title REST — not silent not-found.
+        tq = (spec.get("title_query") or "").strip()
+        if tq or spec.get("brand") or spec.get("sku") or spec.get("pro_id"):
+            log_reasoning(
+                "Catalog AI single-pass: 0 OS hits — live REST title fallback "
+                f"(index may lag catalog) title={tq!r}."
+            )
+            # Fall through to REST path below (do not return empty yet).
+        else:
+            log_reasoning(
+                "Catalog AI single-pass: 0 OS hits, no title/brand/sku — not-found."
+            )
+            return [], spec, 0, False
 
     if spec.get("strict_no_relax") and spec.get("pro_id"):
         return [], spec, 0, False
@@ -3775,12 +4152,25 @@ def catalog_search_live(
         from services.welfog_api import resolve_search_category_id
 
         cat_id = resolve_search_category_id(str(cat_id), ctx)
-    rest = fetch_products_from_api(
-        q,
-        category_id=cat_id,
-        color=spec.get("color"),
-        page=page,
-    )
+    # Try typo-soft + compound-space name variants (REST is often exact/prefix).
+    rest_queries: list[str] = []
+    for cand in _expand_title_query_variants(q) or [q]:
+        if cand and cand not in rest_queries:
+            rest_queries.append(cand)
+    if q and q not in rest_queries:
+        rest_queries.insert(0, q)
+    rest: list = []
+    for rq in rest_queries[:4]:
+        rest = fetch_products_from_api(
+            rq,
+            category_id=cat_id,
+            color=spec.get("color"),
+            page=page,
+        )
+        if rest:
+            if rq != q:
+                log_reasoning(f"Catalog: REST hit via typo-soft name={rq!r} (was {q!r})")
+            break
     brand_key = (spec.get("brand") or "").strip()
     if not rest and brand_key:
         log_reasoning(f"Catalog: REST brand browse name={brand_key!r}")

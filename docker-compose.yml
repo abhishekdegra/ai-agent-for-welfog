@@ -1,0 +1,23 @@
+# Welfog support — local/production Qdrant (vector DB for knowledge RAG)
+# Usage (from this repo root):
+#   docker compose up -d
+#   docker compose ps
+#   docker compose down
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: welfog-qdrant
+    restart: unless-stopped
+    ports:
+      - "6333:6333" # REST / Dashboard
+      - "6334:6334" # gRPC
+    volumes:
+      - welfog_qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+
+volumes:
+  welfog_qdrant_data:
+    name: welfog_qdrant_data

@@ -46,3 +46,6 @@ welfog_history.db
 .mypy_cache/
 .coverage
 htmlcov/
+
+# Local Qdrant backup
+qdrant_backup.tar.gz

@@ -650,8 +650,8 @@ def resolve_answer_route(
             source="kb",
             intent="general",
             handler="dynamic_kb",
-            kb_keys=["terms", "seller", "privacy"],
-            reason="Short video / shorts content rules — filtered KB excerpts only.",
+            kb_keys=[],
+            reason="Short video / shorts content rules — unscoped Admin semantic KB.",
         )
 
 

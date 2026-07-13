@@ -1,5 +1,3 @@
-import os
-
 import click
 from flask import abort, flash, redirect, render_template, request, url_for
 from flask.cli import with_appcontext
@@ -14,7 +12,6 @@ from services.agent_llm_settings import (
     option_for_key,
     set_admin_llm_model_key,
 )
-from support_paths import KNOWLEDGE_DIR
 from extensions import db
 from services.kb_service import get_allowed_knowledge_filenames, refresh_knowledge_cache
 from services.knowledge_reindex_service import (
@@ -22,6 +19,7 @@ from services.knowledge_reindex_service import (
     sync_admin_txt_delete,
     sync_admin_txt_update,
 )
+from services.mysql_service import get_knowledge_document_by_title
 from utils.validators import _safe_knowledge_filename
 
 
@@ -53,8 +51,6 @@ def register_admin_routes(app):
     @app.route("/welfog-admin/knowledge")
     @login_required
     def admin_knowledge():
-        if not os.path.exists(KNOWLEDGE_DIR):
-            os.makedirs(KNOWLEDGE_DIR)
         files = get_allowed_knowledge_filenames()
         return render_template("admin_knowledge.html", files=files, nav_active="knowledge")
 
@@ -72,7 +68,7 @@ def register_admin_routes(app):
         return render_template(
             "admin_settings.html",
             nav_active="settings",
-            knowledge_dir=os.path.abspath(KNOWLEDGE_DIR),
+            knowledge_storage="MySQL knowledge_documents + Qdrant",
             llm_model_key=llm_key,
             llm_current=llm_current,
             llm_options=get_selectable_llm_options(),
@@ -91,20 +87,15 @@ def register_admin_routes(app):
                 return render_template("admin_new_file.html", nav_active="knowledge")
 
             filename = f"{safe_name}.txt"
-            file_path = os.path.abspath(os.path.join(KNOWLEDGE_DIR, filename))
-            if not file_path.startswith(os.path.abspath(KNOWLEDGE_DIR) + os.sep):
-                abort(403)
-            if os.path.exists(file_path):
-                flash("File already exists. Choose a different name.", "error")
+            if get_knowledge_document_by_title(safe_name):
+                flash("Document already exists. Choose a different name.", "error")
                 return render_template("admin_new_file.html", nav_active="knowledge")
 
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(initial_content.strip())
-            refresh_knowledge_cache()
             sync_result = sync_admin_txt_create(safe_name, initial_content.strip())
+            refresh_knowledge_cache()
             if not sync_result.get("ok"):
                 flash(
-                    f"Created {filename} but knowledge re-index failed: "
+                    f"Created {filename} in MySQL but knowledge re-index failed: "
                     f"{sync_result.get('reindex', {}).get('error') or sync_result.get('error')}",
                     "error",
                 )
@@ -119,19 +110,17 @@ def register_admin_routes(app):
         allowed_files = set(get_allowed_knowledge_filenames())
         if filename not in allowed_files:
             abort(404)
-        file_path = os.path.abspath(os.path.join(KNOWLEDGE_DIR, filename))
-        if not file_path.startswith(os.path.abspath(KNOWLEDGE_DIR) + os.sep):
-            abort(403)
+        title = filename[:-4] if filename.lower().endswith(".txt") else filename
+        doc = get_knowledge_document_by_title(title)
+        if not doc:
+            abort(404)
         if request.method == "POST":
             new_content = request.form["content"]
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(new_content)
-            refresh_knowledge_cache()
-            title = os.path.splitext(filename)[0]
             sync_result = sync_admin_txt_update(title, new_content)
+            refresh_knowledge_cache()
             if not sync_result.get("ok"):
                 flash(
-                    f"Saved {filename} but knowledge re-index failed: "
+                    f"Saved {filename} in MySQL but knowledge re-index failed: "
                     f"{sync_result.get('reindex', {}).get('error') or sync_result.get('error')}",
                     "error",
                 )
@@ -139,8 +128,7 @@ def register_admin_routes(app):
                 flash(f"Saved {filename} and re-indexed knowledge pipeline.", "success")
             return redirect(url_for("admin_knowledge"))
 
-        with open(file_path, "r", encoding="utf-8") as f:
-            content = f.read()
+        content = doc.get("content") or ""
         return render_template("admin_edit.html", filename=filename, content=content, nav_active="knowledge")
 
     @app.route("/welfog-admin/delete/<filename>", methods=["POST"])
@@ -149,17 +137,9 @@ def register_admin_routes(app):
         allowed_files = set(get_allowed_knowledge_filenames())
         if filename not in allowed_files:
             abort(404)
-        file_path = os.path.abspath(os.path.join(KNOWLEDGE_DIR, filename))
-        if not file_path.startswith(os.path.abspath(KNOWLEDGE_DIR) + os.sep):
-            abort(403)
-        try:
-            os.remove(file_path)
-        except OSError:
-            flash("Could not delete file.", "error")
-            return redirect(url_for("admin_knowledge"))
-        refresh_knowledge_cache()
-        title = os.path.splitext(filename)[0]
+        title = filename[:-4] if filename.lower().endswith(".txt") else filename
         sync_admin_txt_delete(title)
+        refresh_knowledge_cache()
         flash(f"Deleted {filename} and removed from knowledge pipeline.", "success")
         return redirect(url_for("admin_knowledge"))
 

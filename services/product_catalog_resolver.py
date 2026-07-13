@@ -492,10 +492,11 @@ Rules:
 - rating_min: "more than 2 stars", "rating above 2", "4+ rating" → number. rating_max for "under 3 stars".
 - price_min/price_max: rupees budget (under 200 → price_max=200; "200 rs ki range" → price_max=200). NEVER put star numbers in price fields.
 - Filter-only: "products with rating more than 2" → search_query="", product_name="", rating_min=2.
-- Brand + product: "redmi mobile cover" → brand=Redmi, product_name=mobile cover, search_query=mobile cover.
+- Brand + product: keep brand in the searchable noun AND brand field (never drop brand to only a bare generic type).
 - SKU lookup: "Xiaomi-SKU is sku ka item dikha" → sku="Xiaomi-SKU", search_query="", product_name="".
 - Product id: "product id de rha hu 2815318 iska product bta" → product_id=2815318, search_query="".
-- Brand typos: "jioo ke covers" → brand=Jio, product_name=mobile cover.
+- Brand typos/spaces: infer the intended brand from meaning; keep brand + product noun in entities.
+- Availability asks (any language/phrasing) → still product_search; extract corrected catalog noun + filters.
 - Do NOT put rating/price/filter words in search_query or product_name.
 - Do NOT answer availability from memory — only classify.
 
@@ -634,11 +635,20 @@ def understanding_from_locked_product_route(
     sq = (search_query or locked.search_query or "").strip()
     u = entities_to_understanding(
         entities,
-        search_query=sq,
+        search_query="",
         original_msg=original_msg or msg_en,
     )
     if not u:
         return None
+    # Only attach search_terms from structured product_name (already in u) —
+    # never promote free-form route search_query / Brain paraphrase.
+    _ = sq
+    if isinstance(ai_route, dict) and ai_route.get("_product_nlu_from_ai"):
+        u["_product_nlu_from_ai"] = True
+        entity_terms = (u.get("search_terms") or "").strip()
+        if not entity_terms and sq and ai_route.get("_product_nlu_from_ai"):
+            # Upstream already ran Product Entity Extraction into search_query.
+            u["search_terms"] = sq
     return u
 
 
@@ -1679,14 +1689,10 @@ def entities_to_understanding(
     out: dict[str, Any] = {"action": "search_products", "is_shopping": True}
 
     product_name = (e.get("product_name") or "").strip()
-    if not product_name and search_query:
-        try:
-            from services.product_filter_pipeline import brain_search_query_is_noisy
-
-            if not brain_search_query_is_noisy(search_query):
-                product_name = search_query.strip()
-        except ImportError:
-            product_name = search_query.strip()
+    # Do NOT fall back to free-form search_query — callers historically passed Brain
+    # paraphrases (user_meaning) here, which became OpenSearch title_query.
+    # Product Entity Extraction must put the noun phrase in product_name / search_terms.
+    _ = search_query
     if product_name:
         out["search_terms"] = product_name
 

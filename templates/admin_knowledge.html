@@ -8,13 +8,13 @@
     <div class="admin-stat__value">{{ files|length }}</div>
   </div>
   <div class="admin-stat">
-    <div class="admin-stat__label">Folder</div>
-    <div class="admin-stat__value" style="font-size:0.95rem;color:var(--admin-muted);font-weight:600;">support/knowledge</div>
+    <div class="admin-stat__label">Storage</div>
+    <div class="admin-stat__value" style="font-size:0.95rem;color:var(--admin-muted);font-weight:600;">MySQL + Qdrant</div>
   </div>
 </div>
 
 <div class="admin-toolbar">
-  <span class="admin-toolbar__hint">Create, edit, or remove <code>.txt</code> knowledge files. Chat uses them automatically after save — no code deploy. Use clear headings ending with <code>:</code> (e.g. <code>Service Charges:</code>) so answers stay focused.</span>
+  <span class="admin-toolbar__hint">Create, edit, or remove knowledge documents in MySQL. Chat retrieves via Qdrant after save — no local files. Use clear headings ending with <code>:</code> (e.g. <code>Service Charges:</code>) so answers stay focused.</span>
   <a href="{{ url_for('admin_add_file') }}" class="admin-btn admin-btn--primary">+ Create / Add file</a>
 </div>
 

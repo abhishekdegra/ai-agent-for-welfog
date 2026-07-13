@@ -15,9 +15,11 @@ from utils.reasoning_log import chat_log, log_reasoning
 
 _TLS = threading.local()
 
-_CFG_CHAT_MAX_LLM_CALLS = int(os.getenv("CHAT_MAX_LLM_CALLS", "3") or "3")
-# Hard safety cap: keep per-turn LLM fan-out bounded even if env is higher.
-MAX_LLM_CALLS_PER_TURN = max(1, min(3, _CFG_CHAT_MAX_LLM_CALLS))
+_CFG_CHAT_MAX_LLM_CALLS = int(os.getenv("CHAT_MAX_LLM_CALLS", "5") or "5")
+# Allow brain + KB answer (+ one rescue) without starving grounded replies.
+# Env CHAT_MAX_LLM_CALLS is honored up to 6 — previous hard min(3) caused KB misses
+# after preflight/brain burned the budget.
+MAX_LLM_CALLS_PER_TURN = max(1, min(6, _CFG_CHAT_MAX_LLM_CALLS))
 MAX_ROUTE_STEPS_PER_TURN = int(os.getenv("CHAT_MAX_ROUTE_STEPS", "16") or "16")
 
 
@@ -59,7 +61,24 @@ def begin_chat_turn() -> str:
     _TLS.authoritative_route_lock = None
     _TLS.kb_grounding_hits: list[dict[str, Any]] = []
     _TLS.kb_grounding_corpus = ""
+    # KB latency: turn-scoped reuse (same request only — identical semantics).
+    _TLS.kb_active_doc_ids = None
+    _TLS.kb_active_doc_ids_ready = False
+    _TLS.kb_retrieval_base_cache: dict[str, Any] = {}
+    _TLS.kb_retrieval_result_cache: dict[str, Any] = {}
+    _TLS.kb_retrieval_query_cache: dict[str, str] = {}
+    _TLS.kb_openai_embed_key = None
+    _TLS.kb_openai_embed_vec = None
     return rid
+
+
+def get_kb_turn_cache(name: str, default: Any = None) -> Any:
+    """Read a turn-local KB cache slot (isolated per /chat request)."""
+    return getattr(_TLS, name, default)
+
+
+def set_kb_turn_cache(name: str, value: Any) -> None:
+    setattr(_TLS, name, value)
 
 
 def set_kb_grounding_context(
@@ -197,6 +216,76 @@ def lock_authoritative_kb_route_from_retrieval(
 def is_authoritative_kb_route_locked() -> bool:
     lock = getattr(_TLS, "authoritative_route_lock", None)
     return isinstance(lock, dict) and lock.get("channel") == "kb" and bool(lock.get("immutable"))
+
+
+def lock_authoritative_pincode_route(
+    *,
+    source: str = "brain_route",
+    ai_route: dict | None = None,
+) -> None:
+    """
+    Make delivery/pincode execution immutable for this turn.
+
+    Mirrors KB authoritative lock: once Brain plans live delivery check,
+    product/KB/OOD must not steal the same turn (no keyword routing).
+    """
+    lock = _route_lock()
+    prev = lock.get("channel")
+    # Never override an immutable KB lock mid-turn.
+    if prev == "kb" and lock.get("immutable"):
+        return
+    lock.update(
+        {
+            "channel": "pincode_delivery",
+            "handler": "pincode_delivery_api",
+            "source": source or "brain_route",
+            "immutable": True,
+            "chunks": 0,
+            "top_score": 0.0,
+        }
+    )
+    if isinstance(ai_route, dict):
+        lock["intent"] = (ai_route.get("intent") or "pincode_check").strip().lower()
+    if prev != "pincode_delivery":
+        log_reasoning(
+            f"Authoritative route lock: channel=pincode_delivery "
+            f"source={lock.get('source')} handler={lock.get('handler')}"
+        )
+
+
+def lock_authoritative_pincode_route_from_brain(ai_route: dict | None) -> None:
+    if not isinstance(ai_route, dict):
+        return
+    if ai_route.get("_pincode_delivery_locked"):
+        lock_authoritative_pincode_route(source="brain_route", ai_route=ai_route)
+        return
+    intent = (ai_route.get("intent") or "").strip().lower()
+    handler = (ai_route.get("route_handler") or "").strip().lower()
+    channel = (ai_route.get("data_channel") or "").strip().lower()
+    if intent == "pincode_check" or handler == "pincode_delivery_api":
+        if channel in ("live_api", "", "none"):
+            lock_authoritative_pincode_route(source="brain_route", ai_route=ai_route)
+
+
+def is_authoritative_pincode_route_locked() -> bool:
+    lock = getattr(_TLS, "authoritative_route_lock", None)
+    return (
+        isinstance(lock, dict)
+        and lock.get("channel") == "pincode_delivery"
+        and bool(lock.get("immutable"))
+    )
+
+
+def should_skip_post_pincode_route_steal(caller: str = "") -> bool:
+    """Product/KB/OOD must not run after authoritative delivery plan is locked."""
+    if not is_authoritative_pincode_route_locked():
+        return False
+    label = f" ({caller})" if caller else ""
+    log_reasoning(
+        f"Post-delivery steal skipped{label} — authoritative pincode route locked "
+        f"({authoritative_route_lock_summary()})."
+    )
+    return True
 
 
 def authoritative_route_lock_summary() -> str:

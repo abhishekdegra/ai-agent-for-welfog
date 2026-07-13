@@ -60,11 +60,14 @@ def qdrant_point_id(chunk_key: str) -> str:
 
 
 def _chunk_payload(row: dict[str, Any]) -> dict[str, Any]:
+    from services.knowledge_keys import canonical_knowledge_key
+
+    raw_title = (row.get("title") or "").strip()
     return {
         "doc_id": int(row["doc_id"]),
         "version": int(row["version"]),
         "chunk_no": int(row["chunk_no"]),
-        "title": (row.get("title") or "").strip(),
+        "title": canonical_knowledge_key(raw_title) or raw_title,
         "category": (row.get("category") or "general").strip() or "general",
         "language": (row.get("language") or "auto").strip() or "auto",
         "content": row.get("content") or "",

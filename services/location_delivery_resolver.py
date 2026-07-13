@@ -585,25 +585,40 @@ def ai_understand_delivery_turn(
     conversation_context: str = "",
     ai_route: dict | None = None,
     reply_lang: str = "",
+    *,
+    force_llm: bool = False,
 ) -> Optional[DeliveryTurnUnderstanding]:
     """
     Micro-classifier: delivery/serviceability intent + location (any language).
     Uses RECENT CHAT when the latest message is short or refers back.
     Cached per request — safe to call from routing and live API paths.
+
+    force_llm=True: run even after brain classified — used only when Brain locked
+    delivery but PIN/city are still missing (location fill, not re-routing).
     """
     comb = _combined(original_msg, msg_en)
     if not comb:
         return None
 
-    try:
-        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+    if not force_llm:
+        try:
+            from services.chat_flow_telemetry import should_skip_micro_classifier_llm
 
-        if should_skip_micro_classifier_llm():
-            return DeliveryTurnUnderstanding(source="deferred_brain")
-    except ImportError:
-        pass
+            if should_skip_micro_classifier_llm():
+                return DeliveryTurnUnderstanding(source="deferred_brain")
+        except ImportError:
+            pass
+    else:
+        try:
+            from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
+
+            ensure_product_rescue_llm_slot()
+        except ImportError:
+            pass
 
     cache_key = _delivery_turn_cache_key(original_msg, msg_en, conversation_context)
+    if force_llm:
+        cache_key = f"force|{cache_key}"
     cached = _delivery_turn_cache_get(cache_key)
     if cached is not None:
         return cached
@@ -752,7 +767,7 @@ def ai_extract_delivery_location(
 
 
 def _city_label_from_ai_route(ai_route: dict | None) -> str:
-    """Place name from brain route — no extra LLM."""
+    """Place name from brain route — no extra LLM. Reject sentence-like search_query."""
     if not isinstance(ai_route, dict):
         return ""
     for key in ("extracted_location", "extracted_city", "search_query"):
@@ -760,6 +775,9 @@ def _city_label_from_ai_route(ai_route: dict | None) -> str:
         if not val or len(val) < 2:
             continue
         if re.search(r"\b[1-9]\d{5}\b", val):
+            continue
+        # Brain sometimes puts full user_meaning into search_query (any language).
+        if len(val) > 40 or "?" in val or "？" in val or val.count(" ") >= 3:
             continue
         return val
     return ""
@@ -1510,15 +1528,41 @@ def promote_pincode_delivery_on_route(
         allow_llm=True,
     ):
         return out
+    # Preserve place name for geocode — never wipe city into empty search_query.
+    place = (
+        str(out.get("extracted_location") or out.get("extracted_city") or "").strip()
+        or str(out.get("search_query") or "").strip()
+    )
+    if not place or re.search(r"\b[1-9]\d{5}\b", place):
+        try:
+            understood = resolve_delivery_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=out,
+                allow_llm=True,
+            )
+            if understood.city_name:
+                place = understood.city_name.strip()
+            elif understood.pincode:
+                out["extracted_pincode"] = understood.pincode
+        except Exception:
+            pass
     out["intent"] = "pincode_check"
     out["data_channel"] = "live_api"
     out["needs_order_id"] = False
     out["numeric_context"] = "pincode"
     out["run_catalog_search"] = False
-    out["search_query"] = ""
     out["order_lookup_kind"] = "none"
     out["route_handler"] = "pincode_delivery_api"
     out["is_welfog_related"] = True
+    out["kb_keys"] = []
+    out.pop("_preflight_kb", None)
+    if place and not re.search(r"\b[1-9]\d{5}\b", place):
+        out["search_query"] = place
+        out["extracted_location"] = place
+    elif not (out.get("search_query") or "").strip():
+        out["search_query"] = ""
     log_reasoning(
         "Route fix: delivery/serviceability — pincode_delivery_api (KB override blocked)."
     )
@@ -1536,6 +1580,10 @@ def turn_requests_delivery_serviceability(
     """
     Current turn is delivery/PIN serviceability (beats order-id / KB misroutes).
     AI-first micro-classifier + recent chat; keywords not used.
+
+    Semantic delivery understanding runs BEFORE Brain KB/product short-circuits.
+    Brain sometimes mislabels city serviceability as FAQ/catalog; confidence-gated
+    delivery meaning is the language-agnostic correction (not keyword routing).
     """
     try:
         from services.knowledge_query_pipeline import kb_vector_fast_lane_active
@@ -1543,35 +1591,6 @@ def turn_requests_delivery_serviceability(
         if kb_vector_fast_lane_active():
             return False
     except Exception:
-        pass
-    if isinstance(ai_route, dict):
-        try:
-            from services.ai_route_semantics import brain_route_prefers_kb_answer
-
-            if brain_route_prefers_kb_answer(ai_route):
-                if not _bare_pin_submission_in_pincode_thread(
-                    original_msg, conversation_context, ai_route=ai_route
-                ):
-                    return False
-        except ImportError:
-            ch = (ai_route.get("data_channel") or "").strip().lower()
-            if ch == "kb" and not _bare_pin_submission_in_pincode_thread(
-                original_msg, conversation_context, ai_route=ai_route
-            ):
-                return False
-    try:
-        from services.product_catalog_resolver import product_catalog_route_is_locked
-
-        if product_catalog_route_is_locked(ai_route):
-            return False
-    except ImportError:
-        pass
-    try:
-        from services.semantic_intent import ai_route_is_product_catalog
-
-        if ai_route_is_product_catalog(ai_route):
-            return False
-    except ImportError:
         pass
     try:
         from services.order_details_flow import turn_blocks_delivery_for_single_order_lookup
@@ -1586,6 +1605,24 @@ def turn_requests_delivery_serviceability(
         original_msg, conversation_context, ai_route=ai_route
     ):
         return True
+
+    # Hard product lock from shopping turn — do not steal catalog.
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(ai_route):
+            return False
+    except ImportError:
+        pass
+    try:
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        if turn_is_obvious_product_shopping_turn(
+            original_msg, msg_en, conversation_context
+        ):
+            return False
+    except ImportError:
+        pass
 
     understood = resolve_delivery_turn(
         original_msg,
@@ -1605,12 +1642,21 @@ def turn_requests_delivery_serviceability(
     ):
         return True
 
-    try:
-        from utils.helpers import turn_is_obvious_product_shopping_turn
+    # After semantic delivery check fails, respect Brain KB / catalog labels.
+    if isinstance(ai_route, dict):
+        try:
+            from services.ai_route_semantics import brain_route_prefers_kb_answer
 
-        if turn_is_obvious_product_shopping_turn(
-            original_msg, msg_en, conversation_context
-        ):
+            if brain_route_prefers_kb_answer(ai_route):
+                return False
+        except ImportError:
+            ch = (ai_route.get("data_channel") or "").strip().lower()
+            if ch == "kb":
+                return False
+    try:
+        from services.semantic_intent import ai_route_is_product_catalog
+
+        if ai_route_is_product_catalog(ai_route):
             return False
     except ImportError:
         pass

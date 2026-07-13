@@ -170,9 +170,8 @@ def catalog_title_unusable(
         return True
     if route.get("continue_previous_topic"):
         return True
-    words = re.findall(r"[\w]+", t, re.UNICODE)
-    if len(words) <= 2:
-        return True
+    # Short product noun phrases (1–2 words) ARE valid catalog titles:
+    # "baniyan", "flip flops", "nike shoes", "vest". Never reject by word count alone.
     try:
         from services.turn_intent_gate import is_non_catalog_meta_turn
 
@@ -194,6 +193,12 @@ def should_merge_session_catalog(
     route = ai_route if isinstance(ai_route, dict) else {}
     if route.get("continue_previous_topic"):
         return True
+    # Never merge prior product title into a fresh category / department browse.
+    if route.get("category_only_browse") or (route.get("category_browse") or "").strip():
+        return False
+    u = understanding if isinstance(understanding, dict) else {}
+    if u.get("category_only_browse") or (u.get("category_browse") or "").strip():
+        return False
     intent = (route.get("intent") or "").strip().lower()
     channel = (route.get("data_channel") or "").strip().lower()
     if intent != "product" and channel != "catalog":
@@ -522,7 +527,14 @@ def scrub_ai_product_understanding(
             else:
                 cleaned.append(item)
         out["product_requests"] = cleaned
-    return align_catalog_terms_to_user_message(out, original_msg, msg_en)
+    out = align_catalog_terms_to_user_message(out, original_msg, msg_en)
+    try:
+        from services.product_query_understanding import ensure_branded_product_search_terms
+
+        out = ensure_branded_product_search_terms(out, original_msg, msg_en) or out
+    except ImportError:
+        pass
+    return out
 
 
 def normalize_rating_filters_from_message(comb: str, spec: dict[str, Any]) -> None:

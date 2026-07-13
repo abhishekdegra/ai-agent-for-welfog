@@ -2492,6 +2492,19 @@ def _reconcile_off_topic_brain_misroute(
             return out
 
     if _brain_reasoning_indicates_ood(reasoning):
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            promoted = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if promoted:
+                log_reasoning(
+                    "Brain OOD reconcile — Admin KB semantic rescue over reasoning-OOD."
+                )
+                return promoted
+        except ImportError:
+            pass
         out["intent"] = "out_of_domain"
         out["data_channel"] = "none"
         out["conversation_scope"] = "out_of_domain"
@@ -2505,6 +2518,21 @@ def _reconcile_off_topic_brain_misroute(
         return out
 
     if intent == "out_of_domain" or scope == "out_of_domain":
+        # Admin knowledge is SoT: strong indexed match rescues Brain OOD misroutes
+        # (e.g. reels/short-video policy classified as "not shopping").
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            promoted = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if promoted:
+                log_reasoning(
+                    "Brain OOD reconcile — Admin KB semantic rescue over Brain OOD."
+                )
+                return promoted
+        except ImportError:
+            pass
         out["is_welfog_related"] = False
         out["data_channel"] = "none"
         out["conversation_scope"] = "out_of_domain"
@@ -2512,6 +2540,19 @@ def _reconcile_off_topic_brain_misroute(
         return out
 
     if related is False:
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            promoted = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if promoted:
+                log_reasoning(
+                    "Brain OOD reconcile — Admin KB semantic rescue over is_welfog_related=false."
+                )
+                return promoted
+        except ImportError:
+            pass
         out["intent"] = "out_of_domain"
         out["data_channel"] = "none"
         out["conversation_scope"] = "out_of_domain"
@@ -2611,7 +2652,7 @@ def _reconcile_off_topic_brain_misroute(
 
     if um and "welfog" not in um.lower():
         ood_reasoning = _brain_reasoning_indicates_ood(reasoning)
-        platform_kb = set(kb_keys) & {"payment", "refund", "shipping", "seller", "terms", "privacy"}
+        platform_kb = bool(kb_keys)  # any Brain kb_keys — not a predefined classic-file set
         if channel == "kb" or intent in ("seller", "refund", "payment") or platform_kb:
             try:
                 from services.kb_service import promote_route_from_semantic_kb_match
@@ -2872,12 +2913,25 @@ def _reconcile_semantic_kb_route(
 
     intent_now = (out.get("intent") or "").strip().lower()
     scope_now = (out.get("conversation_scope") or "").strip().lower()
-    # OOD / chitchat should never run KB embedding reconcile.
+    # OOD / chitchat: still allow Admin semantic rescue; true OOD has no strong hit.
     if (
         intent_now == "out_of_domain"
         or scope_now in ("out_of_domain", "general_chitchat", "harm_sensitive")
         or out.get("is_welfog_related") is False
     ):
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            promoted = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if promoted:
+                log_reasoning(
+                    "Brain KB reconcile — Admin semantic rescue from OOD/chitchat scope."
+                )
+                return promoted
+        except ImportError:
+            pass
         return out
 
     q = build_kb_retrieval_query(original_msg, msg_en, "", ai_route=out)
@@ -2941,6 +2995,13 @@ def _reconcile_delivery_policy_from_brain_json(route: dict) -> dict:
     # Live delivery API lock — never downgrade to static FAQ KB.
     if out.get("_pincode_delivery_fast") or out.get("_pincode_delivery_locked"):
         return out
+    try:
+        from services.chat_flow_telemetry import is_authoritative_pincode_route_locked
+
+        if is_authoritative_pincode_route_locked():
+            return out
+    except ImportError:
+        pass
     rh = (out.get("route_handler") or "").strip().lower()
     if rh == "pincode_delivery_api":
         return out
@@ -3221,11 +3282,12 @@ def _try_zero_llm_universal_brain_route(
                 "_universal_brain_route": True,
                 "_turn_promotions_done": True,
                 "_zero_llm_fast": True,
-                "_needs_product_nlu_llm": False,
+                "_needs_product_nlu_llm": True,
                 "_ai_single_pass": True,
             }
             log_reasoning(
-                "Universal brain — zero-LLM product lock (AI NLU → OpenSearch, no keyword sq)."
+                "Universal brain — zero-LLM product lock "
+                "(Product Entity Extraction → OpenSearch title_query)."
             )
             return product_route
     except ImportError:
@@ -3918,7 +3980,8 @@ def _try_fast_finalize_brain_route_after_ai(
             reconcile_welfog_kb_from_brain_meaning,
         )
 
-        if brain_route_prefers_kb_answer(out):
+        # Live pincode_check must not be swallowed by incidental kb_keys on the route.
+        if brain_route_prefers_kb_answer(out) and intent != "pincode_check":
             out = reconcile_welfog_kb_from_brain_meaning(out)
             if (out.get("intent") or "").strip().lower() in (
                 "tracking",
@@ -3943,29 +4006,24 @@ def _try_fast_finalize_brain_route_after_ai(
         from services.ai_route_semantics import reconcile_pincode_delivery_from_brain_meaning
 
         comb_del = f"{original_msg or ''} {msg_en or ''}".strip()
-        try:
-            from services.ai_route_semantics import brain_route_prefers_kb_answer
-
-            kb_locked = brain_route_prefers_kb_answer(out)
-        except ImportError:
-            kb_locked = (channel == "kb" or bool(out.get("kb_keys")))
+        # Brain already planned live delivery — keep it (do not require micro-classifier).
         delivery_keep = (
-            out.get("_pincode_delivery_locked")
+            intent == "pincode_check"
+            or out.get("_pincode_delivery_locked")
             or out.get("_pincode_delivery_fast")
+            or (channel == "live_api" and (out.get("route_handler") or "").strip().lower()
+                == "pincode_delivery_api")
             or turn_is_pincode_delivery_fast_path(
                 original_msg, msg_en, conversation_context
             )
             or turn_continues_pincode_area_check(
                 comb_del, conversation_context, out
             )
-            or (
-                not kb_locked
-                and turn_requests_delivery_serviceability(
-                    original_msg,
-                    msg_en,
-                    conversation_context,
-                    ai_route=out,
-                )
+            or turn_requests_delivery_serviceability(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route=out,
             )
         )
         if delivery_keep:
@@ -4115,6 +4173,20 @@ def _try_fast_finalize_brain_route_after_ai(
                 "Universal brain — product catalog promoted over OOD misroute."
             )
             return product_over_ood
+        # Admin knowledge SoT — rescue OOD when indexed docs answer the question.
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            kb_over_ood = promote_route_from_semantic_kb_match(
+                out, original_msg, msg_en=msg_en
+            )
+            if isinstance(kb_over_ood, dict):
+                log_reasoning(
+                    "Universal brain — Admin KB semantic rescue over OOD fast finalize."
+                )
+                return kb_over_ood
+        except ImportError:
+            pass
         out["_turn_promotions_done"] = True
         out["data_channel"] = "none"
         out["run_catalog_search"] = False
@@ -4122,200 +4194,30 @@ def _try_fast_finalize_brain_route_after_ai(
         log_reasoning("Universal brain — OOD fast finalize (skip reconcile/enrich).")
         return out
 
-  # Brain misroute: pincode/live_api without delivery signal — only when NOT a delivery turn.
-    comb_ff = f"{original_msg or ''} {msg_en or ''}".strip()
+  # Brain chose live pincode_check — lock execution plan; never FAQ-demote to KB.
+    # (FAQ chunks about "delivery" match city serviceability and used to steal the turn.)
     if (
         channel == "live_api"
         and intent == "pincode_check"
-        and comb_ff
         and not out.get("_pincode_delivery_locked")
         and not out.get("_pincode_delivery_fast")
     ):
         try:
-            from services.pincode_delivery_fast_path import (
-                turn_is_pincode_delivery_fast_path,
-            )
-            from services.location_delivery_resolver import (
-                turn_continues_pincode_area_check,
-                turn_requests_delivery_serviceability,
-            )
-            from services.ai_route_semantics import (
-                brain_route_prefers_kb_answer,
-                brain_turn_indicates_welfog_kb,
-                reconcile_welfog_kb_from_brain_meaning,
-            )
-            from services.kb_service import (
-                KB_ANSWER_MIN_CONFIDENCE,
-                resolve_best_faq_chunk_for_question,
-            )
+            from services.ai_route_semantics import reconcile_pincode_delivery_from_brain_meaning
 
-            faq_probe = resolve_best_faq_chunk_for_question(
-                original_msg,
-                msg_en,
-                conversation_context,
-                ai_route=out,
+            out = reconcile_pincode_delivery_from_brain_meaning(
+                out,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
             )
-            faq_ok = bool(
-                faq_probe
-                and float(faq_probe.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE
+            out["_turn_promotions_done"] = True
+            log_reasoning(
+                "Universal brain — pincode_check locked (single live delivery plan)."
             )
-            if faq_ok or brain_turn_indicates_welfog_kb(out):
-                out = reconcile_welfog_kb_from_brain_meaning(out)
-                out["_turn_promotions_done"] = True
-                log_reasoning(
-                    "Universal brain — KB promoted over pincode_check misroute."
-                )
-                return out
-
-            kb_locked = brain_route_prefers_kb_answer(out)
-            if (
-                turn_is_pincode_delivery_fast_path(
-                    original_msg, msg_en, conversation_context
-                )
-                or turn_continues_pincode_area_check(
-                    comb_ff, conversation_context, out
-                )
-                or (
-                    not kb_locked
-                    and turn_requests_delivery_serviceability(
-                        original_msg,
-                        msg_en,
-                        conversation_context,
-                        ai_route=out,
-                    )
-                )
-            ):
-                from services.ai_route_semantics import (
-                    reconcile_pincode_delivery_from_brain_meaning,
-                )
-
-                out = reconcile_pincode_delivery_from_brain_meaning(
-                    out,
-                    original_msg=original_msg,
-                    msg_en=msg_en,
-                    conversation_context=conversation_context,
-                )
-                out["_turn_promotions_done"] = True
-                log_reasoning(
-                    "Universal brain — pincode kept (delivery thread / area follow-up)."
-                )
-                return out
+            return out
         except ImportError:
             pass
-        has_pin = bool(re.search(r"\b\d{6}\b", comb_ff))
-        low_ff = f" {comb_ff.lower()} "
-        delivery_hint = any(
-            x in low_ff
-            for x in (
-                "pincode",
-                "pin code",
-                "zip",
-                "deliver",
-                "delivery",
-                "ship",
-                "courier",
-                "area",
-                "location",
-                "address",
-            )
-        )
-        if not has_pin and not delivery_hint:
-            try:
-                from services.ai_route_semantics import (
-                    brain_turn_indicates_welfog_kb,
-                    reconcile_welfog_kb_from_brain_meaning,
-                )
-                from services.kb_service import (
-                    KB_ANSWER_MIN_CONFIDENCE,
-                    resolve_best_faq_chunk_for_question,
-                )
-
-                faq_probe = resolve_best_faq_chunk_for_question(
-                    original_msg,
-                    msg_en,
-                    conversation_context,
-                    ai_route=out,
-                )
-                faq_ok = bool(
-                    faq_probe
-                    and float(faq_probe.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE
-                )
-                if brain_turn_indicates_welfog_kb(out) or faq_ok:
-                    out = reconcile_welfog_kb_from_brain_meaning(out)
-                    out["_turn_promotions_done"] = True
-                    log_reasoning(
-                        "Universal brain — KB promoted over pincode misroute (FAQ/support)."
-                    )
-                    return out
-            except ImportError:
-                pass
-            try:
-                from services.query_intent_classifier import (
-                    INTENT_HARM,
-                    INTENT_CHITCHAT,
-                    INTENT_OUT,
-                    ai_classify_query_intent,
-                )
-
-                qd = ai_classify_query_intent(
-                    original_msg,
-                    msg_en,
-                    conversation_context,
-                    ignore_routing_complete=True,
-                )
-                if qd and qd.detected_intent == INTENT_HARM:
-                    out["intent"] = "general"
-                    out["conversation_scope"] = "harm_sensitive"
-                    out["data_channel"] = "none"
-                    out["run_catalog_search"] = False
-                    out["is_welfog_related"] = False
-                    out["scope_reply"] = (qd.reply or "").strip()
-                    out["_turn_promotions_done"] = True
-                    log_reasoning(
-                        "Universal brain — harm_sensitive promoted (pincode misroute)."
-                    )
-                    return out
-                if qd and qd.detected_intent in (INTENT_CHITCHAT, INTENT_OUT):
-                    out["intent"] = "general"
-                    out["conversation_scope"] = (
-                        "general_chitchat"
-                        if qd.detected_intent == INTENT_CHITCHAT
-                        else "out_of_domain"
-                    )
-                    out["data_channel"] = "none"
-                    out["run_catalog_search"] = False
-                    out["is_welfog_related"] = qd.detected_intent == INTENT_CHITCHAT
-                    out["scope_reply"] = (qd.reply or "").strip()
-                    out["_turn_promotions_done"] = True
-                    log_reasoning(
-                        "Universal brain — scope repaired from pincode misroute."
-                    )
-                    return out
-                else:
-                    out["intent"] = "general"
-                    out["conversation_scope"] = "out_of_domain"
-                    out["data_channel"] = "none"
-                    out["run_catalog_search"] = False
-                    out["is_welfog_related"] = False
-                    out["scope_reply"] = ""
-                    out["_turn_promotions_done"] = True
-                    try:
-                        from services.conversation_scope import ai_classify_scope_and_reply
-
-                        harm_dec = ai_classify_scope_and_reply(
-                            original_msg, msg_en, conversation_context, ""
-                        )
-                        if harm_dec and harm_dec.scope == "harm_sensitive":
-                            out["conversation_scope"] = "harm_sensitive"
-                            out["scope_reply"] = (harm_dec.reply or "").strip()
-                    except ImportError:
-                        pass
-                    log_reasoning(
-                        "Universal brain — pincode blocked (no delivery signal in message)."
-                    )
-                    return out
-            except ImportError:
-                pass
 
     try:
         from services.ai_route_semantics import (
@@ -4515,10 +4417,13 @@ def _try_fast_finalize_brain_route_after_ai(
                 out, original_msg=original_msg, msg_en=msg_en
             )
             out["_product_catalog_locked"] = True
-            out["_needs_product_nlu_llm"] = False
+            out["_needs_product_nlu_llm"] = True
             out["_ai_single_pass"] = True
             out["_turn_promotions_done"] = True
-            log_reasoning("Universal brain — product catalog fast finalize.")
+            log_reasoning(
+                "Universal brain — product catalog fast finalize "
+                "(Product Entity Extraction owns title_query)."
+            )
             return out
 
         if account_list_route_is_locked(out) or brain_route_indicates_account_list_live(

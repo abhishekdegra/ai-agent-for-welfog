@@ -441,11 +441,24 @@ def init_mysql_knowledge_documents_schema():
 
 
 def _infer_knowledge_category_from_title(title: str) -> str:
+    """
+    Soft taxonomy label for Admin docs (never used to hard-exclude customer knowledge).
+
+    Internal agent docs (welfog-api*, system-messages) are tagged system/api only by
+    exact canonical key — never by loose substring like "api" inside "application".
+    """
+    from services.knowledge_keys import canonical_knowledge_key, is_internal_agent_knowledge_key
+
     t = (title or "").strip().lower()
     if not t:
         return "general"
-    if "welfog-api" in t or "api" in t:
+    key = canonical_knowledge_key(t)
+    if key.startswith("welfog_api"):
         return "api"
+    if key in ("system_messages", "system_messages_2", "system_message"):
+        return "system"
+    if is_internal_agent_knowledge_key(key):
+        return "system"
     if any(k in t for k in ("refund", "return")):
         return "refund"
     if any(k in t for k in ("payment", "invoice")):
@@ -460,8 +473,6 @@ def _infer_knowledge_category_from_title(title: str) -> str:
         return "policy"
     if "company" in t:
         return "company"
-    if "system-messages" in t:
-        return "system"
     return "general"
 
 
@@ -790,6 +801,32 @@ def get_knowledge_document_by_id(doc_id: int) -> dict | None:
         conn.close()
 
 
+def list_active_knowledge_documents() -> list[dict]:
+    """Active knowledge documents from MySQL (production source of truth for originals)."""
+    init_mysql_knowledge_documents_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id, title, category, content, language, status, version, index_status,
+                       created_at, updated_at
+                FROM knowledge_documents
+                WHERE status = 'active'
+                ORDER BY title ASC
+                """
+            )
+            rows = cur.fetchall() or []
+            return [dict(r) for r in rows]
+    except Exception as e:
+        print(f"list_active_knowledge_documents error: {e}")
+        return []
+    finally:
+        conn.close()
+
+
 def create_knowledge_document_record(
     title: str,
     content: str,
@@ -884,6 +921,31 @@ def delete_knowledge_document_chunks(doc_id: int, *, version: int | None = None)
         conn.close()
 
 
+def delete_knowledge_document_chunks_except_version(doc_id: int, keep_version: int) -> int:
+    """Remove MySQL chunks for all versions other than keep_version."""
+    init_mysql_knowledge_chunks_schema()
+    conn = get_mysql_connection()
+    if not conn:
+        return 0
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM knowledge_document_chunks WHERE doc_id = %s AND version <> %s",
+                (int(doc_id), int(keep_version)),
+            )
+            deleted = int(cur.rowcount or 0)
+        conn.commit()
+        return deleted
+    except Exception:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return 0
+    finally:
+        conn.close()
+
+
 def set_knowledge_document_index_status(doc_id: int, status: str) -> None:
     conn = get_mysql_connection()
     if not conn:
@@ -943,7 +1005,13 @@ def process_knowledge_document_chunks(
                 return {"ok": False, "doc_id": doc_id, "chunks": 0, "error": "document_not_active"}
 
             version = int(doc.get("version") or 1)
-            title = (doc.get("title") or "").strip()
+            title_raw = (doc.get("title") or "").strip()
+            try:
+                from services.knowledge_keys import canonical_knowledge_key
+
+                title = canonical_knowledge_key(title_raw) or title_raw
+            except ImportError:
+                title = title_raw
             category = (doc.get("category") or "general").strip() or "general"
             language = (doc.get("language") or "auto").strip() or "auto"
 

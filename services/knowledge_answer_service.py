@@ -30,6 +30,8 @@ def _env_int(name: str, default: int) -> int:
 
 
 ANSWER_TOP_K = _env_int("KNOWLEDGE_ANSWER_TOP_K", DEFAULT_ANSWER_TOP_K)
+# Chunks passed to the answer LLM (smaller = faster, less noise). Retrieval may fetch more.
+ANSWER_CONTEXT_K = max(3, min(12, _env_int("KNOWLEDGE_ANSWER_CONTEXT_K", 6)))
 
 
 def should_generate_qdrant_kb_answer(ai_route: dict | None) -> bool:
@@ -37,6 +39,15 @@ def should_generate_qdrant_kb_answer(ai_route: dict | None) -> bool:
     return should_use_qdrant_retrieval(ai_route=ai_route, kb_intent=True) and is_kb_intent(
         ai_route
     )
+
+
+def _trim_hits_for_answer_llm(hits: list[dict[str, Any]], *, limit: int | None = None) -> list[dict[str, Any]]:
+    """Keep highest-scoring chunks for the grounding prompt."""
+    if not hits:
+        return []
+    cap = max(1, int(limit if limit is not None else ANSWER_CONTEXT_K))
+    ranked = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)
+    return ranked[:cap]
 
 
 def _build_retrieval_query(
@@ -141,6 +152,39 @@ def _kb_fallback_reply(
         return format_kb_no_information_reply(original_msg, reply_lang=reply_lang)
 
 
+def _extractive_answer_from_hits(
+    hits: list[dict[str, Any]],
+    original_msg: str,
+    *,
+    reply_lang: str = "",
+    min_score: float = 0.14,
+) -> str:
+    """
+    When grounded LLM is empty/refuses but retrieval found usable chunks,
+    answer from the best chunk text (no extra LLM). Industry RAG fallback.
+    """
+    if not hits:
+        return ""
+    ranked = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)
+    best = ranked[0]
+    if float(best.get("score") or 0) < min_score:
+        return ""
+    try:
+        from services.kb_service import format_direct_reply_from_kb_hit
+
+        body = format_direct_reply_from_kb_hit(
+            best,
+            original_msg,
+            reply_lang=reply_lang,
+            retrieval_query=original_msg,
+            fast_lane=True,
+        )
+        return (body or "").strip()
+    except ImportError:
+        chunk = re.sub(r"\s+", " ", (best.get("chunk") or "").strip())
+        return chunk[:900] if chunk else ""
+
+
 def _extract_llm_answer_text(ai: dict | None) -> str:
     if not isinstance(ai, dict):
         return ""
@@ -184,10 +228,22 @@ def _format_llm_answer(
     if not resp or _ai_response_looks_like_placeholder(resp):
         return ""
     resp = polish_faq_reply_for_customer(resp, original_msg)
+    # Grounded answer LLM already received reply_lang instructions — skip a second
+    # English↔Hinglish rewrite (often 1–7s + Groq rate-limit). Native script still localizes.
     if resp.strip().startswith("<"):
-        return finalize_customer_reply(resp, original_msg, reply_lang) or ""
+        return (
+            finalize_customer_reply(
+                resp, original_msg, reply_lang, allow_llm_style_rewrite=False
+            )
+            or ""
+        )
     body = _plain_text_to_html_body(resp) or resp
-    return finalize_customer_reply(body, original_msg, reply_lang) or ""
+    return (
+        finalize_customer_reply(
+            body, original_msg, reply_lang, allow_llm_style_rewrite=False
+        )
+        or ""
+    )
 
 
 def generate_grounded_kb_answer_from_qdrant(
@@ -264,19 +320,42 @@ def generate_grounded_kb_answer_from_qdrant(
 
     route_keys = list(keys or (ai_route or {}).get("kb_keys") or [])
     t0 = time.perf_counter()
-    retrieval = retrieve_knowledge_context(
-        retrieval_query,
-        top_k=ANSWER_TOP_K,
-        min_score=DEFAULT_MIN_SCORE,
-        categories=route_keys or None,
-        language=rl,
-        ai_route=ai_route,
-        kb_intent=True,
-        log=True,
-    )
-    retrieval_ms = (time.perf_counter() - t0) * 1000.0
 
-    if retrieval.hits:
+    # Reuse same-turn Qdrant hits when authoritative corpus was already retrieved.
+    reused = False
+    retrieval_hits: list[dict[str, Any]] = []
+    top_score = 0.0
+    try:
+        from services.chat_flow_telemetry import get_kb_grounding_context
+
+        prior_hits, _prior_corpus = get_kb_grounding_context()
+        if prior_hits:
+            retrieval_hits = list(prior_hits)
+            top_score = max((float(h.get("score") or 0) for h in retrieval_hits), default=0.0)
+            reused = True
+    except ImportError:
+        pass
+
+    if not reused:
+        # Soft recall floor — gray-band scores still reach extractive/LLM answer.
+        soft_floor = min(float(DEFAULT_MIN_SCORE), 0.14)
+        retrieval = retrieve_knowledge_context(
+            retrieval_query,
+            top_k=max(ANSWER_TOP_K, ANSWER_CONTEXT_K),
+            min_score=soft_floor,
+            categories=route_keys or None,
+            language=None,
+            ai_route=ai_route,
+            kb_intent=True,
+            log=True,
+        )
+        retrieval_hits = list(retrieval.hits or [])
+        top_score = float(retrieval.top_score or 0.0)
+
+    retrieval_ms = (time.perf_counter() - t0) * 1000.0
+    answer_hits = _trim_hits_for_answer_llm(retrieval_hits)
+
+    if answer_hits:
         try:
             from services.chat_flow_telemetry import (
                 lock_authoritative_kb_route_from_retrieval,
@@ -284,15 +363,15 @@ def generate_grounded_kb_answer_from_qdrant(
             )
 
             lock_authoritative_kb_route_from_retrieval(
-                chunks=len(retrieval.hits),
-                top_score=retrieval.top_score,
+                chunks=len(answer_hits),
+                top_score=top_score,
                 ai_route=ai_route,
             )
-            set_kb_grounding_context(retrieval.hits)
+            set_kb_grounding_context(answer_hits)
         except ImportError:
             pass
 
-    if not retrieval.hits:
+    if not answer_hits:
         try:
             from services.knowledge_rag_debug import (
                 flush_rag_debug_report,
@@ -333,7 +412,7 @@ def generate_grounded_kb_answer_from_qdrant(
             pass
         return _kb_fallback_reply(original_msg, msg_en, reply_lang=rl)
 
-    strict_context = _build_strict_llm_context(retrieval.hits)
+    strict_context = _build_strict_llm_context(answer_hits)
     if not strict_context.strip():
         try:
             from services.knowledge_rag_debug import (
@@ -342,7 +421,7 @@ def generate_grounded_kb_answer_from_qdrant(
                 set_answer_source_debug,
             )
 
-            record_final_chunks_debug(retrieval.hits)
+            record_final_chunks_debug(answer_hits)
             set_answer_source_debug(
                 "NO_CONTEXT",
                 fallback_reason="Retrieved chunks produced empty grounding context.",
@@ -353,7 +432,7 @@ def generate_grounded_kb_answer_from_qdrant(
         log_kb_answer_grounding(
             query=retrieval_query,
             chunks_used=0,
-            top_score=retrieval.top_score,
+            top_score=top_score,
             answer_source="fallback_no_context",
             retrieval_time_ms=retrieval_ms,
             answer_time_ms=0.0,
@@ -362,8 +441,8 @@ def generate_grounded_kb_answer_from_qdrant(
 
     chunk_sources = list(
         dict.fromkeys(
-            str(h.get("source") or h.get("category") or "general")
-            for h in retrieval.hits
+            str(h.get("title") or h.get("source") or h.get("category") or "general")
+            for h in answer_hits
         )
     )
 
@@ -373,7 +452,7 @@ def generate_grounded_kb_answer_from_qdrant(
             record_grounding_prompt_debug,
         )
 
-        record_final_chunks_debug(retrieval.hits, strict_context)
+        record_final_chunks_debug(answer_hits, strict_context)
         record_grounding_prompt_debug(
             context=strict_context,
             summary="ai_brain_answer with strict KB-only grounding rules (Welfog assistant JSON response).",
@@ -425,13 +504,13 @@ def generate_grounded_kb_answer_from_qdrant(
 
         answer_text = enforce_kb_fact_grounding(
             answer_text,
-            retrieval.hits,
+            answer_hits,
             original_msg=original_msg,
             msg_en=msg_en,
         )
         if not (answer_text or "").strip():
             answer_text = rebuild_contact_answer_from_chunks(
-                retrieval.hits,
+                answer_hits,
                 original_msg=original_msg,
                 msg_en=msg_en,
             )
@@ -447,7 +526,7 @@ def generate_grounded_kb_answer_from_qdrant(
 
             formatted = enforce_kb_fact_grounding(
                 formatted,
-                retrieval.hits,
+                answer_hits,
                 original_msg=original_msg,
                 msg_en=msg_en,
             ) or formatted
@@ -459,7 +538,7 @@ def generate_grounded_kb_answer_from_qdrant(
             from services.knowledge_grounding_validator import rebuild_contact_answer_from_chunks
 
             chunk_reply = rebuild_contact_answer_from_chunks(
-                retrieval.hits,
+                answer_hits,
                 original_msg=original_msg,
                 msg_en=msg_en,
             )
@@ -467,6 +546,42 @@ def generate_grounded_kb_answer_from_qdrant(
                 formatted = chunk_reply
         except ImportError:
             pass
+
+    # LLM refused / empty but retrieval succeeded — serve chunk extractively
+    # instead of false "not in knowledge base" (common on Hinglish FAQ asks).
+    if not formatted and answer_hits and top_score >= 0.14:
+        extractive = _extractive_answer_from_hits(
+            answer_hits,
+            original_msg,
+            reply_lang=rl,
+            min_score=0.14,
+        )
+        if extractive:
+            log_kb_answer_grounding(
+                query=retrieval_query,
+                chunks_used=len(answer_hits),
+                chunk_sources=chunk_sources,
+                top_score=top_score,
+                answer_source="extractive_chunk_fallback",
+                retrieval_time_ms=retrieval_ms,
+                answer_time_ms=answer_ms,
+            )
+            try:
+                from services.kb_service import log_kb_pipeline_complete
+
+                log_kb_pipeline_complete(
+                    query=retrieval_query,
+                    language=rl,
+                    intent="kb",
+                    route="qdrant_extractive",
+                    retrieved_chunks=len(answer_hits),
+                    similarity_score=top_score,
+                    response_time_ms=retrieval_ms + answer_ms,
+                    source="extractive_chunk_fallback",
+                )
+            except ImportError:
+                pass
+            return extractive
 
     if not formatted:
         try:
@@ -481,9 +596,9 @@ def generate_grounded_kb_answer_from_qdrant(
             pass
         log_kb_answer_grounding(
             query=retrieval_query,
-            chunks_used=len(retrieval.hits),
+            chunks_used=len(answer_hits),
             chunk_sources=chunk_sources,
-            top_score=retrieval.top_score,
+            top_score=top_score,
             answer_source="fallback_llm_empty",
             retrieval_time_ms=retrieval_ms,
             answer_time_ms=answer_ms,
@@ -496,8 +611,8 @@ def generate_grounded_kb_answer_from_qdrant(
                 language=rl,
                 intent="kb",
                 route="qdrant_grounded",
-                retrieved_chunks=len(retrieval.hits),
-                similarity_score=retrieval.top_score,
+                retrieved_chunks=len(answer_hits),
+                similarity_score=top_score,
                 response_time_ms=retrieval_ms + answer_ms,
                 source="fallback_llm_empty",
             )
@@ -514,9 +629,9 @@ def generate_grounded_kb_answer_from_qdrant(
         pass
     log_kb_answer_grounding(
         query=retrieval_query,
-        chunks_used=len(retrieval.hits),
+        chunks_used=len(answer_hits),
         chunk_sources=chunk_sources,
-        top_score=retrieval.top_score,
+        top_score=top_score,
         answer_source="qdrant_grounded_llm",
         retrieval_time_ms=retrieval_ms,
         answer_time_ms=answer_ms,
@@ -529,8 +644,8 @@ def generate_grounded_kb_answer_from_qdrant(
             language=rl,
             intent="kb",
             route="qdrant_grounded",
-            retrieved_chunks=len(retrieval.hits),
-            similarity_score=retrieval.top_score,
+            retrieved_chunks=len(answer_hits),
+            similarity_score=top_score,
             response_time_ms=retrieval_ms + answer_ms,
             source="qdrant_grounded_llm",
         )
@@ -632,23 +747,12 @@ def ensure_kb_grounding_corpus_for_turn(
             pass
 
     try:
-        from services.kb_service import (
-            get_support_contact_kb_keys,
-            read_concatenated_kb_file_contents,
-        )
-        from utils.helpers import (
-            _text_asks_customer_care_contact,
-            message_asks_welfog_social_media,
-        )
+        from services.kb_service import get_customer_kb_keys, read_concatenated_kb_file_contents
 
-        comb = f"{original_msg or ''} {msg_en or ''}".strip()
-        file_keys: list[str] = []
-        if _text_asks_customer_care_contact(comb):
-            file_keys.extend(get_support_contact_kb_keys() or [])
-        if message_asks_welfog_social_media(comb) and "company" not in file_keys:
-            file_keys.append("company")
-        if file_keys:
-            blob = read_concatenated_kb_file_contents(file_keys)
+        # Last-resort corpus from dynamic Admin catalog (no hardcoded contact/company keys).
+        all_keys = get_customer_kb_keys()[:8]
+        if all_keys:
+            blob = read_concatenated_kb_file_contents(all_keys)
             if blob.strip():
                 set_kb_grounding_context([], corpus=blob)
                 return [], blob

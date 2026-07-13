@@ -351,16 +351,39 @@ def merge_ai_into_catalog_spec(
             pass
     if cat_browse:
         try:
-            from services.welfog_api import get_category_id_from_text
+            from services.welfog_api import (
+                get_category_id_from_text,
+                query_should_use_category_id_only,
+            )
 
             cid = get_category_id_from_text(cat_browse)
             if cid:
                 spec["category_id"] = int(cid)
-                if ai.get("category_only_browse") or not (spec.get("title_query") or "").strip():
+                msg_for_gate = original_msg or cat_browse
+                category_only = bool(ai.get("category_only_browse")) or query_should_use_category_id_only(
+                    cid, msg_for_gate, ctx=None
+                )
+                # search_terms that are just the department name are NOT a product title.
+                st = (
+                    (ai.get("search_terms") or ai.get("product_name") or ai.get("product_type") or "")
+                ).strip().lower()
+                cat_norm = re.sub(r"[^a-z0-9]+", " ", cat_browse.lower()).strip()
+                st_norm = re.sub(r"[^a-z0-9]+", " ", st).strip()
+                st_is_dept = bool(st_norm) and (
+                    st_norm == cat_norm
+                    or st_norm in cat_norm
+                    or cat_norm in st_norm
+                )
+                if category_only or st_is_dept:
                     spec["title_query"] = ""
+                    spec["_category_only_browse"] = True
                     spec.pop("brand", None)
                     spec.pop("brand_aliases", None)
                     spec.pop("brand_name_match_only", None)
+                elif not (spec.get("title_query") or "").strip() and st and not st_is_dept:
+                    from services.product_query_understanding import polish_search_terms
+
+                    spec["title_query"] = polish_search_terms(st, original_msg)
         except (TypeError, ValueError, ImportError):
             pass
 
@@ -368,8 +391,11 @@ def merge_ai_into_catalog_spec(
         try:
             from services.welfog_api import query_should_use_category_id_only
 
-            if query_should_use_category_id_only(spec["category_id"], original_msg, ctx=None):
+            if query_should_use_category_id_only(
+                spec["category_id"], original_msg, ctx=None
+            ):
                 spec["title_query"] = ""
+                spec["_category_only_browse"] = True
                 spec.pop("brand", None)
                 spec.pop("brand_aliases", None)
                 spec.pop("brand_name_match_only", None)

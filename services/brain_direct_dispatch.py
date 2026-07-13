@@ -121,6 +121,14 @@ def _try_brain_immediate_scope_or_kb_reply(
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
 
+    try:
+        from services.chat_flow_telemetry import should_skip_post_pincode_route_steal
+
+        if should_skip_post_pincode_route_steal("_try_brain_immediate_scope_or_kb_reply"):
+            return None
+    except ImportError:
+        pass
+
     scope = (brain_route.get("conversation_scope") or "").strip().lower()
     intent = (brain_route.get("intent") or "").strip().lower()
     channel = (brain_route.get("data_channel") or "").strip().lower()
@@ -264,7 +272,57 @@ def _try_brain_immediate_scope_or_kb_reply(
                     pass
                 return scope_reply
 
-    # --- OOD / chitchat before KB or transactional detours ---
+    # --- Admin KB semantic check BEFORE OOD refusal ---
+    # Indexed Admin knowledge is SoT for whether a topic is answerable. Brain may
+    # mislabel platform policies (reels, shorts, etc.) as OOD "not shopping".
+    try:
+        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from utils.helpers import turn_is_obvious_product_shopping_turn
+
+        skip_kb_probe = (
+            brain_route_indicates_product_catalog(brain_route)
+            or turn_is_obvious_product_shopping_turn(
+                original_msg, msg_en, conv_for_llm
+            )
+            or intent
+            in (
+                "order",
+                "order_history",
+                "wishlist",
+                "product",
+                "pincode_check",
+                "deals",
+                "categories",
+            )
+        )
+    except ImportError:
+        skip_kb_probe = False
+
+    if not skip_kb_probe and (
+        scope in ("out_of_domain", "harm_sensitive")
+        or not brain_route.get("is_welfog_related", True)
+        or (brain_route.get("data_channel") or "").strip().lower() != "kb"
+    ):
+        try:
+            from services.kb_service import promote_route_from_semantic_kb_match
+
+            rescued = promote_route_from_semantic_kb_match(
+                brain_route, original_msg, msg_en=msg_en
+            )
+            if rescued:
+                brain_route = rescued
+                scope = (brain_route.get("conversation_scope") or "").strip().lower()
+                intent = (brain_route.get("intent") or "").strip().lower()
+                try:
+                    from services.chat_flow_telemetry import store_brain_route_result
+
+                    store_brain_route_result(brain_route)
+                except ImportError:
+                    pass
+        except ImportError:
+            pass
+
+    # --- OOD / chitchat before transactional detours (after Admin KB rescue) ---
     try:
         from services.chat_flow_telemetry import should_skip_post_kb_ood_guard
 
@@ -313,7 +371,7 @@ def _try_brain_immediate_scope_or_kb_reply(
                 pass
             return scope_reply
 
-    # --- KB vector only for Welfog support turns (never before OOD/chitchat above) ---
+    # --- KB vector for Welfog support turns (Admin catalog — unscoped semantic) ---
     try:
         from services.ai_route_semantics import brain_route_indicates_product_catalog
         from utils.helpers import turn_is_obvious_product_shopping_turn
@@ -561,26 +619,6 @@ def _try_brain_kb_locked_reply(
         return None
     kb_keys = list(brain_route.get("kb_keys") or [])
     if not kb_keys:
-        _brain_intent_kb = {
-            "payment": ["payment"],
-            "refund": ["refund"],
-            "general": ["company"],
-            "seller": ["company", "faqs"],
-        }
-        kb_keys = list(_brain_intent_kb.get(intent, []))
-    if not kb_keys:
-        um = (brain_route.get("user_meaning") or "").strip().lower()
-        if um and any(
-            x in um
-            for x in ("contact", "care", "phone", "number", "email", "support", "helpline")
-        ):
-            try:
-                from services.kb_service import get_support_contact_kb_keys
-
-                kb_keys = get_support_contact_kb_keys()[:2]
-            except ImportError:
-                pass
-    if not kb_keys:
         try:
             from services.kb_service import resolve_brain_kb_keys
 
@@ -764,13 +802,22 @@ def _prepare_brain_product_route(
         from utils.reasoning_log import log_reasoning
 
         log_reasoning(
-            "Brain product turn — no usable product phrase; preserving empty search_query "
-            "(entities/filter browse may still apply)."
+            "Brain product turn — no structured product_name entity; "
+            "Product Entity Extraction will own title_query (never Brain user_meaning)."
         )
 
+    # Keep Brain entity hint only. Never stamp user_meaning / paraphrases into search_query
+    # as OpenSearch title_query — extract_semantic_product_entities is the SoT.
     route["search_query"] = sq
     route["_ai_single_pass"] = True
-    route["_needs_product_nlu_llm"] = False
+    # Title always needs semantic product entity extraction (unless SKU / pro_id).
+    pe = route.get("_product_entities") or {}
+    if pe.get("sku") or pe.get("pro_id") or pe.get("product_id"):
+        route["_needs_product_nlu_llm"] = False
+    elif route.get("category_only_browse") and not sq:
+        route["_needs_product_nlu_llm"] = False
+    else:
+        route["_needs_product_nlu_llm"] = True
     return route, sq
 
 
@@ -818,15 +865,18 @@ def _brain_route_is_category_only_browse(
     original_msg: str,
     msg_en: str,
 ) -> bool:
-    if bool(brain_route.get("category_only_browse")):
-        return True
-    if (brain_route.get("category_browse") or "").strip():
-        return True
+    # Concrete product search terms always win over department browse.
+    sq = (brain_route.get("search_query") or "").strip()
+    if sq:
+        return False
     entities = brain_route.get("entities") or {}
     if not isinstance(entities, dict):
         entities = {}
+    pe = brain_route.get("product_entities") or brain_route.get("_product_entities") or {}
+    if not isinstance(pe, dict):
+        pe = {}
     if any(
-        entities.get(k)
+        (entities.get(k) or pe.get(k))
         for k in (
             "product_name",
             "sku",
@@ -836,18 +886,32 @@ def _brain_route_is_category_only_browse(
             "color",
             "size",
             "model",
+            "product_type",
         )
     ):
         return False
     try:
         from services.welfog_api import (
             _message_has_product_search_filters,
+            _message_targets_specific_product,
             _user_explicitly_browses_category,
             resolve_nav_category_id_fast,
         )
 
         comb = f"{original_msg} {msg_en}".strip()
         if comb and _message_has_product_search_filters(comb):
+            return False
+        if comb and _message_targets_specific_product(comb):
+            return False
+        if bool(brain_route.get("category_only_browse")) or (
+            brain_route.get("category_browse") or ""
+        ).strip():
+            if comb and _user_explicitly_browses_category(comb):
+                return bool(resolve_nav_category_id_fast(comb))
+            # Brain said category browse but message has no specific product —
+            # only treat as category-only when it is a bare department ask.
+            if comb and not _message_targets_specific_product(comb):
+                return True
             return False
         if comb and _user_explicitly_browses_category(comb):
             return bool(resolve_nav_category_id_fast(comb))
@@ -1004,6 +1068,17 @@ def _try_brain_product_catalog_fallback_dispatch(
     One ai_brain_route already ran — OpenSearch catalog (no specialist LLM stack).
     """
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
+        return None
+    try:
+        from services.chat_flow_telemetry import should_skip_post_pincode_route_steal
+
+        if should_skip_post_pincode_route_steal("product_catalog_fallback"):
+            return None
+    except ImportError:
+        pass
+    if brain_route.get("_pincode_delivery_locked") or (
+        (brain_route.get("intent") or "").strip().lower() == "pincode_check"
+    ):
         return None
     intent_ub = (brain_route.get("intent") or "").strip().lower()
     if intent_ub in ("categories", "category_feed"):
@@ -1383,6 +1458,7 @@ def try_llm_down_product_catalog_recovery(
             "_universal_brain_route": True,
             "_ai_single_pass": True,
             "_needs_product_nlu_llm": False,
+            "_product_nlu_from_ai": True,
             "_product_entities": entities,
             "search_query": sq,
             "user_meaning": classified.get("user_meaning") or f"Show {sq}",
@@ -1476,7 +1552,9 @@ def try_structural_product_catalog_reply(
             "_product_catalog_locked": True,
             "_universal_brain_route": True,
             "_ai_single_pass": True,
+            # resolve_catalog_search_terms_for_message = Product Entity Extraction.
             "_needs_product_nlu_llm": False,
+            "_product_nlu_from_ai": True,
         }
         sq = resolve_catalog_search_terms_for_message(
             original_msg, msg_en, ai_route=product_route
@@ -1487,8 +1565,12 @@ def try_structural_product_catalog_reply(
         return None
 
     product_route["search_query"] = sq
+    product_route["_product_entities"] = {
+        **(product_route.get("_product_entities") or {}),
+        "product_name": sq,
+    }
     product_route["user_meaning"] = f"Show {sq}"
-    log_reasoning(f"Structural product fast path sq={sq!r} → OpenSearch (skip brain LLM).")
+    log_reasoning(f"Structural product fast path sq={sq!r} → OpenSearch (entity extract).")
     return _run_product_catalog_flow(
         product_route,
         sq,
@@ -2005,6 +2087,8 @@ def _try_brain_order_live_direct_reply(
 def _brain_is_pincode_delivery_turn(brain_route: dict) -> bool:
     if not isinstance(brain_route, dict):
         return False
+    if brain_route.get("_pincode_delivery_locked"):
+        return True
     intent = (brain_route.get("intent") or "").strip().lower()
     handler = (brain_route.get("route_handler") or "").strip().lower()
     channel = (brain_route.get("data_channel") or "").strip().lower()
@@ -2019,15 +2103,33 @@ def _brain_is_pincode_delivery_turn(brain_route: dict) -> bool:
             return True
     except ImportError:
         pass
+    try:
+        from services.chat_flow_telemetry import is_authoritative_pincode_route_locked
+
+        if is_authoritative_pincode_route_locked():
+            return True
+    except ImportError:
+        pass
     return False
 
 
 def _extract_pincode_from_brain_route(brain_route: dict, original_msg: str, msg_en: str) -> str:
+    """PIN only from THIS message (or Brain when it matches typed digits). Never history."""
     import re
 
-    pin = re.sub(r"\D", "", str(brain_route.get("extracted_pincode") or ""))
-    if len(pin) == 6 and pin[0] != "0":
-        return pin
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    msg_pin = ""
+    m = re.search(r"\b([1-9]\d{5})\b", comb)
+    if m:
+        msg_pin = m.group(1)
+
+    # No 6-digit PIN in this turn → city/ask-PIN path (geocode or prompt).
+    if not msg_pin:
+        return ""
+
+    brain_pin = re.sub(r"\D", "", str(brain_route.get("extracted_pincode") or ""))
+    if len(brain_pin) == 6 and brain_pin[0] != "0" and brain_pin == msg_pin:
+        return brain_pin
     try:
         from utils.helpers import resolve_pincode_for_check
 
@@ -2035,16 +2137,14 @@ def _extract_pincode_from_brain_route(brain_route: dict, original_msg: str, msg_
             original_msg,
             "",
             msg_en=msg_en,
-            ai_extracted=brain_route.get("extracted_pincode"),
+            ai_extracted=msg_pin,
             ai_route=brain_route,
         )
         if pin:
             return pin
     except ImportError:
         pass
-    comb = f"{original_msg} {msg_en}".strip()
-    m = re.search(r"\b([1-9]\d{5})\b", comb)
-    return m.group(1) if m else ""
+    return msg_pin
 
 
 def _extract_location_from_brain_route(brain_route: dict) -> str:
@@ -2165,6 +2265,19 @@ def _try_brain_pincode_direct_reply(
     if not _brain_is_pincode_delivery_turn(brain_route):
         return None
 
+    import time
+
+    t_all = time.perf_counter()
+    try:
+        from services.chat_flow_telemetry import (
+            lock_authoritative_pincode_route,
+            record_phase,
+        )
+
+        lock_authoritative_pincode_route(source="brain_dispatch", ai_route=brain_route)
+    except ImportError:
+        record_phase = None  # type: ignore
+
     try:
         from utils.helpers import clear_order_session_for_new_lookup
 
@@ -2210,39 +2323,39 @@ def _try_brain_pincode_direct_reply(
     route_for_api.setdefault("intent", "pincode_check")
     route_for_api.setdefault("data_channel", "live_api")
     route_for_api.setdefault("route_handler", "pincode_delivery_api")
+    route_for_api["_pincode_delivery_locked"] = True
     if pin:
         route_for_api["extracted_pincode"] = pin
     if location and not (route_for_api.get("search_query") or "").strip():
         route_for_api["search_query"] = location
 
+    # Brain locked delivery but PIN/city missing → one semantic location fill (force_llm).
+    # No static city-list scan; geocode uses Brain/meaning city_name only.
     if not pin:
         try:
             from services.location_delivery_resolver import (
-                _MAJOR_CITY_PINS,
-                _major_city_named_in_text,
-                _norm_city_key,
-                extract_place_query_from_delivery_message,
+                ai_understand_delivery_turn,
                 geocode_city_to_pincode,
             )
 
-            comb = f"{original_msg} {msg_en}".strip()
+            t_loc = time.perf_counter()
             city = (location or "").strip()
             if not city:
-                city = _major_city_named_in_text(comb) or ""
-            if not city:
-                for word in re.findall(r"[a-z]{3,}", comb.lower()):
-                    if _norm_city_key(word) in _MAJOR_CITY_PINS:
-                        city = word
-                        break
-            if not city:
-                extracted = extract_place_query_from_delivery_message(comb)
-                for part in (extracted or "").split():
-                    if _norm_city_key(part) in _MAJOR_CITY_PINS:
-                        city = part
-                        break
-                if not city and extracted:
-                    city = extracted
-            if city:
+                meaning = (brain_route.get("user_meaning") or "").strip()
+                understood = ai_understand_delivery_turn(
+                    original_msg,
+                    msg_en or meaning,
+                    conv_for_llm,
+                    ai_route=route_for_api,
+                    reply_lang=lang,
+                    force_llm=True,
+                )
+                if understood:
+                    pin_u = re.sub(r"\D", "", str(understood.pincode or ""))
+                    if len(pin_u) == 6 and pin_u[0] != "0":
+                        pin = pin_u
+                    city = (understood.city_name or "").strip() or city
+            if city and not pin:
                 geo = geocode_city_to_pincode(city)
                 resolved_pin = str(geo.get("pincode") or "")
                 if resolved_pin:
@@ -2251,8 +2364,13 @@ def _try_brain_pincode_direct_reply(
                     route_for_api["extracted_pincode"] = pin
                     route_for_api["search_query"] = location
                     log_reasoning(
-                        f"Brain pincode: city {city!r} → PIN {pin} (offline/geocode, skip ask-PIN)."
+                        f"Brain pincode: city {city!r} → PIN {pin} (geocode, skip ask-PIN)."
                     )
+            if record_phase:
+                record_phase(
+                    "pincode_location_resolve",
+                    (time.perf_counter() - t_loc) * 1000.0,
+                )
         except ImportError:
             pass
 
@@ -2275,10 +2393,20 @@ def _try_brain_pincode_direct_reply(
                 log_reasoning(
                     f"Brain direct pincode: live API for PIN {pin} (skip routing stack)."
                 )
+                t_api = time.perf_counter()
                 api_res = check_pincode_delivery(pin)
+                if record_phase:
+                    record_phase(
+                        "pincode_live_api",
+                        (time.perf_counter() - t_api) * 1000.0,
+                    )
                 api_called = True
                 reply_html = format_pincode_check_reply(
-                    pin, api_res, original_msg, lang
+                    pin,
+                    api_res,
+                    original_msg,
+                    lang,
+                    city_label=location or "",
                 )
         except ImportError:
             reply_html = ""
@@ -2293,11 +2421,7 @@ def _try_brain_pincode_direct_reply(
                 conversation_context=conv_for_llm,
                 reply_lang=lang,
                 ai_route=route_for_api,
-                allow_llm=not (
-                    route_for_api.get("_pincode_delivery_locked")
-                    or (route_for_api.get("intent") or "").strip().lower()
-                    == "pincode_check"
-                ),
+                allow_llm=False,
             )
             if result.handled and result.reply_html:
                 reply_html = result.reply_html
@@ -2318,11 +2442,7 @@ def _try_brain_pincode_direct_reply(
                 msg_en,
                 conv_for_llm,
                 reply_lang=lang,
-                allow_ai=not (
-                    route_for_api.get("_pincode_delivery_locked")
-                    or (route_for_api.get("intent") or "").strip().lower()
-                    == "pincode_check"
-                ),
+                allow_ai=False,
             )
         except ImportError:
             reply_html = ""
@@ -2337,6 +2457,8 @@ def _try_brain_pincode_direct_reply(
         selected_tool="pincode_delivery_api",
         api_called=api_called,
     )
+    if record_phase:
+        record_phase("pincode_dispatch_total", (time.perf_counter() - t_all) * 1000.0)
     try:
         from services.answer_router import AnswerRouteDecision
         from services.chat_flow_telemetry import store_turn_analysis
@@ -2554,6 +2676,41 @@ def try_brain_direct_dispatch(
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
 
+    # Delivery semantic plan first — before KB informational / early KB steal.
+    try:
+        from services.ai_route_semantics import reconcile_pincode_delivery_from_brain_meaning
+        from services.chat_flow_telemetry import (
+            is_authoritative_pincode_route_locked,
+            should_skip_post_pincode_route_steal,
+        )
+
+        brain_route = reconcile_pincode_delivery_from_brain_meaning(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+        if (
+            brain_route.get("_pincode_delivery_locked")
+            or (brain_route.get("intent") or "").strip().lower() == "pincode_check"
+            or is_authoritative_pincode_route_locked()
+        ):
+            pin_first = _try_brain_pincode_direct_reply(
+                brain_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+            )
+            if pin_first:
+                return pin_first
+        if should_skip_post_pincode_route_steal("brain_direct_dispatch"):
+            return None
+    except ImportError:
+        pass
+
     try:
         from services.knowledge_query_pipeline import try_kb_informational_locked_reply
         from services.turn_intent_coordinator import kb_turn_blocks_product_catalog
@@ -2645,16 +2802,9 @@ def try_brain_direct_dispatch(
         from services.ai_route_semantics import (
             brain_route_indicates_informational_kb,
             brain_route_indicates_product_catalog,
-            reconcile_pincode_delivery_from_brain_meaning,
             reconcile_product_catalog_from_brain_meaning,
         )
 
-        brain_route = reconcile_pincode_delivery_from_brain_meaning(
-            brain_route,
-            original_msg=original_msg,
-            msg_en=msg_en,
-            conversation_context=conv_for_llm,
-        )
         try:
             from services.account_list_semantics import (
                 account_list_route_is_locked,
@@ -3189,6 +3339,45 @@ def try_finish_brain_classified_turn(
     if not isinstance(brain_route, dict) or brain_route.get("llm_unavailable"):
         return None
 
+    # Single execution plan: delivery/pincode BEFORE KB and product.
+    # Brain may mislabel city serviceability as kb/catalog; semantic reconcile corrects.
+    try:
+        from services.ai_route_semantics import reconcile_pincode_delivery_from_brain_meaning
+        from services.chat_flow_telemetry import (
+            is_authoritative_pincode_route_locked,
+            should_skip_post_pincode_route_steal,
+        )
+
+        pin_route = reconcile_pincode_delivery_from_brain_meaning(
+            brain_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conv_for_llm,
+        )
+        if (
+            pin_route.get("_pincode_delivery_locked")
+            or (pin_route.get("intent") or "").strip().lower() == "pincode_check"
+            or is_authoritative_pincode_route_locked()
+        ):
+            pin_first = _try_brain_pincode_direct_reply(
+                pin_route,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conv_for_llm=conv_for_llm,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context_fn,
+            )
+            if pin_first:
+                log_reasoning(
+                    "Brain finish — pincode delivery first (single execution plan)."
+                )
+                return pin_first
+        if should_skip_post_pincode_route_steal("try_finish_post_pin"):
+            return None
+    except ImportError:
+        pass
+
     channel_finish = (brain_route.get("data_channel") or "").strip().lower()
     if channel_finish == "kb" and not brain_route.get("needs_order_id"):
         kb_first = _try_brain_immediate_scope_or_kb_reply(
@@ -3221,37 +3410,40 @@ def try_finish_brain_classified_turn(
             log_reasoning("Brain finish — KB direct dispatch (channel=kb).")
             return kb_direct
 
-    # Locked product catalog — OpenSearch before KB embed (embed lock caused 60–170s hangs).
     try:
+        from services.chat_flow_telemetry import should_skip_post_pincode_route_steal
         from services.ai_route_semantics import (
             brain_route_indicates_product_catalog,
             reconcile_product_catalog_from_brain_meaning,
         )
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
-        catalog_route = reconcile_product_catalog_from_brain_meaning(
-            brain_route,
-            original_msg=original_msg,
-            msg_en=msg_en,
-        )
-        if product_catalog_route_is_locked(catalog_route) or brain_route_indicates_product_catalog(
-            catalog_route
-        ):
-            product_first = _try_brain_product_catalog_fallback_dispatch(
-                catalog_route,
+        if should_skip_post_pincode_route_steal("try_finish_product"):
+            pass
+        else:
+            catalog_route = reconcile_product_catalog_from_brain_meaning(
+                brain_route,
                 original_msg=original_msg,
                 msg_en=msg_en,
-                conv_for_llm=conv_for_llm,
-                user_id=user_id,
-                lang=lang,
-                ctx=ctx,
-                reset_context_fn=reset_context_fn,
             )
-            if product_first:
-                log_reasoning(
-                    "Brain finish — product OpenSearch first (skip KB embed queue)."
+            if product_catalog_route_is_locked(
+                catalog_route
+            ) or brain_route_indicates_product_catalog(catalog_route):
+                product_first = _try_brain_product_catalog_fallback_dispatch(
+                    catalog_route,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv_for_llm,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context_fn,
                 )
-                return product_first
+                if product_first:
+                    log_reasoning(
+                        "Brain finish — product OpenSearch first (skip KB embed queue)."
+                    )
+                    return product_first
     except ImportError:
         pass
 

@@ -8848,6 +8848,7 @@ def extract_product_search_query(
         ):
             from services.ai_route_semantics import resolve_catalog_search_phrase
 
+            # Structured entity hint only — never Brain paraphrase as title SoT.
             sq = resolve_catalog_search_phrase(
                 ai_route,
                 original_msg=original_msg,
@@ -8856,6 +8857,20 @@ def extract_product_search_query(
             )
             if sq:
                 return sq
+            # Prefer Product Entity Extraction over user_meaning / raw paraphrase.
+            try:
+                from services.product_query_understanding import (
+                    resolve_catalog_search_terms_for_message,
+                )
+
+                extracted = resolve_catalog_search_terms_for_message(
+                    original_msg, msg_en, ai_route=ai_route
+                )
+                if extracted and len(extracted.strip()) >= 2:
+                    return extracted.strip()
+            except ImportError:
+                pass
+            return ""
     except ImportError:
         pass
     if _message_looks_like_shopping_query(f"{original_msg} {msg_en}".strip()):

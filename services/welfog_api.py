@@ -98,45 +98,59 @@ _REST_CATEGORY_BASELINE_SLUGS: frozenset[str] | None = None
 
 
 def _product_slugs_from_rows(rows: list) -> frozenset[str]:
+    """Stable fingerprints for REST rows (cards often lack slug/id — use name)."""
     out: set[str] = set()
-    for row in (rows or [])[:16]:
+    for row in (rows or [])[:20]:
         if not isinstance(row, dict):
             continue
-        slug = row.get("slug") or row.get("id")
-        if slug is not None:
-            out.add(str(slug))
+        slug = row.get("slug") or row.get("id") or row.get("pro_id")
+        if slug is not None and str(slug).strip():
+            out.add(str(slug).strip().lower())
+            continue
+        name = (row.get("name") or "").strip().lower()
+        if name:
+            out.add(re.sub(r"\s+", " ", name)[:80])
     return frozenset(out)
 
 
 def _rest_category_filter_trustworthy(category_id, rows: list) -> bool:
     """
-    Welfog products/search often ignores category= for non-electronics ids and returns
-    the same default pool. Reject those rows so callers can try name search instead.
+    Welfog products/search often ignores category= and returns the default home pool.
+    Reject near-identical unfiltered dumps; allow smaller real category pages even if
+    some SKUs also appear on the home page.
     """
     global _REST_CATEGORY_BASELINE_SLUGS
     if not rows:
         return False
     slugs = _product_slugs_from_rows(rows)
     if not slugs:
-        return True
+        return False
     if _REST_CATEGORY_BASELINE_SLUGS is None:
-        baseline = _catalog_search_get({"page": 1, "category": "16"})
+        baseline = _catalog_search_get({"page": 1})
         _REST_CATEGORY_BASELINE_SLUGS = _product_slugs_from_rows(baseline or [])
-    cid = str(category_id or "").strip()
-    if _REST_CATEGORY_BASELINE_SLUGS and slugs == _REST_CATEGORY_BASELINE_SLUGS and cid not in ("", "16"):
+    baseline = _REST_CATEGORY_BASELINE_SLUGS or frozenset()
+    if not baseline:
+        return True
+    if slugs == baseline:
+        return False
+    overlap = len(slugs & baseline)
+    # Same-sized (or nearly) dump with mostly the same items → ignored category filter.
+    if len(slugs) >= max(12, len(baseline) - 2) and overlap / max(len(slugs), 1) >= 0.8:
+        return False
+    if abs(len(slugs) - len(baseline)) <= 2 and overlap / max(len(slugs), 1) >= 0.85:
         return False
     return True
 
 
 def _catalog_search_with_category(base_params: dict, category_id) -> list:
     """
-    Welfog search API: most departments need `category` / `category_id`;
-    legacy `categories` works for some ids (e.g. electronics) only.
+    Welfog search API: `categories=` is the reliable department filter for many ids;
+    `category` / `category_id` often return the default home pool.
     """
     if not category_id:
         return _catalog_search_get(base_params)
     cid = str(category_id).strip()
-    for key in ("category", "category_id", "categories"):
+    for key in ("categories", "category", "category_id"):
         params = dict(base_params)
         params[key] = cid
         rows = _catalog_search_get(params)
@@ -1344,7 +1358,7 @@ _CATEGORY_BROWSE_FILLER = frozenset(
     {
         "mereko", "mujhe", "meko", "mere", "mera", "meri", "please", "plz",
         "product", "products", "item", "items", "show", "list", "dikhao", "dikha",
-        "dikhe", "dikhaa", "dekho", "dekh", "batao", "btao", "bata", "btana", "batana",
+        "dikhe", "dikhaa", "dekho", "dekh", "batao", "btao", "bata", "bta", "btana", "batana",
         "chahiye", "chiye", "category", "categories", "ke", "ki", "ka", "ko", "se",
         "me", "in", "all", "saare", "saari", "sab", "want", "need", "give", "dena",
         "lao", "la", "de", "do", "wale", "wali", "some", "any", "bhi", "also", "too",
@@ -2161,8 +2175,31 @@ def _category_fuzzy_lookup(input_text: str, mapping: dict, main_hint: str = None
     return None
 
 
+def _is_category_browse_filler_token(tok: str) -> bool:
+    """True when token is browse filler or a verb/morph variant of one (dekhne←dekh, bta←bata)."""
+    t = (tok or "").strip().lower()
+    if not t:
+        return True
+    if t in _CATEGORY_BROWSE_FILLER:
+        return True
+    # Morphological extensions of filler stems (≥4 chars): dekh→dekhne, dikha→dikhao.
+    for f in _CATEGORY_BROWSE_FILLER:
+        if len(f) >= 4 and len(t) > len(f) and t.startswith(f):
+            return True
+    # Truncated verb stems (bta←bata/batao) — token is a prefix of a filler word.
+    if len(t) >= 3:
+        for f in _CATEGORY_BROWSE_FILLER:
+            if len(f) > len(t) and f.startswith(t):
+                return True
+    return False
+
+
 def _strip_message_for_category_lookup(text: str) -> str:
-    words = [w for w in _normalize_cat_name(text).split() if w and w not in _CATEGORY_BROWSE_FILLER]
+    words = [
+        w
+        for w in _normalize_cat_name(text).split()
+        if w and len(w) >= 2 and not _is_category_browse_filler_token(w)
+    ]
     return " ".join(words).strip()
 
 
@@ -2192,22 +2229,58 @@ def query_should_use_category_id_only(category_id, query: str, ctx=None) -> bool
     q = (query or "").strip()
     if not q:
         return True
+    # Explicit department browse beats leftover verb noise — still id-only.
+    if _user_explicitly_browses_category(q):
+        resolved = (
+            resolve_nav_category_id_fast(q, ctx=ctx)
+            or resolve_nav_category_id_fast(_expand_category_query_text(q), ctx=ctx)
+            or get_category_id_from_text(q, ctx=ctx)
+        )
+        if resolved and str(resolved) == str(category_id):
+            if not _message_targets_specific_product(q):
+                return True
+    # Named product (vest, slippers…) always needs title_query — never id-only.
     if _message_targets_specific_product(q):
         return False
     stripped = _strip_message_for_category_lookup(q)
     if not stripped:
         return True
+    # Leftover resolves to THIS category (or is the category name) → id-only browse.
     fast = resolve_nav_category_id_fast(stripped, ctx=ctx)
-    if fast:
-        return str(fast) == str(category_id)
-    return get_category_id_from_text(stripped, ctx=ctx) == str(category_id)
+    if fast and str(fast) == str(category_id):
+        return True
+    if get_category_id_from_text(stripped, ctx=ctx) == str(category_id):
+        return True
+    # Typo / morphology left non-category tokens but full message still resolves
+    # to this department — prefer category-id browse over polluted title_query.
+    full_fast = resolve_nav_category_id_fast(q, ctx=ctx) or resolve_nav_category_id_fast(
+        _expand_category_query_text(q), ctx=ctx
+    )
+    if full_fast and str(full_fast) == str(category_id):
+        leftover = set(re.findall(r"[a-z0-9]{3,}", (stripped or "").lower()))
+        try:
+            leftover -= _category_name_tokens_for_id(category_id, ctx)
+        except Exception:
+            pass
+        leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
+        if not leftover:
+            return True
+    return False
 
 
 def category_browse_search_name(category_id, query: str, ctx=None) -> str:
     """Return '' for category-only browse queries so the API returns category products."""
     if query_should_use_category_id_only(category_id, query, ctx):
         return ""
-    return (query or "").strip()
+    # Never pass the raw conversational sentence as a product name filter.
+    stripped = _strip_message_for_category_lookup(query)
+    if not stripped:
+        return ""
+    if resolve_nav_category_id_fast(stripped, ctx=ctx) or get_category_id_from_text(
+        stripped, ctx=ctx
+    ):
+        return ""
+    return stripped
 
 
 def _category_name_tokens_for_id(category_id, ctx=None) -> set[str]:
@@ -2336,26 +2409,66 @@ def _user_explicitly_browses_category(text: str) -> bool:
 
 
 def _message_targets_specific_product(text: str) -> bool:
-    """Keyword search for a product type (shirt, rice, cover…) — do not force nav category_id."""
+    """
+    True when the message names a product type beyond a bare department browse.
+
+    Uses leftover tokens after stripping category labels / browse filler — not a
+    product synonym dictionary — so vest/baniyan/flipflops/etc. stay product search.
+    """
     low = (text or "").lower()
+    if not low.strip():
+        return False
     try:
-        from services.opensearch_products import _extract_product_keywords, _PRODUCT_NOUNS
+        from services.opensearch_products import (
+            _GENERIC_TITLE_MODIFIERS,
+            _extract_product_keywords,
+            _PRODUCT_NOUNS,
+        )
 
         if _extract_product_keywords(low):
             return True
-        words = set(re.findall(r"[a-z]{3,}", low))
-        extra = {"tshirt", "tee", "denim", "sneaker", "sneakers", "flipflop", "flip", "flops"}
-        if words & (set(_PRODUCT_NOUNS) | extra):
+        words = set(re.findall(r"[a-z0-9]{3,}", low))
+        if words & set(_PRODUCT_NOUNS):
             return True
     except ImportError:
+        _GENERIC_TITLE_MODIFIERS = frozenset()  # noqa: N806
+
+    stripped = _strip_message_for_category_lookup(text)
+    leftover = set(re.findall(r"[a-z0-9]{3,}", (stripped or "").lower()))
+    try:
+        nav = _get_nav_categories_map(None) or {}
+        cat_toks: set[str] = set()
+        for name in nav.keys():
+            cat_toks.update(re.findall(r"[a-z0-9]{3,}", (name or "").lower()))
+        leftover -= cat_toks
+    except Exception:
         pass
-    return bool(
-        re.search(
-            r"\b(?:shirt|tshirt|jeans|charger|bottle|rice|wheat|cover|case|shoes?|saree|kurta|"
-            r"laptop|watch|earphone|headphone|soap|cream|atta|dal)\b",
-            low,
-        )
-    )
+    leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
+    try:
+        leftover -= set(_GENERIC_TITLE_MODIFIERS)
+    except Exception:
+        pass
+    # Any remaining token (vest, baniyan, flipflops, innerwear, …) ⇒ product search.
+    if leftover:
+        # If message resolves to a department, only ignore leftover that is the
+        # category name / typo noise — keep real product nouns (vest, slippers…).
+        try:
+            cid = resolve_nav_category_id_fast(text) or resolve_nav_category_id_fast(
+                _expand_category_query_text(text)
+            )
+            if cid:
+                leftover -= _category_name_tokens_for_id(cid)
+                leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
+                try:
+                    leftover -= set(_GENERIC_TITLE_MODIFIERS)
+                except Exception:
+                    pass
+                if not leftover:
+                    return False
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]:
@@ -2414,10 +2527,48 @@ def resolve_search_category_id(category_id: str, ctx=None) -> str:
     return cid
 
 
+def department_catalog_label_names(category_id, ctx=None) -> list[str]:
+    """
+    Live nav/inner display names under a department — used to match OpenSearch
+    category_name (leaf labels). No product keyword lists.
+    """
+    cid = str(category_id or "").strip()
+    if not cid:
+        return []
+    main = resolve_search_category_id(cid, ctx) or cid
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def _add(label: str) -> None:
+        raw = (label or "").strip()
+        if not raw:
+            return
+        leaf = raw.split("—")[-1].strip() if "—" in raw else raw
+        for cand in (raw, leaf):
+            key = _normalize_cat_name(cand)
+            if key and key not in seen:
+                seen.add(key)
+                names.append(cand.strip())
+
+    _add(category_name_for_id(main, ctx))
+    _add(category_name_for_id(cid, ctx))
+    try:
+        _, meta, _ = _get_inner_categories_flat_map(ctx)
+        for _child_id, m in (meta or {}).items():
+            if not isinstance(m, dict):
+                continue
+            if str(m.get("main_category_id") or "").strip() != str(main):
+                continue
+            _add(str(m.get("name") or ""))
+    except Exception:
+        pass
+    return names
+
+
 def fetch_products_by_category_browse(category_id, ctx=None, page=1, color=None):
     """
-    Category-only or category-first product browse.
-    Tries search API with resolved main category id, then inner id, then name keyword fallback.
+    Category-only product browse via search API with resolved main category id.
+    Never falls back to unfiltered name-only search (that mixes other departments).
     Returns (products_list, effective_category_id).
     """
     from utils.reasoning_log import log_reasoning
@@ -2439,17 +2590,19 @@ def fetch_products_by_category_browse(category_id, ctx=None, page=1, color=None)
                 f"Category browse API hit category={try_cid} ({len(products)} items)."
             )
             return products, try_cid
+        if products:
+            log_reasoning(
+                f"Category browse REST ignored category={try_cid} "
+                f"(default catalog dump — skipped)."
+            )
 
+    # Trusted name+category only (same fingerprint gate). Never name-only.
     label = category_name_for_id(cid, ctx) or category_name_for_id(search_cid, ctx)
     if label:
         kw = (label.split("—")[-1] if "—" in label else label).strip()
         products = fetch_products_from_api(kw, category_id=search_cid, color=color, page=page)
-        if products:
+        if products and _rest_category_filter_trustworthy(search_cid, products):
             log_reasoning(f"Category browse name+filter categories={search_cid} name={kw!r}.")
-            return products, search_cid
-        products = fetch_products_from_api(kw, category_id=None, color=color, page=page)
-        if products:
-            log_reasoning(f"Category browse name-only fallback name={kw!r}.")
             return products, search_cid
 
     return [], search_cid

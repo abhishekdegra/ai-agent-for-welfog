@@ -344,9 +344,11 @@ def _structural_gap_ai_from_message(
         if v not in (None, "", []):
             ai[dst] = v
 
-    sq = (brain_search_query or locked.get("search_terms") or "").strip()
-    if sq and not brain_search_query_is_noisy(sq) and not ai.get("search_terms"):
-        ai["search_terms"] = sq
+    # Do NOT promote brain_search_query into search_terms — that path fed Brain
+    # paraphrases (user_meaning) into OpenSearch title_query. locked.search_terms
+    # is already copied above when Product Entity Extraction (or structured
+    # product_entities.product_name) produced it.
+    _ = brain_search_query
 
     try:
         from utils.helpers import extract_product_id
@@ -396,30 +398,41 @@ def _locked_catalog_spec_ready(
     *,
     brain_search_query: str = "",
 ) -> bool:
-    """True only when product NLU already ran — never skip for bare search_query text."""
+    """
+    True only when Product Entity Extraction already produced a usable title/SKU,
+    or this is category-only browse (empty title is correct).
+    Never skip NLU solely because `_product_nlu_from_ai` was flagged with empty terms.
+    """
     route = ai_route or {}
     locked = dict(locked_understanding or {})
+    _ = brain_search_query
 
     if locked.get("pro_id") or locked.get("sku"):
         return True
     if route.get("numeric_context") == "product_id":
         return True
 
-    if locked.get("_product_nlu_from_ai") or route.get("_product_nlu_from_ai"):
-        return True
-
-    if locked.get("_ai_first") and locked.get("_product_nlu_from_ai"):
-        if (
-            locked.get("search_terms")
-            or locked.get("brand")
-            or locked.get("color")
-            or locked.get("pro_id")
-            or locked.get("sku")
-            or locked.get("max_price") is not None
-            or locked.get("min_price") is not None
-            or locked.get("rating_min") is not None
-        ):
+    if route.get("category_only_browse") or locked.get("category_only_browse"):
+        # Category-id browse — empty title is intentional.
+        if not (locked.get("search_terms") or "").strip():
             return True
+
+    nlu_done = bool(
+        locked.get("_product_nlu_from_ai") or route.get("_product_nlu_from_ai")
+    )
+    has_title = bool((locked.get("search_terms") or "").strip())
+    if nlu_done and (
+        has_title
+        or locked.get("pro_id")
+        or locked.get("sku")
+        or locked.get("brand")
+        or locked.get("color")
+        or locked.get("max_price") is not None
+        or locked.get("min_price") is not None
+        or locked.get("rating_min") is not None
+    ):
+        # Filters-only browse (price/rating) may have empty title intentionally.
+        return True
 
     if route.get("_needs_product_nlu_llm"):
         return False
@@ -447,16 +460,13 @@ def _build_catalog_spec_from_locked_entities(
             merge_ai[k] = v
 
     entities = dict((ai_route or {}).get("_product_entities") or {})
-    sq = (
-        (brain_search_query or "").strip()
-        or ((ai_route or {}).get("search_query") or "").strip()
-    )
+    # Filters/entities only — never Brain search_query / user_meaning as title SoT.
     try:
         from services.product_catalog_resolver import entities_to_understanding
 
         eu = entities_to_understanding(
             entities,
-            search_query=sq,
+            search_query="",
             original_msg=original_msg or msg_en,
         )
         if eu:
@@ -466,8 +476,22 @@ def _build_catalog_spec_from_locked_entities(
     except ImportError:
         pass
 
-    if sq and not merge_ai.get("search_terms") and not merge_ai.get("pro_id"):
-        if not (ai_route or {}).get("_needs_product_nlu_llm"):
+    # Only reuse search_terms when Product Entity Extraction already ran.
+    # Never stamp Brain paraphrase text (brain_search_query) into title_query.
+    if (
+        not merge_ai.get("search_terms")
+        and not merge_ai.get("pro_id")
+        and (
+            (ai_route or {}).get("_product_nlu_from_ai")
+            or merge_ai.get("_product_nlu_from_ai")
+            or (locked_understanding or {}).get("_product_nlu_from_ai")
+        )
+    ):
+        sq = (
+            ((locked_understanding or {}).get("search_terms") or "").strip()
+            or (brain_search_query or "").strip()
+        )
+        if sq:
             try:
                 if not brain_search_query_is_noisy(sq):
                     merge_ai["search_terms"] = sq
@@ -501,12 +525,9 @@ def _build_catalog_spec_from_locked_entities(
             understanding=merge_ai,
             ai_route=ai_route,
         ):
-            last_spec = ((ctx or {}).get("data") or {}).get("last_os_spec") or {}
-            last_tq = str(last_spec.get("title_query") or "").strip()
-            if last_tq:
-                merge_ai["search_terms"] = last_tq
-            else:
-                merge_ai.pop("search_terms", None)
+            # Drop unusable title — never reuse last_os_spec title (leaks prior
+            # vest/flipflops into electronics / new product turns).
+            merge_ai.pop("search_terms", None)
     except ImportError:
         pass
     spec = build_catalog_search_spec(
@@ -524,7 +545,8 @@ def _build_related_accessory_understanding(
     entities: dict,
 ) -> dict | None:
     """
-    Device not in catalog — retry using AI-provided related_search_terms only.
+    Zero hits — retry using AI-provided related_search_terms.
+    Covers device browse and general Product Entity Extraction synonym fallback.
     No hardcoded product-type keyword lists.
     """
     locked = dict(locked_understanding or {})
@@ -535,19 +557,26 @@ def _build_related_accessory_understanding(
         ent.get("allow_related_fallback")
     ):
         return None
-    if not locked.get("device_browse"):
-        return None
     related = (
         (locked.get("related_search_terms") or ent.get("related_search_terms") or "").strip()
     )
     if not related:
         return None
+    primary = (locked.get("search_terms") or "").strip().lower()
+    if related.lower() == primary:
+        return None
     out = dict(locked)
     out.pop("device_browse", None)
     out.pop("exclude_title_tokens", None)
+    # Related synonym retry must not keep a department category_id that zeros OS/REST
+    # (e.g. slippers → flip flops while category_id=Men Fashion empties the index).
+    out.pop("category_id", None)
+    out.pop("category_browse", None)
+    out.pop("category_only_browse", None)
     out["_related_fallback"] = True
     out["search_terms"] = related
     out["_ai_first"] = True
+    out["_product_nlu_from_ai"] = True
     return out
 
 
@@ -594,9 +623,9 @@ def build_catalog_spec_for_product_turn(
 
     if allow_product_nlu_llm and not skip_nlu:
         try:
-            from services.product_query_understanding import understand_product_query
+            from services.product_query_understanding import extract_semantic_product_entities
 
-            spec, nlu = understand_product_query(
+            spec, nlu = extract_semantic_product_entities(
                 original_msg,
                 msg_en,
                 conversation_context,
@@ -618,7 +647,7 @@ def build_catalog_spec_for_product_turn(
             brain_search_query=brain_search_query,
         )
         log_reasoning(
-            "Catalog spec from locked AI entities — skip duplicate product NLU LLM."
+            "Catalog spec from locked entities/SKU — Product Entity Extraction skipped."
         )
 
     if not _spec_has_catalog_signal(spec):
@@ -664,7 +693,7 @@ def build_catalog_spec_for_product_turn(
     else:
         spec.pop("_ai_single_pass", None)
 
-    if spec.get("category_id") and not spec.get("_ai_single_pass"):
+    if spec.get("category_id"):
         try:
             from services.welfog_api import (
                 _user_explicitly_browses_category,
@@ -682,6 +711,7 @@ def build_catalog_spec_for_product_turn(
             )
             if category_browse:
                 spec["title_query"] = ""
+                spec["_category_only_browse"] = True
                 spec.pop("brand_aliases", None)
                 spec.pop("brand_name_match_only", None)
         except ImportError:
@@ -776,8 +806,8 @@ def resolve_category_browse_into_spec(
     """Map category browse messages → category_id (API nav), not a vague title_query."""
     if not spec:
         return spec
-    if spec.get("_ai_single_pass"):
-        return spec
+    # Still resolve/clear title for AI single-pass — otherwise department words stay in
+    # title_query and category-id browse returns 0 / wrong pools.
     if spec.get("pro_id") or spec.get("sku"):
         return spec
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
@@ -788,6 +818,7 @@ def resolve_category_browse_into_spec(
             _message_has_product_search_filters,
             _user_explicitly_browses_category,
             get_category_id_from_text,
+            query_should_use_category_id_only,
             resolve_category_product_browse_route,
         )
         from utils.helpers import _text_requests_category_product_browse
@@ -812,36 +843,40 @@ def resolve_category_browse_into_spec(
         if resolved:
             cid, sq = str(resolved), ""
 
-    if not cid:
-        spec = dict(spec or {})
-        if spec.get("category_id"):
-            try:
-                from services.welfog_api import query_should_use_category_id_only
+    if not cid and spec.get("category_id"):
+        cid = str(spec["category_id"])
 
-                if query_should_use_category_id_only(spec["category_id"], comb, ctx=ctx):
-                    spec["title_query"] = ""
-                    spec.pop("brand", None)
-                    spec.pop("brand_aliases", None)
-                    spec.pop("brand_name_match_only", None)
-            except ImportError:
-                pass
+    if not cid:
         return spec
 
     spec = dict(spec)
-    spec["category_id"] = int(cid)
     try:
-        from services.welfog_api import query_should_use_category_id_only
+        spec["category_id"] = int(cid)
+    except (TypeError, ValueError):
+        pass
 
-        category_only = query_should_use_category_id_only(cid, comb, ctx=ctx) or not (sq or "").strip()
-    except ImportError:
+    try:
+        category_only = query_should_use_category_id_only(cid, comb, ctx=ctx) or (
+            browses and not (sq or "").strip()
+        )
+    except Exception:
         category_only = browses and not (sq or "").strip()
 
+    existing_title = (spec.get("title_query") or "").strip()
     if category_only:
+        # Department browse — never AND a department word as title_query.
         spec["title_query"] = ""
+        spec["_category_only_browse"] = True
+        spec.pop("brand", None)
+        spec.pop("brand_aliases", None)
+        spec.pop("brand_name_match_only", None)
+    elif existing_title:
+        pass
     elif sq:
         spec["title_query"] = sq.strip()
     elif browses:
         spec["title_query"] = ""
+        spec["_category_only_browse"] = True
     return spec
 
 

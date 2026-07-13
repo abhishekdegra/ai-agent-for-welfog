@@ -131,7 +131,8 @@ def _narrow_route_kb_keys(
     original_msg: str,
     msg_en: str,
 ) -> list[str]:
-    """Scope brain kb_keys to the detected topic (payment, refund, etc.) — max 3 files."""
+    """Soft Brain kb_keys only — never an allow-list that hides new Admin docs."""
+    _ = (original_msg, msg_en)
     keys = [
         k
         for k in (
@@ -143,34 +144,11 @@ def _narrow_route_kb_keys(
     if not keys:
         return []
     try:
-        from services.query_understanding import (
-            filter_kb_keys_for_intent,
-            infer_kb_query_category,
-            scoped_kb_keys_for_retrieval,
-        )
+        from services.query_understanding import filter_kb_keys_for_intent
 
-        cat = infer_kb_query_category(
-            original_msg,
-            msg_en,
-            ai_route=ai_route,
-        )
-        meaning = ((ai_route or {}).get("user_meaning") or "").strip()
-        filtered = filter_kb_keys_for_intent(keys, cat, user_meaning=meaning)
-        if filtered:
-            narrowed = list(dict.fromkeys(filtered))
-            if cat == "payment" and "payment" in narrowed:
-                return ["payment"]
-            if cat == "refund" and "refund" in narrowed:
-                return ["refund"]
-            return narrowed[:2]
-        scoped = scoped_kb_keys_for_retrieval(
-            cat, ai_route=ai_route, user_meaning=meaning or f"{original_msg} {msg_en}".strip()
-        )
-        if scoped:
-            return scoped[:3]
+        return filter_kb_keys_for_intent(keys, "general")[:4]
     except ImportError:
-        pass
-    return keys[:3]
+        return keys[:4]
 
 
 def _brain_keys_fast_reply(

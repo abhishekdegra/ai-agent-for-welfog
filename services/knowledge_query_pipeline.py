@@ -223,6 +223,7 @@ def _try_strong_faq_informational_decision(
     if score < 0.40:
         return None
 
+    src = (faq.get("source") or "").strip()
     out = SemanticKnowledgeDecision(
         is_informational=True,
         confidence=min(0.93, 0.52 + score * 0.42),
@@ -232,9 +233,9 @@ def _try_strong_faq_informational_decision(
             original_msg, msg_en, conversation_context, ai_route=ai_route
         ),
         kb_hit=faq,
-        kb_keys=["faqs"],
+        kb_keys=[src] if src else [],
         handler="kb_grounded_ai" if score >= 0.28 else "dynamic_kb",
-        reason=f"Strong FAQ match (faqs.txt score={score:.2f}).",
+        reason=f"Strong FAQ-style match ({src or 'kb'} score={score:.2f}).",
     )
     return out
 
@@ -532,23 +533,8 @@ def _semantic_kb_match(
     return hit
 
 
-_POLICY_KB_STEMS = frozenset(
-    {"refund", "payment", "faqs", "shipping", "support", "seller", "terms", "privacy"}
-)
-_OVERVIEW_KB_STEMS = frozenset({"company", "about", "story", "intro", "brand"})
-
-
-_TOPIC_SOURCE_AFFINITY: dict[str, frozenset[str]] = {
-    "refund": frozenset({"refund", "faqs", "terms", "shipping"}),
-    "return": frozenset({"refund", "faqs", "terms", "shipping"}),
-    "payment": frozenset({"payment", "faqs", "terms"}),
-    "shipping": frozenset({"shipping", "faqs", "terms"}),
-    "seller": frozenset({"seller", "faqs", "support"}),
-    "privacy": frozenset({"privacy", "faqs", "terms", "company"}),
-    "terms": frozenset({"terms", "faqs", "privacy"}),
-    "order": frozenset({"faqs", "support", "shipping"}),
-    "order_history": frozenset({"faqs", "support"}),
-}
+_POLICY_KB_STEMS = frozenset()  # legacy; affinity no longer gates retrieval
+_OVERVIEW_KB_STEMS = frozenset()
 
 
 def _pick_best_semantic_kb_hit(
@@ -558,109 +544,51 @@ def _pick_best_semantic_kb_hit(
     query_category: str = "general",
 ) -> dict[str, Any] | None:
     """
-    Rerank top embedding hits — prefer policy file over company overview;
-    penalize cross-topic chunks (refund vs order history vs shipping).
+    Pick the strongest semantic hit. Soft category affinity never overrides a
+    higher raw embedding score (new Admin docs must win when more relevant).
     """
+    _ = query
     if not hits:
         return None
     if len(hits) == 1:
         return hits[0]
 
-    try:
-        from services.kb_service import _kb_focus_profile
-    except ImportError:
-        _kb_focus_profile = None
-
-    include_terms, exclude_terms, _ = (
-        _kb_focus_profile(query) if _kb_focus_profile else (set(), set(), 3)
-    )
-    affinity = _TOPIC_SOURCE_AFFINITY.get((query_category or "general").strip().lower(), frozenset())
-
-    def _adjusted(h: dict[str, Any]) -> float:
-        s = float(h.get("score") or 0)
-        src = (h.get("source") or "").lower()
-        chunk_l = re.sub(r"<br\s*/?>", " ", (h.get("chunk") or "")).lower()
-        if affinity and not any(a in src for a in affinity):
-            s -= 0.055
-        if query_category == "shipping" and "shipping" in src:
-            s += 0.05
-        if query_category == "refund" and "refund" in src:
-            s += 0.05
-        if query_category == "payment" and "payment" in src:
-            s += 0.05
-        if query_category == "seller" and "seller" in src:
-            s += 0.05
-        if exclude_terms and any(t in chunk_l for t in exclude_terms):
-            s -= 0.09
-        if include_terms:
-            hit_n = sum(1 for t in include_terms if t in chunk_l)
-            miss_n = sum(1 for t in exclude_terms if t in chunk_l)
-            s += 0.04 * hit_n - 0.06 * miss_n
-        return s
-
-    ranked = sorted(hits, key=_adjusted, reverse=True)
-    top = ranked[0]
-    orig_top = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)[0]
-    if top.get("source") != orig_top.get("source"):
-        log_reasoning(
-            f"KB rerank ({query_category}): prefer {top.get('source')} over {orig_top.get('source')} "
-            f"(adj { _adjusted(top):.2f} vs { _adjusted(orig_top):.2f})."
-        )
-
-    if float(top.get("score") or 0) >= _SEMANTIC_STRONG:
-        return top
-
-    top_src = (top.get("source") or "").lower()
-    top_is_overview = any(s in top_src for s in _OVERVIEW_KB_STEMS)
-
-    for alt in ranked[1:]:
-        gap = float(top.get("score") or 0) - float(alt.get("score") or 0)
-        if gap > 0.05:
-            break
-        alt_src = (alt.get("source") or "").lower()
-        alt_is_policy = any(s in alt_src for s in _POLICY_KB_STEMS)
-        if top_is_overview and alt_is_policy and gap <= 0.05:
-            log_reasoning(
-                f"KB rerank: prefer {alt_src} over {top_src} "
-                f"(scores {alt.get('score'):.2f} vs {top.get('score'):.2f})."
-            )
-            return alt
-
-    if top_is_overview and float(top.get("score") or 0) < _SEMANTIC_STRONG:
-        try:
-            from services.kb_service import _embedding_similarity
-
-            best = top
-            best_s = _adjusted(top)
-            for cand in ranked[:4]:
-                chunk = (cand.get("chunk") or "").strip()
-                if not chunk:
-                    continue
-                sim = _embedding_similarity(query, re.sub(r"<br\s*/?>", " ", chunk))
-                combined = _adjusted(cand) * 0.55 + sim * 0.45
-                if combined > best_s + 0.02:
-                    best = cand
-                    best_s = combined
-            return best
-        except Exception:
-            pass
-
+    by_raw = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)
+    top = by_raw[0]
+    # Tiny soft nudge only among near-ties (≤0.02 raw gap) — never suppress winner.
+    cat = (query_category or "general").strip().lower()
+    if cat and cat not in ("", "general") and len(by_raw) > 1:
+        gap = float(by_raw[0].get("score") or 0) - float(by_raw[1].get("score") or 0)
+        if gap <= 0.02:
+            for cand in by_raw[:4]:
+                src = (cand.get("source") or "").lower()
+                if cat in src or src == cat:
+                    if float(cand.get("score") or 0) + 1e-9 >= float(top.get("score") or 0) - 0.02:
+                        return cand
     return top
 
 
+# Topic labels from KB-turn LLM — keys are ALWAYS empty (unscoped semantic).
+# Predefined file maps removed: Admin CRUD docs are discovered via Qdrant.
 KB_TOPIC_KEYS: dict[str, list[str]] = {
-    "delivery_shipping": ["shipping", "faqs"],
-    "refund_return_policy": ["refund", "faqs", "shipping"],
-    "payment_fees": ["payment", "faqs"],
-    "company_faq": ["company", "faqs"],
-    "welfog_social": ["company"],
-    "seller": ["seller", "support"],
-    "contact_support": ["support", "faqs"],
-    "privacy_terms": ["privacy", "terms", "faqs"],
-    "order_howto": ["faqs", "welfog_api"],
-    "general_faq": ["faqs"],
-    "none": ["faqs"],
+    "delivery_shipping": [],
+    "refund_return_policy": [],
+    "payment_fees": [],
+    "company_faq": [],
+    "welfog_social": [],
+    "seller": [],
+    "contact_support": [],
+    "privacy_terms": [],
+    "order_howto": [],
+    "general_faq": [],
+    "none": [],
 }
+
+
+def kb_keys_for_topic(topic: str | None) -> list[str]:
+    """No hardcoded file list — empty means full-catalog semantic retrieval."""
+    _ = topic
+    return []
 
 
 def ai_classify_kb_turn(
@@ -995,7 +923,7 @@ def analyze_informational_knowledge_turn(
             )
             if kb_turn_is_informational(kb_cls):
                 topic = (kb_cls.get("kb_topic") or "general_faq").strip().lower()
-                keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+                keys = kb_keys_for_topic(topic)
                 um = (kb_cls.get("user_meaning_en") or "").strip()
                 if um:
                     out.retrieval_query = build_semantic_retrieval_query(
@@ -1036,7 +964,7 @@ def analyze_informational_knowledge_turn(
             out.source = "heuristic"
             out.confidence = 0.92
             out.handler = "order_id_help_kb"
-            out.kb_keys = list((ai_route or {}).get("kb_keys") or ["faqs", "welfog_api_order_id"])
+            out.kb_keys = list((ai_route or {}).get("kb_keys") or [])
             out.reason = "Where to find Order ID — KB steps."
             return out
         if _text_has_order_placement_intent(comb_early):
@@ -1044,7 +972,7 @@ def analyze_informational_knowledge_turn(
             out.source = "heuristic"
             out.confidence = 0.9
             out.handler = "order_placement_kb"
-            out.kb_keys = list((ai_route or {}).get("kb_keys") or ["faqs"])
+            out.kb_keys = list((ai_route or {}).get("kb_keys") or [])
             out.reason = "How to place order — KB steps."
             return out
 
@@ -1060,7 +988,7 @@ def analyze_informational_knowledge_turn(
             out.source = "ai_route"
             out.confidence = 0.88
             out.handler = "wishlist_howto_kb"
-            out.kb_keys = list((ai_route or {}).get("kb_keys") or ["faqs", "welfog_api_wishlist"])
+            out.kb_keys = list((ai_route or {}).get("kb_keys") or [])
             out.reason = "Wishlist how-to in app — KB steps (Groq account_list_kind)."
             return out
         from services.account_list_semantics import turn_requests_purchase_history_in_chat
@@ -1161,24 +1089,24 @@ def analyze_informational_knowledge_turn(
                 out.confidence = 0.9
                 out.source = "keyword_failsafe"
                 out.handler = "dynamic_kb"
-                out.kb_keys = ["company", "privacy"]
-                out.reason = "Keyword failsafe: Grievance Officer — company KB."
+                out.kb_keys = []
+                out.reason = "Keyword failsafe: Grievance Officer — semantic KB."
                 return out
             if message_is_welfog_about_request(comb_early):
                 out.is_informational = True
                 out.confidence = 0.88
                 out.source = "keyword_failsafe"
                 out.handler = "welfog_about_kb"
-                out.kb_keys = ["company", "faqs"]
-                out.reason = "Keyword failsafe: What is Welfog — company KB."
+                out.kb_keys = []
+                out.reason = "Keyword failsafe: What is Welfog — semantic KB."
                 return out
             if _text_has_past_order_complaint_context(comb_early):
                 out.is_informational = True
                 out.confidence = 0.86
                 out.source = "keyword_failsafe"
                 out.handler = "dynamic_kb"
-                out.kb_keys = ["refund", "faqs", "shipping"]
-                out.reason = "Keyword failsafe: wrong/damaged item — refund KB."
+                out.kb_keys = []
+                out.reason = "Keyword failsafe: wrong/damaged item — semantic KB."
                 return out
         except ImportError:
             pass
@@ -1247,15 +1175,17 @@ def analyze_informational_knowledge_turn(
     )
     if hit:
         score = float(hit.get("score") or 0)
-        src = (hit.get("source") or "").strip().lower()
-        if src == "faqs" and score >= 0.18:
+        src = (hit.get("source") or "").strip()
+        if score >= 0.18:
             out.is_informational = True
             out.confidence = min(0.92, 0.6 + score * 0.35)
             out.source = "embedding"
             out.kb_hit = hit
-            out.kb_keys = ["faqs"]
+            out.kb_keys = [src] if src else []
             out.handler = "kb_grounded_ai" if score >= 0.28 else "dynamic_kb"
-            out.reason = f"FAQ knowledge match (faqs.txt score={score:.2f})."
+            out.reason = f"KB knowledge match ({src or 'kb'} score={score:.2f})."
+            if score >= _SEMANTIC_STRONG:
+                out.handler = "kb_grounded_ai"
             return out
         if score >= _SEMANTIC_STRONG or (
             isinstance(score, int) and score >= 3
@@ -1264,7 +1194,6 @@ def analyze_informational_knowledge_turn(
             out.confidence = min(0.92, 0.55 + score * 0.35 if score <= 1 else 0.55 + score * 0.08)
             out.source = "embedding"
             out.kb_hit = hit
-            src = (hit.get("source") or "").strip()
             out.kb_keys = [src] if src else []
             out.reason = f"Strong KB embedding match (score={score:.2f})."
             if score >= _SEMANTIC_STRONG:
@@ -1436,7 +1365,7 @@ def resolve_informational_kb_route(
             source=source,
             intent="general",
             handler=handler,
-            kb_keys=keys or ["faqs"],
+            kb_keys=keys or [],
             kb_hit=semantic.kb_hit,
             kb_min_score=_SEMANTIC_MIN,
             reason=semantic.reason or "Semantic KB match.",
@@ -1460,8 +1389,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="general",
                 handler="dynamic_kb",
-                kb_keys=["company", "privacy"],
-                reason="Keyword failsafe: Grievance Officer — company KB.",
+                kb_keys=[],
+                reason="Keyword failsafe: Grievance Officer — semantic KB.",
             )
 
         if _text_asks_customer_care_contact(comb) and not _user_requests_grievance_channel(comb):
@@ -1469,8 +1398,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="general",
                 handler="customer_care_kb",
-                kb_keys=["support"],
-                reason="Keyword failsafe: customer-care contact.",
+                kb_keys=[],
+                reason="Keyword failsafe: customer-care contact — semantic KB.",
             )
 
         if message_is_welfog_about_request(comb):
@@ -1478,8 +1407,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="general",
                 handler="welfog_about_kb",
-                kb_keys=["company", "faqs"],
-                reason="Keyword failsafe: What is Welfog.",
+                kb_keys=[],
+                reason="Keyword failsafe: What is Welfog — semantic KB.",
             )
 
         if _text_is_refund_return_policy_howto(comb) or message_needs_policy_answer(comb):
@@ -1487,8 +1416,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="refund",
                 handler="dynamic_kb",
-                kb_keys=["refund", "faqs", "shipping"],
-                reason="Keyword failsafe: return/refund policy.",
+                kb_keys=[],
+                reason="Keyword failsafe: return/refund policy — semantic KB.",
             )
 
         if message_is_seller_on_welfog_request(comb):
@@ -1496,8 +1425,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="seller",
                 handler="seller_kb",
-                kb_keys=["seller", "support"],
-                reason="Keyword failsafe: seller account.",
+                kb_keys=[],
+                reason="Keyword failsafe: seller account — semantic KB.",
             )
 
         if message_is_knowledge_information_request(comb, conversation_context):
@@ -1511,8 +1440,8 @@ def resolve_informational_kb_route(
                 source="kb",
                 intent="general",
                 handler="dynamic_kb",
-                kb_keys=keys or ["faqs"],
-                reason="Keyword failsafe: policy / FAQ.",
+                kb_keys=keys or [],
+                reason="Keyword failsafe: policy / FAQ — semantic KB.",
             )
 
     if semantic.is_informational and semantic.source == "ai_route":
@@ -1556,7 +1485,7 @@ def resolve_informational_kb_route(
         source="kb",
         intent="general",
         handler="dynamic_kb",
-        kb_keys=keys or ["faqs"],
+        kb_keys=keys or [],
         reason=semantic.reason or "Informational KB fallback.",
     )
 
@@ -1667,15 +1596,11 @@ def try_ai_first_kb_early_reply(
 
     if preflight:
         try:
-            from services.turn_intent_coordinator import (
-                kb_classified_as_live_api,
-                kb_turn_is_informational,
-                store_kb_turn_classification,
-                structural_skip_kb_turn_classifier,
-            )
+            from services.turn_intent_coordinator import structural_skip_kb_turn_classifier
             from services.kb_service import (
                 KB_DIRECT_MIN_SCORE,
                 best_kb_hit,
+                build_kb_retrieval_query,
                 format_direct_reply_from_kb_hit,
             )
             from services.translation_service import resolve_customer_reply_lang
@@ -1685,47 +1610,35 @@ def try_ai_first_kb_early_reply(
             ):
                 return None
 
-            classified = ai_classify_kb_turn(
-                original_msg,
-                msg_en,
-                conversation_context,
-                reply_lang=reply_lang,
-                ai_route=ai_route,
-                preflight=True,
-            )
-            store_kb_turn_classification(
-                original_msg,
-                msg_en,
-                conversation_context,
-                reply_lang,
-                classified,
-            )
-
-            if not classified:
-                log_reasoning(
-                    "KB preflight — AI classify unavailable; defer to brain/catalog."
-                )
-                return None
-            if kb_classified_as_live_api(classified):
-                log_reasoning(
-                    "KB preflight — AI: live API/catalog turn; skip vector KB."
-                )
-                return None
-            if not kb_turn_is_informational(classified):
-                log_reasoning(
-                    "KB preflight — AI: not informational KB; skip vector KB."
-                )
-                return None
-
-            topic = (classified.get("kb_topic") or "general_faq").strip().lower()
-            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
-            um = (classified.get("user_meaning_en") or "").strip()
-            rq = um or comb
+            # Vector-first preflight — no classifier LLM (saves 1–12s + LLM budget).
+            # Brain still owns routing when there is no strong KB hit.
             rl = reply_lang or resolve_customer_reply_lang(original_msg)
+            rq = build_kb_retrieval_query(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route={"_preflight_kb": True, "reply_lang": rl},
+            ) or comb
+            # Short Hinglish without English gloss often ranks the wrong chunk
+            # (e.g. contact) — defer to brain user_meaning for accurate retrieval.
+            try:
+                from services.translation_service import text_usable_as_english_retrieval
 
-            kb_body = ""
-            hit = best_kb_hit(rq, keys=keys, min_score=KB_DIRECT_MIN_SCORE)
-            if hit and float(hit.get("score") or 0) >= KB_DIRECT_MIN_SCORE:
+                gloss_head = (rq.split("—")[0] or "").strip()
+                if (
+                    gloss_head
+                    and not text_usable_as_english_retrieval(gloss_head)
+                    and len(re.findall(r"[a-z0-9]+", gloss_head.lower())) <= 10
+                ):
+                    log_reasoning(
+                        "KB preflight — no English retrieval gloss; defer to brain."
+                    )
+                    return None
+            except ImportError:
+                pass
+            floor = max(0.18, float(KB_DIRECT_MIN_SCORE))
+            hit = best_kb_hit(rq, keys=None, min_score=floor)
+            if hit and float(hit.get("score") or 0) >= floor:
                 kb_body = format_direct_reply_from_kb_hit(
                     hit,
                     original_msg,
@@ -1733,11 +1646,11 @@ def try_ai_first_kb_early_reply(
                     retrieval_query=rq,
                     fast_lane=True,
                 ) or ""
-            if kb_body:
-                log_reasoning(
-                    f"KB preflight — AI topic={topic} + scoped vector ({keys[:3]})."
-                )
-                return kb_body
+                if kb_body:
+                    log_reasoning(
+                        f"KB preflight — vector-first hit score={float(hit.get('score') or 0):.3f} (no classify LLM)."
+                    )
+                    return kb_body
 
             try:
                 from services.kb_service import direct_kb_search
@@ -1745,39 +1658,16 @@ def try_ai_first_kb_early_reply(
                 kb_body = direct_kb_search(
                     rq,
                     keys=None,
-                    min_score=max(0.18, KB_DIRECT_MIN_SCORE - 0.04),
+                    min_score=floor,
                     zero_llm_fast=True,
                 ) or ""
                 if kb_body:
-                    log_reasoning(
-                        f"KB preflight — AI topic={topic} + full KB vector fallback."
-                    )
+                    log_reasoning("KB preflight — vector-first full KB hit (no classify LLM).")
                     return kb_body
             except ImportError:
                 pass
 
-            try:
-                from services.kb_service import format_dynamic_kb_answer
-
-                dyn = format_dynamic_kb_answer(
-                    original_msg,
-                    msg_en,
-                    reply_lang=rl,
-                    conversation_context=conversation_context,
-                    suggested_keys=keys,
-                    ai_route={"user_meaning": um} if um else None,
-                )
-                if dyn and dyn.strip():
-                    log_reasoning(
-                        f"KB preflight — AI topic={topic} + dynamic KB answer."
-                    )
-                    return dyn
-            except ImportError:
-                pass
-
-            log_reasoning(
-                f"KB preflight — AI topic={topic} but no KB hit; defer to brain."
-            )
+            log_reasoning("KB preflight — no strong vector hit; defer to brain.")
             return None
         except ImportError:
             return None
@@ -1859,10 +1749,26 @@ def try_ai_first_kb_early_reply(
                     if kb_body:
                         log_reasoning("KB vector from brain channel=kb (zero extra LLM).")
                         return kb_body
-                if scope in ("out_of_domain", "general_chitchat", "harm_sensitive"):
-                    return None
-                if intent == "out_of_domain":
-                    return None
+                if scope in ("out_of_domain", "general_chitchat", "harm_sensitive") or intent == "out_of_domain":
+                    # Last chance: Admin indexed knowledge may still answer (Brain mislabeled OOD).
+                    try:
+                        from services.kb_service import promote_route_from_semantic_kb_match
+
+                        rescued = promote_route_from_semantic_kb_match(
+                            brain, original_msg, msg_en=msg_en
+                        )
+                        if rescued:
+                            brain = rescued
+                            intent = (brain.get("intent") or "").strip().lower()
+                            scope = (brain.get("conversation_scope") or "").strip().lower()
+                            meaning = (brain.get("user_meaning") or "").strip()
+                            keys = list(brain.get("kb_keys") or [])
+                        else:
+                            return None
+                    except ImportError:
+                        return None
+                    if scope in ("out_of_domain", "general_chitchat", "harm_sensitive") or intent == "out_of_domain":
+                        return None
                 meaning = (brain.get("user_meaning") or "").strip()
                 keys = list(brain.get("kb_keys") or [])
                 rh = (brain.get("route_handler") or "").strip().lower()
@@ -1972,10 +1878,10 @@ def try_ai_first_kb_early_reply(
                 if social_body:
                     return social_body
 
-            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+            keys = kb_keys_for_topic(topic)
             body = direct_kb_search(
                 retrieval_q,
-                keys=keys,
+                keys=None,
                 min_score=KB_DIRECT_MIN_SCORE,
                 zero_llm_fast=True,
             )
@@ -2141,6 +2047,20 @@ def try_kb_informational_locked_reply(
             route = get_cached_brain_route()
         except ImportError:
             route = None
+
+    try:
+        from services.chat_flow_telemetry import should_skip_post_pincode_route_steal
+
+        if should_skip_post_pincode_route_steal("try_kb_informational_locked_reply"):
+            return None
+    except ImportError:
+        pass
+    if isinstance(route, dict) and (
+        route.get("_pincode_delivery_locked")
+        or (route.get("intent") or "").strip().lower() == "pincode_check"
+        or (route.get("route_handler") or "").strip().lower() == "pincode_delivery_api"
+    ):
+        return None
 
     try:
         from services.ai_route_semantics import brain_route_indicates_product_catalog

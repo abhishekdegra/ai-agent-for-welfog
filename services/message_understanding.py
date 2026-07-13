@@ -1250,9 +1250,10 @@ def _apply_ai_route_corrections_body(
         out["search_query"] = ""
         out["data_channel"] = "kb"
         out["route_handler"] = "dynamic_kb"
-        out["kb_keys"] = ["terms", "seller", "privacy"]
+        # Empty keys → unscoped Admin semantic retrieval (any indexed doc can win).
+        out["kb_keys"] = []
         out.pop("handler", None)
-        log_reasoning("Safety: short video / shorts rules — terms+seller KB (KB-only, concise).")
+        log_reasoning("Safety: short video / shorts rules — semantic Admin KB.")
         return out
 
     if (

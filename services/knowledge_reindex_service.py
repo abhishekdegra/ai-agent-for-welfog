@@ -14,6 +14,7 @@ from services.mysql_service import (
     bump_knowledge_document_version,
     create_knowledge_document_record,
     delete_knowledge_document_chunks,
+    delete_knowledge_document_chunks_except_version,
     delete_knowledge_document_record,
     get_knowledge_document_by_id,
     get_knowledge_document_by_title,
@@ -22,6 +23,7 @@ from services.mysql_service import (
 )
 from services.qdrant_service import (
     delete_knowledge_vectors_by_doc_id,
+    delete_knowledge_vectors_by_doc_id_except_version,
     ensure_qdrant_collection,
     is_qdrant_configured,
     qdrant_config,
@@ -114,13 +116,36 @@ def reindex_knowledge_document_on_create(doc_id: int) -> dict[str, Any]:
     return result
 
 
+def _delete_qdrant_vectors_except_version(doc_id: int, keep_version: int) -> dict[str, Any]:
+    if not is_qdrant_configured():
+        return {"ok": True, "skipped": True, "reason": "qdrant_disabled"}
+    collection = _qdrant_collection()
+    if not collection:
+        return {"ok": False, "error": "qdrant_collection_missing"}
+    ensure_qdrant_collection()
+    try:
+        delete_knowledge_vectors_by_doc_id_except_version(
+            collection, int(doc_id), int(keep_version)
+        )
+        return {
+            "ok": True,
+            "doc_id": int(doc_id),
+            "keep_version": int(keep_version),
+            "collection": collection,
+        }
+    except Exception as exc:
+        return {"ok": False, "doc_id": int(doc_id), "error": str(exc)}
+
+
 def reindex_knowledge_document_on_update(doc_id: int, content: str) -> dict[str, Any]:
     """
-    Update flow:
-    - increment version
-    - delete previous Qdrant vectors
-    - regenerate chunks + embeddings
-    - upsert new vectors
+    Update flow (atomic for chat):
+    - bump version + mark index_status=processing (excluded from retrieval)
+    - keep previous Qdrant vectors until new version is upserted
+    - regenerate chunks + embeddings for the new version
+    - upsert new vectors, then delete older version vectors
+    - drop older MySQL chunks
+    - indexer sets index_status=indexed (document becomes retrievable again)
     """
     doc = get_knowledge_document_by_id(doc_id)
     if not doc:
@@ -141,22 +166,39 @@ def reindex_knowledge_document_on_update(doc_id: int, content: str) -> dict[str,
     old_version = bump.get("old_version")
     new_version = bump.get("new_version")
 
-    qdrant_del = _delete_qdrant_vectors_for_doc(doc_id)
+    # Do NOT delete Qdrant first — processing status already hides this doc from retrieval.
+    result = _chunk_and_embed_document(doc_id, replace_all_versions=False)
+    if not result.get("ok"):
+        result.update(
+            {
+                "operation": "update",
+                "old_version": old_version,
+                "new_version": new_version,
+            }
+        )
+        print(
+            f"[kb-reindex] update failed doc_id={doc_id} v{old_version}->v{new_version}",
+            flush=True,
+        )
+        return result
+
+    qdrant_del = _delete_qdrant_vectors_except_version(doc_id, int(new_version or 1))
     if not qdrant_del.get("ok") and not qdrant_del.get("skipped"):
         set_knowledge_document_index_status(doc_id, "failed")
         return {
             "ok": False,
             "operation": "update",
             "doc_id": doc_id,
-            "stage": "qdrant_delete",
+            "stage": "qdrant_prune_old",
             "error": qdrant_del.get("error"),
             "old_version": old_version,
             "new_version": new_version,
+            "chunk_result": result.get("chunk_result"),
+            "index_result": result.get("index_result"),
         }
 
-    delete_knowledge_document_chunks(doc_id)
+    delete_knowledge_document_chunks_except_version(doc_id, int(new_version or 1))
 
-    result = _chunk_and_embed_document(doc_id, replace_all_versions=True)
     result.update(
         {
             "operation": "update",
@@ -173,12 +215,15 @@ def reindex_knowledge_document_on_update(doc_id: int, content: str) -> dict[str,
 
 
 def reindex_knowledge_document_on_delete(doc_id: int) -> dict[str, Any]:
-    """Delete flow: remove Qdrant vectors + MySQL chunks + document row."""
+    """Delete flow: hide from retrieval first, then remove Qdrant + MySQL."""
     doc = get_knowledge_document_by_id(doc_id)
     if not doc:
         return {"ok": True, "operation": "delete", "doc_id": doc_id, "already_deleted": True}
 
     print(f"[kb-reindex] delete doc_id={doc_id} title={doc.get('title')}", flush=True)
+
+    # Exclude from grounded retrieval before vectors disappear.
+    set_knowledge_document_index_status(doc_id, "processing")
 
     qdrant_del = _delete_qdrant_vectors_for_doc(doc_id)
     chunks_deleted = delete_knowledge_document_chunks(doc_id)

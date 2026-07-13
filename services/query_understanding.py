@@ -3,7 +3,8 @@ Query understanding layer — enriches LLM routing before KB / API / AI answer.
 
 - Language, meaning, intent, entities, required action, confidence
 - Short/unclear turns: expand with recent conversation for retrieval + routing
-- Intent-filtered KB keys (never ground refund answers in payment-only files, etc.)
+- KB file eligibility is NOT filtered by predefined catalogs — semantic retrieval
+  selects among all active Admin documents
 - Low confidence → clarification in customer's language (no guessing)
 """
 from __future__ import annotations
@@ -14,24 +15,6 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from utils.reasoning_log import chat_log, log_reasoning
-
-# KB file stems allowed per intent (subset of customer keys; empty = use AI keys only).
-_INTENT_KB_HINTS: dict[str, frozenset[str]] = {
-    "refund": frozenset({"refund", "faqs", "terms", "shipping", "support"}),
-    "return": frozenset({"refund", "faqs", "terms", "shipping", "support"}),
-    "payment": frozenset({"payment", "faqs", "terms", "support"}),
-    "shipping": frozenset({"shipping", "faqs", "terms", "support", "refund"}),
-    "privacy": frozenset({"privacy", "faqs", "terms", "company"}),
-    "terms": frozenset({"terms", "faqs", "privacy", "company"}),
-    "seller": frozenset({"seller", "faqs", "support", "terms"}),
-    "general": frozenset(
-        {"faqs", "company", "support", "terms", "privacy", "payment", "refund", "shipping", "seller"}
-    ),
-    "pincode_check": frozenset({"faqs", "shipping", "support"}),
-    "order": frozenset({"faqs", "support", "refund", "shipping"}),
-    "order_history": frozenset({"faqs", "support"}),
-    "wishlist": frozenset({"faqs", "support"}),
-}
 
 _API_INTENTS = frozenset(
     {
@@ -367,11 +350,19 @@ def infer_kb_query_category(
         conversation_context=conversation_context,
     )
     if top_key and top_score >= 0.18:
-        stem = top_key.lower().replace("welfog_api_", "")
-        if stem in ("refund", "payment", "seller", "shipping", "privacy", "terms"):
-            return stem
+        # Soft topic label for logging only — never gates retrieval eligibility.
+        return top_key.lower().replace("welfog_api_", "")[:48] or "general"
 
-    if intent in _INTENT_KB_HINTS:
+    if intent and intent not in (
+        "product",
+        "order",
+        "order_history",
+        "wishlist",
+        "pincode_check",
+        "deals",
+        "categories",
+        "category_feed",
+    ):
         return intent
     return "general"
 
@@ -382,7 +373,13 @@ def scoped_kb_keys_for_retrieval(
     ai_route: dict | None = None,
     user_meaning: str = "",
 ) -> list[str]:
-    """Customer KB file keys allowed for this query category."""
+    """
+    All active customer Admin knowledge keys (dynamic catalog).
+
+    Brain kb_keys are soft hints only — never an allow-list that hides new docs.
+    Category is unused for eligibility (kept for call-site compat).
+    """
+    _ = (category, user_meaning)
     try:
         from services.kb_service import get_customer_kb_keys
 
@@ -391,19 +388,16 @@ def scoped_kb_keys_for_retrieval(
         return []
 
     route = ai_route or {}
-    raw_keys = list(route.get("kb_keys") or [])
-    cat = (category or "general").strip().lower()
-    filtered = filter_kb_keys_for_intent(raw_keys, cat, user_meaning=user_meaning or route.get("user_meaning") or "")
-    if filtered:
-        scoped = [k for k in filtered if k in customer]
-        if scoped:
-            return scoped
-
-    if cat in ("", "general"):
-        return list(customer)
-    allow = _INTENT_KB_HINTS.get(cat) or frozenset()
-    scoped = [k for k in customer if k in allow or any(h in k.lower() for h in allow)]
-    return scoped if scoped else list(customer)
+    raw_keys = filter_kb_keys_for_intent(
+        list(route.get("kb_keys") or []),
+        category or "general",
+        user_meaning=user_meaning or route.get("user_meaning") or "",
+    )
+    # Valid Brain hints first (soft), then full catalog for semantic coverage.
+    hinted = [k for k in raw_keys if k in customer]
+    if hinted:
+        return list(dict.fromkeys(hinted + list(customer)))
+    return list(customer)
 
 
 def filter_kb_keys_for_intent(
@@ -412,40 +406,23 @@ def filter_kb_keys_for_intent(
     *,
     user_meaning: str = "",
 ) -> list[str]:
-    """Drop KB files that do not match detected intent before retrieval/answer."""
-    keys = [k for k in (suggested_keys or []) if k]
-    if not keys:
-        return []
-    intent_l = (intent or "general").strip().lower()
-    allow = _INTENT_KB_HINTS.get(intent_l) or _INTENT_KB_HINTS.get("general")
-    if not allow:
-        return keys
+    """
+    Pass-through: never drop Admin documents via predefined intent catalogs.
 
-    meaning_l = (user_meaning or "").lower()
-    filtered: list[str] = []
-    for k in keys:
-        stem = k.lower().replace("welfog_api_", "").replace("welfog-api-", "")
-        if k in allow:
-            filtered.append(k)
-            continue
-        if any(h in stem for h in allow):
-            filtered.append(k)
-            continue
-        # Topic words in meaning → keep matching file
-        if "refund" in meaning_l and "refund" in stem:
-            filtered.append(k)
-        elif "payment" in meaning_l and "payment" in stem:
-            filtered.append(k)
-        elif "privacy" in meaning_l and "privacy" in stem:
-            filtered.append(k)
-        elif "seller" in meaning_l and "seller" in stem:
-            filtered.append(k)
+    Canonicalize keys only. Intent/user_meaning kept for call-site compat.
+    """
+    _ = (intent, user_meaning)
+    try:
+        from services.knowledge_keys import canonical_knowledge_key
+    except ImportError:
+        canonical_knowledge_key = lambda t: (t or "").strip().lower()  # noqa: E731
 
-    if not filtered and keys:
-        # Prefer faqs/support over unrelated API routing master
-        safe = [k for k in keys if k in ("faqs", "support", "company") or k in allow]
-        return safe[:3] if safe else keys[:2]
-    return list(dict.fromkeys(filtered))
+    out: list[str] = []
+    for k in suggested_keys or []:
+        ck = canonical_knowledge_key(str(k or ""))
+        if ck and ck not in out:
+            out.append(ck)
+    return out
 
 
 def build_query_understanding(
@@ -479,10 +456,6 @@ def build_query_understanding(
             conversation_context=conversation_context,
         )
     filtered = filter_kb_keys_for_intent(raw_keys, filter_intent, user_meaning=meaning)
-    if filter_intent == "payment" and "payment" in filtered:
-        filtered = ["payment"] + [k for k in filtered if k != "payment"]
-    elif filter_intent == "refund" and "refund" in filtered:
-        filtered = ["refund"]
     if intent in ("product", "order_history", "wishlist", "deals", "categories", "category_feed", "pincode_check"):
         filtered = [k for k in filtered if not k.startswith("welfog_api_routing")]
 

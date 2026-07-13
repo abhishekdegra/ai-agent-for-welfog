@@ -31,15 +31,9 @@ def _safe_print(msg: str) -> None:
 
 def _routing_master_for_prompt() -> str:
     files_map = get_runtime_knowledge_files()
-    path = files_map.get("welfog_api_routing_master")
-    if path and os.path.isfile(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                body = (f.read() or "").strip()
-            if body:
-                return body
-        except OSError:
-            pass
+    body = files_map.get("welfog_api_routing_master")
+    if isinstance(body, str) and body.strip():
+        return body.strip()
     return "(See intent list in schema.)"
 
 
@@ -188,10 +182,10 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "run_catalog_search": true/false,
   "meta_kind": "none" | "hostile" | "bot_latency" | "topic_denial" | "wrong_search_complaint" | "conversational" | "assistant_intro",
   "kb_keys": ["keys for KB answers only — empty if live_api/catalog handles it"],
-  "search_query": "English PRODUCT TYPE only (2-6 words) when run_catalog_search=true — jeans, mobile cover, iphone, pajama. NEVER brand/color/price/time words. Must match product_entities.product_name. Empty when not shopping.",
+  "search_query": "English searchable product noun (2-6 words) when run_catalog_search=true — jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama. Include brand/device WHEN user named it with the product. NEVER color/price/time/filler verbs. Must match product_entities.product_name. Empty when not shopping.",
   "product_entities": {{
-    "product_name": "English product type to search (mobile cover, jeans, iphone, water bottle) — no brand/color/price",
-    "brand": "Brand if mentioned (Redmi, Nike, Apple) else empty",
+    "product_name": "English searchable noun (iphone cover, samsung cover, nike shoes, jeans, flip flops) — include brand/device when user named it; no color/price/filler",
+    "brand": "Brand if mentioned (Redmi, Nike, Apple, Samsung) else empty",
     "color": "Color if mentioned (black, blue) else empty",
     "size": "Size if mentioned (S, M, L, kids) else empty",
     "price_min": null,
@@ -254,37 +248,39 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - PIN / delivery area / "can you deliver to X" / city name (Jaipur, Kota) / friend lives in an area (ANY language) → pincode_check, data_channel=live_api, needs_order_id=false, order_lookup_kind=none, run_catalog_search=false. This is NOT order tracking — never set intent=order or needs_order_id=true for hypothetical delivery to a place. Clear city → live geocode+API; vague place → ask for 6-digit PIN. Extract PIN when present.
 - Product availability ON Welfog ("welfog pe chawal milega", "do you sell rice on welfog", "kya milta hai welfog par") → intent=product, data_channel=catalog, run_catalog_search=true — NOT pincode_check unless they ask delivery to a named city/PIN/address.
 - Existing order timeline (shipment/courier/status/not received) → order + order_lookup_kind=track, needs_order_id=true. Do not confuse with pincode_check.
-- Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style) → intent=product, data_channel=catalog, run_catalog_search=true. Fill product_entities with ALL filters the user asked for; search_query = product_entities.product_name (product TYPE only in English).
+- Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style/typo) → intent=product, data_channel=catalog, run_catalog_search=true. Fill product_entities with ALL filters; search_query = product_entities.product_name (searchable English noun — include brand/device when user named it with the product).
 - PRODUCT ENTITIES (critical — backend uses these for OpenSearch filters, not raw customer text):
-  * product_name = what to find (jeans, mobile cover, iphone, pajama, water bottle, track pants) — NEVER put brand/color/price/time words (night, black, redmi) in product_name.
-  * brand = manufacturer/company ONLY (Redmi, Infinix, Nike, BoAt) — NEVER product type.
-  * NEVER set brand to product_name or product type (mobile cover, iphone cover, shirt are NOT brands).
+  * product_name = searchable catalog noun (jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama) — INCLUDE brand/device when user named it WITH the product. NEVER color/price/time/filler verbs (dikhao, h kya).
+  * brand = manufacturer/company ONLY (Redmi, Infinix, Nike, BoAt, Samsung) — NEVER product type alone.
+  * NEVER set brand to product_name or product type (mobile cover, shirt are NOT brands; "iphone cover" is a product_name, not a brand).
   * If user did not name a brand, leave brand="" — search by product_name/title only.
-  * "iphone cover" without "apple" → product_name=iphone cover, brand="" (NOT Apple).
+  * "iphone cover" / "iphone ka cover" → product_name=iphone cover, brand=iphone (or brand="" if you put iphone only in product_name — prefer BOTH product_name=iphone cover AND brand=iphone).
   * "under 150 rs" / "150 se kam" / "150 rs ke andar" / "200rs ke andar andar" → price_max=number. ALWAYS set price_max when user gives a rupee budget — keep brand/color filters too.
   * "above 500" → price_min=500.
   * product_intent + allow_related_fallback + related_search_terms: REQUIRED on every product_entities — backend has no fixed product keyword lists.
   * device (phone/handset/laptop device): product_intent=device, allow_related_fallback=true, related_search_terms=closest related Welfog catalog type in English, exclude_title_tokens=accessory words that would pollute THIS device search (you choose per product).
   * exact accessory/part (cover, charger, cable, jeans, shirt, bottle…): product_intent=accessory or general, allow_related_fallback=false, related_search_terms="".
-  * "redmi mobile cover" → product_name=mobile cover, brand=Redmi.
+  * "redmi mobile cover" / "redmi ke covers" → product_name=redmi cover (or mobile cover), brand=Redmi — NEVER drop brand to only "mobile cover" without setting brand.
+  * "sam sung ka cover" / spaced brand typos → brand=Samsung, product_name=samsung cover.
+  * "nike shoes h kya" / availability ("hai kya", "h kya", "milega") → still product shopping: product_name=nike shoes, brand=Nike.
   * "black mobile covers" → product_name=mobile cover, color=black.
   * product id / pro_id + cover → numeric_context=product_id, product_id=that number, product_name=mobile cover (accessory for that product).
   * SKU "Xiaomi-SK" → sku=Xiaomi-SK (keep hyphen exactly). numeric_context=none for SKU-only turns.
   * pajama / night wear → product_name=pajama or nightwear — NEVER put "night" in brand.
   * kids / bachche → size=kids when user shops for children.
   * Hinglish patterns (MUST fill product_entities — never leave empty on product turns):
-    - "infinix mobile ka cover chahiye" / "dost ko X cover" → product_name=mobile cover, brand=Infinix (or named brand).
-    - "redmi ke covers dikha" / "X ke cover dikhao" → product_name=mobile cover, brand=Redmi (brand from X).
-    - "behan ke liye iphone cover" → product_name=mobile cover, brand=Apple (iphone accessory).
+    - "infinix mobile ka cover chahiye" / "dost ko X cover" → product_name=infinix cover (or mobile cover), brand=Infinix.
+    - "redmi ke covers dikha" / "X ke cover dikhao" → product_name=redmi cover, brand=Redmi.
+    - "behan ke liye iphone cover" → product_name=iphone cover, brand=iphone.
     - ANY brand user names (BoAt, Noise, Itel, Lava, etc.) → put in product_entities.brand — do not limit to famous brands.
-  * mandatory_match_tokens: when user names ANY specific model/device/brand product (any language/style), set 1-4 English title tokens that MUST appear in catalog results — you infer from meaning, not fixed lists. Examples: iphone cover → ["iphone"]; philips trimmer → ["philips","trimmer"]; redmi note 10 case → ["redmi","note"]. Do NOT use generic type words alone (cover, shirt, bottle). REQUIRED when a named product/model/brand is the focus.
+  * mandatory_match_tokens: when user names ANY specific model/device/brand product (any language/style), set 1-4 English title tokens that MUST appear in catalog results — you infer from meaning, not fixed lists. Examples: iphone cover → ["iphone","cover"]; philips trimmer → ["philips","trimmer"]; redmi note 10 case → ["redmi","note"]. Do NOT use generic type words alone (cover, shirt, bottle). REQUIRED when a named product/model/brand is the focus.
   * product_entities is REQUIRED when run_catalog_search=true — never empty product_name AND empty brand on a named-product browse.
 - Today's deals / offers / discounts / flash sale (ANY language) → intent=deals, data_channel=live_api, run_catalog_search=false, needs_order_id=false. NOT a product named "deals".
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
 - Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="" unless user also named a product type.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
-- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new .txt file is added. Seller → intent=seller. Grievance → company+privacy KB. Wrong/damaged item policy → refund KB (NOT order_history). Off-topic → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help — those are KB only.
-- Personal life, marriage, dating, jokes, homework, politics, sports scores, other apps — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys.
+- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to, OR any topic covered by an Admin knowledge document in the catalog above) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new document is added — if the catalog lists it, it is IN SCOPE (welfog_support), never out_of_domain. Seller → intent=seller. Grievance → company+privacy KB when those keys exist. Wrong/damaged item policy → refund KB when present (NOT order_history). Truly off-platform topics with NO matching catalog document → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help — those are KB only.
+- Personal life, marriage, dating, jokes, homework, sports scores, other apps — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain — UNLESS the user is asking about Welfog platform rules/policies that appear in the Admin knowledge catalog (e.g. allowed/prohibited content on Welfog Reels/shorts). Catalog-covered platform policy questions → data_channel=kb, conversation_scope=welfog_support, is_welfog_related=true. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys when catalog keys exist; empty kb_keys is OK when unsure — retrieval will pick semantically.
 - General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company → kb company (NOT assistant_intro).
 - Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=2-3 sentences mirroring the user's EXACT language, script, and slang (Hinglish stays Hinglish — never default to stiff English "Hi there I'm the Welfog assistant"), run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
@@ -438,7 +434,7 @@ RULES:
 - Answer ONLY what the user asked when it is in-scope; keep the "response" concise (no extra sections, no unrelated marketing). Match answer length to question — one-line question → 1-3 sentences, not a full policy essay.
 - SELLER LOGIN: If user reports seller login/OTP/panel error, give login troubleshooting bullets from seller knowledge — NOT "how to become seller" registration steps. After failed attempts, add customer care contact from KB.
 - SERVICE CHARGES: If user asks about fees/charges on Welfog, answer only from payment knowledge (checkout display, COD/premium return fees) in 2-4 sentences — no order-tracking or greeting text.
-- SHORT VIDEO / SHORTS / REELS: Rules come from terms (Short Video Content Rules), seller (Supplier Promotional Videos, ASCI), privacy (age/consent). intent=general, data_channel=kb, kb_keys terms+seller+privacy. NEVER say "no restrictions" if KB lists prohibited content. NEVER invent quality/timing/brand-image rules not in KB.
+- SHORT VIDEO / SHORTS / REELS: Answer only from Admin knowledge excerpts provided for this turn (any Admin document may contain the rules). intent=general, data_channel=kb. Leave kb_keys empty or use catalog keys that match — never invent file names. NEVER say "no restrictions" if KB lists prohibited content. NEVER invent quality/timing/brand-image rules not in KB.
 - KB-ONLY FACTS: Every policy/fee/rule sentence must come from KNOWLEDGE BASE text provided. If a detail is not in the context, say it is not in the available knowledge — do NOT guess or use generic filler ("follow guidelines", "maintain brand image").
 - LIVE API DATA: If LIVE ACCOUNT/API DATA is present, use it for order/refund/payment status facts; use KB for policy/how-to context. If they conflict on status, trust LIVE data.
 - NEVER write bracket placeholders like [insert phone number from KB] or [insert ...] — copy exact phone/email/dates from the knowledge text, or omit that line entirely.

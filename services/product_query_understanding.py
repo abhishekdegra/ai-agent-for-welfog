@@ -22,6 +22,67 @@ _HINDI_GRAIN_DROP = frozenset(
 )
 
 
+def ensure_branded_product_search_terms(
+    ai: Optional[dict],
+    original_msg: str = "",
+    msg_en: str = "",
+) -> Optional[dict]:
+    """
+    Structural repair only (any catalog product): if brand is known and missing from
+    search_terms, prepend brand + mark strict. No product-type keyword lists —
+    noun phrase comes from Product NLU / LLM.
+    """
+    if not ai or not isinstance(ai, dict):
+        return ai
+    out = dict(ai)
+    brand = (out.get("brand") or "").strip()
+    if not brand:
+        comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        if comb:
+            try:
+                from services.opensearch_products import (
+                    _extract_brand_literal_from_text,
+                    _infer_brand_from_message,
+                )
+
+                brand = (
+                    _infer_brand_from_message(comb)
+                    or _extract_brand_literal_from_text(comb)
+                    or ""
+                )
+            except ImportError:
+                brand = ""
+    if not brand:
+        return out
+
+    bl = brand.strip().lower()
+    st = (out.get("search_terms") or "").strip()
+    st_compact = re.sub(r"[^a-z0-9]", "", st.lower())
+    bl_compact = re.sub(r"[^a-z0-9]", "", bl)
+    out["brand"] = brand
+
+    aliases = list(out.get("brand_aliases") or [])
+    for a in (bl, bl.replace(" ", ""), brand):
+        al = str(a).strip().lower()
+        if al and al not in {x.lower() for x in aliases}:
+            aliases.append(al)
+    out["brand_aliases"] = aliases
+
+    if st and bl_compact and bl_compact not in st_compact:
+        out["search_terms"] = f"{bl} {st}".strip()
+        out["match_mode"] = "strict"
+        toks = list(out.get("mandatory_match_tokens") or [])
+        if bl not in {str(x).lower() for x in toks}:
+            toks.insert(0, bl)
+        out["mandatory_match_tokens"] = toks
+        log_reasoning(
+            f"Brand merged into search_terms: brand={brand!r} terms={out['search_terms']!r}"
+        )
+    else:
+        out["match_mode"] = out.get("match_mode") or ("strict" if st else out.get("match_mode"))
+    return out
+
+
 def align_search_terms_with_message(original_msg: str, search_terms: str) -> str:
     """Ensure extracted terms match grains user said — clean English only (basmati wheat)."""
     if not (original_msg or "").strip():
@@ -52,11 +113,70 @@ def scrub_conversational_tail_from_terms(terms: str) -> str:
     return re.sub(r"\s+", " ", t).strip()
 
 
+def soft_collapse_repeated_letters(text: str) -> str:
+    """
+    Algorithmic typo soften (not a product dictionary):
+    - vowel runs → single (fliipflops→flipflops, baniiyan→baniyan, iphonee→iphone)
+    - consonant runs of 3+ → single (samsunggg→samsung)
+    Use as search VARIANT / primary when the model echoed raw keysmash.
+    """
+    t = (text or "").lower()
+    if not t:
+        return t
+    t = re.sub(r"([aeiou])\1+", r"\1", t)
+    t = re.sub(r"([b-df-hj-np-tv-z])\1{2,}", r"\1", t)
+    return t
+
+
+def soften_echoed_typo_search_terms(terms: str) -> str:
+    """If search_terms still contain repeated letters, collapse them for catalog match."""
+    raw = re.sub(r"\s+", " ", (terms or "").strip().lower())
+    if not raw:
+        return raw
+    if not re.search(r"(.)\1", raw):
+        return raw
+    parts = []
+    for tok in raw.split():
+        if re.search(r"(.)\1", tok):
+            soft = soft_collapse_repeated_letters(tok)
+            # After collapsing keysmash, prefer a balanced space split when the
+            # token is still a long compound (fliipflops→flipflops→flip flops).
+            if soft and " " not in soft and len(re.sub(r"[^a-z0-9]", "", soft)) >= 8:
+                spaced = _prefer_balanced_compound_space(soft)
+                parts.append(spaced or soft)
+            else:
+                parts.append(soft)
+        else:
+            parts.append(tok)
+    return " ".join(parts).strip()
+
+
+def _prefer_balanced_compound_space(token: str) -> str:
+    """Algorithmic mid-split for compounds — not a product dictionary."""
+    t = re.sub(r"[^a-z0-9]", "", (token or "").lower())
+    if len(t) < 8:
+        return token
+    best = token
+    best_score = 10**9
+    for i in range(3, len(t) - 2):
+        left, right = t[:i], t[i:]
+        if not (left.isalpha() and right.isalpha()):
+            continue
+        score = abs(len(left) - len(right))
+        # Slight preference for splits near the middle.
+        score += abs(i - len(t) / 2) * 0.01
+        if score < best_score:
+            best_score = score
+            best = f"{left} {right}"
+    return best
+
+
 def polish_search_terms(terms: str, original_msg: str = "") -> str:
-    """User-facing + OpenSearch query: English only, no filler (no 'gehu dikhana wheat')."""
+    """User-facing + OpenSearch query: English only, drop conversational filler — not product dictionaries."""
     from services.opensearch_products import _extract_size_from_text, _strip_size_from_title_query
 
     terms = scrub_conversational_tail_from_terms(terms)
+    terms = soften_echoed_typo_search_terms(terms)
     if original_msg:
         terms = align_search_terms_with_message(original_msg, terms)
     size_val = _extract_size_from_text(f"{terms} {original_msg}")
@@ -69,6 +189,9 @@ def polish_search_terms(terms: str, original_msg: str = "") -> str:
     for w in re.findall(r"[a-z0-9]+", (terms or "").lower()):
         if len(w) < 2 or w in _FILLER_WORDS or w in _SHOW_TYPO_DROP:
             continue
+        # Morphological show-verbs (dikha/dika/dikhao…) — not product nouns.
+        if re.fullmatch(r"dik[a-z]{0,5}", w):
+            continue
         if has_en_grain and w in _HINDI_GRAIN_DROP:
             continue
         if w not in seen:
@@ -77,12 +200,13 @@ def polish_search_terms(terms: str, original_msg: str = "") -> str:
     return " ".join(words[:8]).strip()
 
 
-_SHOW_TYPO_DROP = frozenset({"shoe", "shwo", "sho", "showw", "shw"})
+_SHOW_TYPO_DROP = frozenset({"shwo", "sho", "showw", "shw"})
 
 _FILLER_WORDS = frozenset(
     {
         "mereko", "mujhe", "mere", "ko", "me", "mai", "main", "mene", "maine", "bhai", "sir",
-        "pls", "please", "dikha", "dikhao", "dikho", "dikhado", "dikhana", "dikhaa", "bata",
+        "pls", "please", "dikha", "dikhao", "dikho", "dikhado", "dikhana", "dikhaa", "dika",
+        "dikah", "dikh", "dikhao", "bata",
         "batao", "btao", "bta", "de", "do", "dena", "dedo", "chahiye", "chiye", "chaahiye",
         "milega", "milegi", "milta", "milti", "mil", "sakta", "skta", "sakti", "hai", "h",
         "he", "ho", "hun", "kya", "ky", "ka", "ke", "ki", "se", "liye", "wala", "wali", "wale",
@@ -517,9 +641,22 @@ def ai_extract_product_search(
     Use Groq to extract shopping intent from any wording.
     Returns dict with search_terms, color, brand, max_price, sku, reasoning — or None.
     """
-    system_prompt = f"""You extract Welfog PRODUCT SEARCH parameters from user messages.
+    system_prompt = f"""You extract Welfog PRODUCT ENTITIES from user messages.
+This is Product Entity Extraction — NOT Brain routing, NOT paraphrasing.
+
 Users write in English, Hinglish, Hindi, Tamil, Telugu, Bengali, Gujarati, Punjabi, Kannada, Malayalam, Marathi, Urdu, or mix.
 Messages may be indirect ("paani peene ke liye jug", "pahan ne ke liye safed shirt", "basmati ke chawal").
+
+- ENTITY CONTRACT (critical):
+- search_terms = ONLY the searchable product noun phrase the user wants.
+- NEVER write a full English sentence. NEVER paraphrase ("see …", "tell about …", "user wants …", "show me …").
+- NEVER invent a broad category word (clothes, products, items, stuff) when the user named a specific product.
+- CATALOG ENGLISH: Translate any language/vernacular to the English noun phrase that typically appears in ecommerce product titles. Correct spelling/spacing/compounding using meaning (not a fixed word list). Drop show/buy filler verbs from search_terms.
+- related_search_terms: optional alternate English catalog noun if the primary might miss titles (else empty). allow_related_fallback=true when set.
+- Put price budgets in max_price/min_price — NOT inside search_terms.
+- Put colour in color — NOT inside search_terms when separable.
+- Do NOT rewrite into a different unrelated product.
+- Preserve the user's product meaning while using catalog-searchable English.
 
 IMPORTANT — do not confuse products:
 - chawal / chaawal → rice ONLY when user said chawal/rice words.
@@ -532,7 +669,9 @@ IMPORTANT — do not confuse products:
 Return ONLY valid JSON:
 {{
   "reasoning": "brief step-by-step",
-  "search_terms": "2-6 English keywords for catalog search (product type + attributes). NEVER repeat words. No filler.",
+  "search_terms": "canonical English catalog product noun phrase only (2-6 words). NEVER a sentence. NEVER repeat words.",
+  "related_search_terms": "optional alternate English catalog noun if primary may miss titles, else empty",
+  "allow_related_fallback": true,
   "color": "Single standard English colour (White, Black, Sky Blue, Red...) or empty — no notes in parentheses",
   "brand": "brand if mentioned else empty",
   "brand_aliases": ["title spellings for that brand"],
@@ -549,23 +688,25 @@ Return ONLY valid JSON:
 }}
 
 RULES:
-- Translate to English catalog words: safed→white, kala→black, aasmani/asmani→sky blue, shirt→shirt, jug→water jug.
+- Semantic entity extraction: understand WHAT product + WHICH filters (brand, colour, size, price, rating, sku, pro_id) from meaning — ANY language/script/mix, typos, odd spacing, slang. Do NOT rely on fixed keyword lists.
+- TYPOS / SPACES (critical): Customers mistype freely (extra vowels/letters, missing spaces, keysmash brands). search_terms MUST be the corrected English catalog form — NEVER echo the raw typo. If unsure, still correct best-effort and set related_search_terms to another plausible catalog noun; allow_related_fallback=true.
+- Translate to English catalog title nouns when needed (colour words, product nouns). Put colour in color field when separable.
 - Map grains only when that word appears: chawal→rice, gehu→wheat — put result ONLY in search_terms (e.g. "basmati wheat"), never keep gehu/dikhana in search_terms.
-- search_terms must be short clean English (2-4 words): "basmati wheat", "black shirt", "water jug" — never "basmati gehu dikhana wheat".
-- Do NOT include conversational words: mereko, bhai, dikhao, chahiye, liye, peene, khane, pahan, bta de, sun na, hello, pasand kiya, mene.
-- If the user tells a story then asks for a NEW product (e.g. liked iPhone cover, now wants Realme cover), use ONLY the new product in search_terms (e.g. "realme cover") — ignore the old iPhone story.
-- Long messages: extract 2-4 English words for what they want NOW, not the full sentence.
-- search_terms must NOT duplicate tokens (wrong: "shirt shirt", "basmati chawal basmati chawal").
-- Keep product-specific words: basmati rice, basmati wheat, white shirt, water jug, black shirt.
-- match_mode strict when brand/model in search_terms (iphone cover, redmi cover); universal for generic charger/rice/shirt only.
+- search_terms = short clean catalog noun phrase (2-4 words). NEVER a sentence. NEVER filler verbs (dikhao/dika/show/chahiye) or availability tags (h kya/hai kya/milega).
+- BRAND + PRODUCT: if user named a brand/device with a product, put BOTH in search_terms AND brand (e.g. brand + type). NEVER drop the brand into a bare generic type like "mobile cover" / "cover" alone. Brand typos must be corrected in brand + search_terms.
+- Do NOT include conversational filler in search_terms.
+- If the user tells a story then asks for a NEW product, use ONLY the new product — ignore the old story.
+- Long messages: extract 2-4 words for the product they want NOW, not the full sentence.
+- search_terms must NOT duplicate tokens.
+- Vernacular → catalog English when titles use English (e.g. undershirt/vest words → vest / men vest) and put the vernacular as related_search_terms when helpful.
+- match_mode strict when brand/model is in the ask; universal for unbranded generic types.
 - If user only asks about orders/tracking/refund with NO product to buy, is_shopping=false and search_terms="".
-- If user vents about relationships, emotions, or personal life (e.g. gf left, setting chhod ke bhag gyi) with NO product to buy, is_shopping=false and search_terms="".
-- Typos are OK — infer the product (cabel→cable, moblie→mobile) in search_terms.
-- "cabel/cable tumhare pass" / "milega kya" on Welfog = USB/charging cable PRODUCT shopping — NOT internet/WiFi connection.
-- If unsure of product, put best guess in search_terms (2-4 words max).
+- If user vents about relationships/emotions with NO product to buy, is_shopping=false and search_terms="".
+- "cable/cabel tumhare pass" / "milega kya" on Welfog = shopping for that product — NOT internet/WiFi.
+- If unsure of product, best-guess noun phrase (2-4 words) — never "clothes"/"products"/"items".
 - max_price / min_price → customer purchase price (NOT MRP/unit_price). Use for rs/budget/range only.
-- rating_min / rating_max for star filters (e.g. rating > 2 → rating_min=2, under 3 stars → rating_max=3).
-- pro_id when user gives numeric product id (2615316 is product id) — set pro_id, search_terms="".
+- rating_min / rating_max for star filters.
+- pro_id when user gives numeric product id — set pro_id, search_terms="".
 - {language_reply_instruction(reply_lang)}
 JSON only."""
 
@@ -599,9 +740,12 @@ JSON only."""
     terms = polish_search_terms((out.get("search_terms") or "").strip(), original_msg)
     if terms:
         out["search_terms"] = terms
+    out = ensure_branded_product_search_terms(out, original_msg, msg_en) or out
+    if (out.get("search_terms") or "").strip():
+        out["search_terms"] = polish_search_terms(out["search_terms"], original_msg)
     out["color"] = sanitize_llm_color(
         str(out.get("color") or ""),
-        terms,
+        (out.get("search_terms") or terms),
         original_msg,
     ) or ""
     log_reasoning(
@@ -715,6 +859,80 @@ def merge_llm_into_search_spec(
     return spec
 
 
+def repair_zero_hit_catalog_terms(
+    original_msg: str,
+    failed_terms: str = "",
+    reply_lang: str = "en",
+) -> Optional[str]:
+    """
+    One compact LLM call when primary title_query returned 0 catalog hits.
+    Returns an alternate English catalog noun phrase, or None.
+    """
+    failed = (failed_terms or "").strip()
+    msg = (original_msg or "").strip()
+    if not msg:
+        return None
+    system_prompt = f"""The catalog search for this shopping request returned ZERO products.
+Return ONLY JSON: {{"search_terms": "alternate English catalog product noun that would appear in ecommerce titles", "reasoning": "brief"}}
+RULES:
+- Give a DIFFERENT English catalog noun than {failed!r}.
+- Prefer the noun most likely to appear IN PRODUCT TITLES on an Indian ecommerce catalog (not a paraphrase of the user sentence).
+- Infer from user meaning across languages/typos/spacing — output the corrected catalog English form titles use (never echo the raw misspelling).
+- Keep brand/device tokens if the user named them (corrected spelling).
+- If the failed terms look mistyped, return the intended catalog spelling/spacing.
+- NEVER a full sentence. NEVER clothes/products/items. 2-4 words max.
+- {language_reply_instruction(reply_lang)}
+JSON only."""
+    out = llm_json_chat_completion(
+        [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"USER MESSAGE:\n{msg}\n\nFAILED SEARCH TERMS:\n{failed or '(empty)'}\n",
+            },
+        ],
+        max_tokens=80,
+        timeout_sec=8,
+        max_attempts=1,
+    )
+    if not out:
+        return None
+    alt = polish_search_terms((out.get("search_terms") or "").strip(), original_msg)
+    if not alt or alt.lower() == failed.lower():
+        return None
+    log_reasoning(f"Zero-hit catalog repair: {failed!r} → {alt!r}")
+    return alt
+
+
+def extract_semantic_product_entities(
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    *,
+    category_id=None,
+    color=None,
+    pro_id=None,
+) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+    """
+    Single source of truth for OpenSearch title_query.
+
+    Semantic Product Entity Extraction — extracts the searchable product noun phrase
+    (+ filters) from the user's request. Must NEVER consume Brain user_meaning /
+    reasoning / paraphrase sentences. Prefer this over resolve_catalog_search_phrase
+    or Brain search_query for catalog title terms.
+    """
+    return understand_product_query(
+        original_msg,
+        msg_en,
+        conversation_context,
+        reply_lang,
+        category_id=category_id,
+        color=color,
+        pro_id=pro_id,
+    )
+
+
 def understand_product_query(
     original_msg: str,
     msg_en: str = "",
@@ -726,8 +944,11 @@ def understand_product_query(
     pro_id=None,
 ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
     """
-    AI-first OpenSearch spec — one product-search LLM understands filters in any language;
-    heuristics only when the model is unavailable.
+    AI-first OpenSearch spec — Product Entity Extraction understands filters in any
+    language; heuristics only when the model is unavailable.
+
+    search_terms / title_query = canonical product noun phrase ONLY (never a
+    paraphrased English sentence from Brain).
     """
     from services.opensearch_products import build_catalog_search_spec
 
@@ -815,10 +1036,100 @@ def understand_product_query(
         pro_id=pro_id,
     )
 
+    # Heuristic / budget-exhausted paths may keep brand separate from a generic type
+    # (shoes, cover). Re-merge into title_query before display/search.
+    try:
+        patched = ensure_branded_product_search_terms(
+            {
+                "search_terms": (spec.get("title_query") or "").strip(),
+                "brand": (spec.get("brand") or (ai_payload or {}).get("brand") or ""),
+                "brand_aliases": list(
+                    spec.get("brand_aliases")
+                    or (ai_payload or {}).get("brand_aliases")
+                    or []
+                ),
+                "mandatory_match_tokens": list(
+                    spec.get("mandatory_match_tokens")
+                    or (ai_payload or {}).get("mandatory_match_tokens")
+                    or []
+                ),
+                "match_mode": (ai_payload or {}).get("match_mode")
+                or spec.get("match_mode")
+                or "",
+            },
+            original_msg,
+            msg_en,
+        )
+        if patched and (patched.get("search_terms") or "").strip():
+            polished = polish_search_terms(patched["search_terms"], original_msg)
+            if polished:
+                spec["title_query"] = polished
+            if patched.get("brand"):
+                spec["brand"] = patched["brand"]
+            if patched.get("brand_aliases"):
+                spec["brand_aliases"] = patched["brand_aliases"]
+            if patched.get("mandatory_match_tokens"):
+                spec["mandatory_match_tokens"] = patched["mandatory_match_tokens"]
+            if (patched.get("match_mode") or "").lower() == "strict":
+                spec["match_mode"] = "strict"
+                spec["title_match_strict"] = True
+            if ai_payload is not None:
+                ai_payload.update(
+                    {
+                        k: patched[k]
+                        for k in (
+                            "search_terms",
+                            "brand",
+                            "brand_aliases",
+                            "mandatory_match_tokens",
+                            "match_mode",
+                        )
+                        if k in patched
+                    }
+                )
+    except Exception:
+        pass
+
     if ai_payload and spec.get("title_query"):
         spec["title_query"] = clean_product_part_label(
             spec["title_query"], original_msg
         )
+
+    # Non-Latin NLU output gets wiped by polish ([a-z0-9] only) → empty title +
+    # catalog dump. One English-only re-extract when that happens.
+    if (
+        ai_payload
+        and not (spec.get("title_query") or "").strip()
+        and not ai_payload.get("pro_id")
+        and not ai_payload.get("sku")
+        and not ai_payload.get("category_only_browse")
+        and (original_msg or "").strip()
+    ):
+        try:
+            retry = ai_extract_product_search(
+                original_msg,
+                msg_en or "Translate product noun to English catalog words only.",
+                conversation_context,
+                reply_lang="en",
+            )
+            if retry and (retry.get("search_terms") or "").strip():
+                retry["_ai_first"] = True
+                retry["_product_nlu_from_ai"] = True
+                ai_payload = retry
+                spec = build_catalog_search_spec(
+                    original_msg,
+                    msg_en,
+                    ai=ai_payload,
+                    category_id=category_id,
+                    color=color or ai_payload.get("color"),
+                    pro_id=pro_id,
+                )
+                if spec.get("title_query"):
+                    spec["title_query"] = clean_product_part_label(
+                        spec["title_query"], original_msg
+                    )
+        except Exception:
+            pass
 
     return spec, llm or ai_payload
 
@@ -831,6 +1142,19 @@ def display_label_for_product_search(
     """Clean label for chat replies — always like 'basmati wheat', never 'gehu dikhana wheat'."""
     if spec.get("pro_id") is not None:
         return f"Product ID {spec['pro_id']}"
+    # Category-only browse → department name, never "your search".
+    if spec.get("category_id") and not (spec.get("title_query") or "").strip():
+        try:
+            from services.welfog_api import category_name_for_id
+
+            cat_label = category_name_for_id(str(spec["category_id"]))
+            if cat_label:
+                return cat_label
+        except ImportError:
+            pass
+        cb = (spec.get("category_browse") or (llm or {}).get("category_browse") or "").strip()
+        if cb:
+            return cb.title() if cb.islower() else cb
     label = ""
     if llm and llm.get("search_terms"):
         st = str(llm["search_terms"]).strip().lower()
@@ -840,12 +1164,17 @@ def display_label_for_product_search(
             )
     if not label:
         label = clean_product_part_label(spec.get("title_query") or "", original_msg)
-    if label and is_noisy_search_query(label, understanding=llm or {}, entities=spec):
-        label = ""
+    # Short catalog nouns are valid — avoid wiping via entities=spec substance path.
+    if label and is_noisy_search_query(label, understanding=llm or {}):
+        if is_noisy_search_query(label):
+            label = ""
     if (not label or label.lower() in ("products", "product")) and spec.get("brand"):
         tq = clean_product_part_label(spec.get("title_query") or "", original_msg)
         label = f"{spec['brand']} {tq}".strip() if tq else str(spec["brand"]).strip()
     if not label:
+        tq = (spec.get("title_query") or "").strip()
+        if tq and len(tq) >= 2:
+            return tq
         return "your search"
     extras = []
     try:

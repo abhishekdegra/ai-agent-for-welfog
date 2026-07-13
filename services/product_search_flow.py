@@ -294,6 +294,8 @@ JSON SCHEMA:
     }}
   ],
   "search_terms": "only when product_requests has ONE item — else empty",
+  "related_search_terms": "optional alternate English catalog noun if primary may miss titles, else empty",
+  "allow_related_fallback": true,
   "color": "catalog colour (Black, Green, Multicolor, Sky Blue...) or empty — NEVER put in sku",
   "brand": "company/brand user asked for (any spelling you infer) or empty",
   "brand_aliases": ["spellings that may appear in titles for that brand — at least ONE must match, e.g. oneplus, one plus"],
@@ -314,6 +316,10 @@ JSON SCHEMA:
 }}
 
 RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, beauty):
+- PRODUCT ENTITY EXTRACTION (critical): search_terms is the searchable product noun phrase ONLY. NEVER a paraphrased English sentence. NEVER "see …", "tell about …", "show me …", "user wants …". NEVER generalize a named product to broad words like clothes/products/items/stuff. CATALOG ENGLISH: emit the English noun that appears in ecommerce product titles — translate any language/vernacular; correct typos/spacing/compounds from meaning (no fixed product dictionary). related_search_terms = optional alternate catalog noun; allow_related_fallback=true when set. Price → max_price/min_price fields, not inside search_terms.
+- TYPOS / SPACES / KEYSMASH (critical): Never copy the customer's raw misspelling into search_terms. Correct to the catalog English form. Always set related_search_terms when the input looks noisy (extra letters, missing spaces, roman Hindi variants). Brand typos belong in brand + search_terms corrected.
+- BRAND + PRODUCT (critical): When user names a brand/device WITH a product type, put BOTH in search_terms AND brand field, match_mode=strict, and brand tokens in mandatory_match_tokens. NEVER collapse to a bare generic type that drops the brand.
+- SPELLING / SPACES / MIXED LANGUAGE: Semantically normalize typos, split brands, and drop show/buy verbs from search_terms. Availability asks (any language: "do you have", "hai kya", "milega") are still shopping — extract the product noun + filters.
 - MEANING FIRST (industry): Understand the LATEST message + RECENT CONVERSATION semantically — ANY language/script, typos, slang, long paragraphs, indirect phrasing. User may ask in 1000 different ways; infer intent from meaning, NOT from matching Hindi/English keyword lists. Do NOT echo the full user sentence into search_terms. Your JSON is the ONLY source for color, price, rating, brand, size, SKU, pro_id.
 - NEVER put conversational words in sku (chahiye, dikhao, batana, please, milega, shaadi, mast, …) — sku is ONLY a warehouse code with digits or explicit "SKU ABC123" from the user.
 - ALL FILTERS: Put every constraint the user meant into the correct JSON field (top-level or per product_requests[]). Long message with price + colour + product + rating → fill all fields. Multiple products with different filters → separate product_requests[] rows each with their own color/max_price/rating_min/etc.
@@ -343,7 +349,7 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - max_price / min_price in JSON → purchase_price_max / purchase_price_min (landed price = purchase + shipping) — ONLY when user asked for rupees/budget, NEVER for star/rating thresholds.
 - rating_min / rating_max in JSON for star filters — NEVER put star numbers in min_price/max_price.
 - PRICE-ONLY browse (critical): "under 500 rs", "500 se kam wale item", "under 190" → max_price/min_price ONLY; search_terms="" brand="" — do NOT add Samsung/mobile/cover from old chat unless user said wahi/same/pehle wala product.
-- BUDGET + PRODUCT (critical): "I have 150 rs show mobile covers", "190 rs budget mobile cover in this range" → search_terms=mobile cover (English product type), max_price=150 or 190, brand="" unless user named brand THIS message.
+- BUDGET + PRODUCT (critical): "I have 150 rs show mobile covers", "190 rs budget mobile cover in this range", "under 300 sports shoes" → search_terms=mobile cover / sports shoes (product noun only), max_price=150/190/300, brand="" unless user named brand THIS message.
 - Never copy brand from RECENT CONVERSATION unless user repeats that brand in the LATEST message.
 - RATING filter: set rating_min / rating_max ONLY when the LATEST message explicitly mentions stars/rating — otherwise null. NEVER default rating_min=0.01 or rating_max=5. "4 star wale" → rating_min=4; "under 3 rating" → rating_max=3. Colour/price-only messages → rating fields MUST be null.
 - PRICE filter: set max_price/min_price ONLY when the LATEST message mentions rs/rupees/budget/under/over price — otherwise null. NEVER copy 150/200 from old chat unless user repeats budget this message.
@@ -1355,11 +1361,16 @@ def _run_locked_catalog_search_fast(
     from services.welfog_api import build_welfog_product_browse_url
 
     locked_u = dict(ai_understanding or {})
+    if isinstance(ai_route, dict) and ai_route.get("_product_nlu_from_ai"):
+        locked_u["_product_nlu_from_ai"] = True
     sq = ""
     if locked_u.get("sku"):
         sq = str(locked_u["sku"]).strip()
     elif locked_u.get("pro_id"):
         sq = f"pro_id {locked_u['pro_id']}"
+    # Optional: entity-extracted title already on locked understanding / route.
+    if not sq and locked_u.get("_product_nlu_from_ai"):
+        sq = (locked_u.get("search_terms") or "").strip()
     entities = dict((ai_route or {}).get("_product_entities") or {})
 
     try:
@@ -1392,10 +1403,17 @@ def _run_locked_catalog_search_fast(
 
     pre_fallback_u = dict(locked_u)
 
+    # title_query SoT = Product Entity Extraction (understand_product_query /
+    # extract_semantic_product_entities). Brain paraphrases must NEVER skip this stage.
     allow_nlu = True
     if locked_u.get("sku") or locked_u.get("pro_id"):
         allow_nlu = False
-    elif isinstance(ai_route, dict) and ai_route.get("_needs_product_nlu_llm") is False:
+    elif locked_u.get("_product_nlu_from_ai") and (locked_u.get("search_terms") or "").strip():
+        # Entity extractor already ran upstream — do not duplicate.
+        allow_nlu = False
+    elif isinstance(ai_route, dict) and ai_route.get("category_only_browse") and not (
+        (locked_u.get("search_terms") or "").strip() or (sq or "").strip()
+    ):
         allow_nlu = False
 
     os_spec, pq_llm = build_catalog_spec_for_product_turn(
@@ -1406,7 +1424,8 @@ def _run_locked_catalog_search_fast(
         ctx=ctx,
         ai_route=ai_route,
         locked_understanding=locked_u or None,
-        brain_search_query=sq,
+        # Do not feed Brain paraphrase text as title — filters/entities only.
+        brain_search_query="" if allow_nlu else sq,
         allow_product_nlu_llm=allow_nlu,
     )
     if pq_llm and pq_llm.get("_product_nlu_from_ai") and isinstance(ai_route, dict):
@@ -1465,7 +1484,7 @@ def _run_locked_catalog_search_fast(
     elif not products and raw_count > 0:
         removed_reason = "post_filter_mismatch"
 
-    if not products and locked_u.get("device_browse") and not locked_u.get("specific_accessory"):
+    if not products and not locked_u.get("specific_accessory"):
         fb_u = _build_related_accessory_understanding(locked_u, entities)
         if fb_u:
             fb_spec, _fb_pq = build_catalog_spec_for_product_turn(
@@ -1482,7 +1501,7 @@ def _run_locked_catalog_search_fast(
             fb_spec["_related_fallback"] = True
             fb_spec["_ai_single_pass"] = True
             log_reasoning(
-                "Catalog device browse: 0 phones — retry related accessories "
+                "Catalog 0 hits — retry related_search_terms from entity extraction "
                 f"(title={fb_spec.get('title_query')!r})."
             )
             fb_products, fb_spec, fb_total, fb_more = catalog_search_live(
@@ -1500,6 +1519,52 @@ def _run_locked_catalog_search_fast(
                 os_has_more = fb_more
                 locked_u = fb_u
                 removed_reason = ""
+
+    if not products:
+        try:
+            from services.product_query_understanding import repair_zero_hit_catalog_terms
+
+            alt = repair_zero_hit_catalog_terms(
+                original_msg,
+                (os_spec.get("title_query") or locked_u.get("search_terms") or ""),
+                reply_lang=reply_lang,
+            )
+            if alt:
+                repair_u = dict(locked_u)
+                repair_u["search_terms"] = alt
+                repair_u.pop("category_id", None)
+                repair_u["_product_nlu_from_ai"] = True
+                repair_u["_related_fallback"] = True
+                repair_spec, _ = build_catalog_spec_for_product_turn(
+                    original_msg,
+                    msg_en,
+                    conversation_context=conversation_context,
+                    reply_lang=reply_lang,
+                    ctx=ctx,
+                    ai_route=ai_route,
+                    locked_understanding=repair_u,
+                    brain_search_query=alt,
+                    allow_product_nlu_llm=False,
+                )
+                repair_spec["_ai_single_pass"] = True
+                repair_spec.pop("category_id", None)
+                rp, repair_spec, rt, rm = catalog_search_live(
+                    repair_spec,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    page=1,
+                    ctx=ctx,
+                )
+                rp = apply_catalog_result_filters(rp, repair_spec)
+                if rp:
+                    products = rp
+                    os_spec = repair_spec
+                    os_total = rt
+                    os_has_more = rm
+                    locked_u = repair_u
+                    removed_reason = ""
+        except Exception:
+            pass
 
     route_entities = None
     if ai_route and isinstance(ai_route.get("_product_entities"), dict):
@@ -1760,6 +1825,7 @@ def _run_catalog_search(
             (ai_understanding or {}).get("_product_nlu_from_ai")
             or (ai_understanding or {}).get("pro_id")
             or (ai_understanding or {}).get("sku")
+            or (ai_route or {}).get("_product_nlu_from_ai")
         )
         os_spec, pq_llm = build_catalog_spec_for_product_turn(
             original_msg,
@@ -1769,7 +1835,12 @@ def _run_catalog_search(
             ctx=ctx,
             ai_route=ai_route,
             locked_understanding=ai_understanding,
-            brain_search_query=(search_query or "").strip(),
+            # Never feed Brain paraphrase as title; entity extractor owns it.
+            brain_search_query=(
+                ((ai_understanding or {}).get("search_terms") or "").strip()
+                if nlu_ready
+                else ""
+            ),
             allow_product_nlu_llm=not nlu_ready,
         )
         title_match = (os_spec.get("title_query") or "").strip()
@@ -2313,7 +2384,7 @@ def run_product_search_ai_flow(
             if route_entities:
                 understanding = entities_to_understanding(
                     route_entities,
-                    search_query=route_sq,
+                    search_query="",
                     original_msg=original_msg,
                 )
                 if understanding:
@@ -2377,13 +2448,11 @@ def run_product_search_ai_flow(
                 if route_entities:
                     understanding = entities_to_understanding(
                         route_entities,
-                        search_query=resolved.search_query or route_sq,
+                        search_query="",
                         original_msg=original_msg,
                     )
-                    if understanding and resolved.search_query and not understanding.get(
-                        "search_terms"
-                    ):
-                        understanding["search_terms"] = resolved.search_query
+                    # Never stamp resolved.search_query (may be Brain paraphrase) into
+                    # search_terms — Product Entity Extraction owns title_query.
                 log_product_catalog_routing(
                     detected_intent="product_search",
                     product_entities=route_entities,

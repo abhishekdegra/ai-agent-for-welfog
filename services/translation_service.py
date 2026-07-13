@@ -467,6 +467,101 @@ def to_en(text):
     return text
 
 
+# Process-local cache: Hinglish/native → English for KB dense retrieval (aligns with English chunks).
+_RETRIEVAL_EN_CACHE: dict[str, str] = {}
+_RETRIEVAL_EN_CACHE_MAX = 128
+
+
+def text_usable_as_english_retrieval(text: str) -> bool:
+    """True when text is clear English — safe to embed against English KB chunks."""
+    plain = re.sub(r"<[^>]+>", " ", text or "").strip()
+    if len(plain) < 2:
+        return False
+    if not _latin_script_only(plain):
+        return False
+    if is_hinglish_message(plain):
+        return False
+    # Mixed Roman (e.g. "welfog ka owner kon h") is not clear English even if
+    # hinglish-marker lists miss particles like ka/kon — require English signal.
+    return _looks_english_only_latin(plain)
+
+
+def to_en_for_retrieval(text: str, lang: str = "") -> str:
+    """
+    English gloss for Qdrant dense retrieval against English-indexed KB chunks.
+
+    Unlike to_en_for_routing (Brain stays multilingual on raw Hinglish), retrieval
+    must embed an English meaning or Hinglish/Hindi queries miss English chunks.
+    Uses a short Google translate timeout + process cache — no keyword maps.
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    lang = _normalize_language(lang) if lang else resolve_customer_reply_lang(raw)
+    if lang == "en" and text_usable_as_english_retrieval(raw):
+        return raw.lower()
+    if text_usable_as_english_retrieval(raw) and lang not in NATIVE_SCRIPT_LANGS:
+        # Already English-like (even if reply_lang mis-detected).
+        return raw.lower()
+
+    cache_key = f"{lang}|{raw.lower()[:900]}"
+    hit = _RETRIEVAL_EN_CACHE.get(cache_key)
+    if hit is not None:
+        return hit
+
+    gloss = raw.lower()
+    # Protect brand name — Google often mistranslates "Welfog" → "welfare".
+    brand_token = "WelfogBrandName"
+    protected = re.sub(r"\bwelfog\b", brand_token, raw, flags=re.IGNORECASE)
+    translated_ok = False
+    try:
+        import concurrent.futures
+
+        def _do_translate():
+            return GoogleTranslator(source="auto", target="en").translate(protected)
+
+        timeout = float(os.getenv("RETRIEVAL_TRANSLATE_TIMEOUT_SEC", "1.2") or "1.2")
+        limit = max(0.5, min(timeout, 2.0))
+        # wait=False — Google hangs must not block the with-block exit after timeout.
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(_do_translate)
+            result = fut.result(timeout=limit)
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
+        if result and isinstance(result, str) and len(result.strip()) > 1:
+            gloss = result.strip()
+            gloss = re.sub(re.escape(brand_token), "Welfog", gloss, flags=re.IGNORECASE)
+            # Residual mistranslation if protector was stripped by the MT engine.
+            if re.search(r"\bwelfog\b", raw, flags=re.IGNORECASE):
+                gloss = re.sub(r"\bwelfare\b", "Welfog", gloss, flags=re.IGNORECASE)
+            gloss = gloss.lower()
+            # If MT produced non-English junk, keep raw — dense+fulltext still run on it.
+            if not text_usable_as_english_retrieval(gloss) and is_hinglish_message(gloss):
+                gloss = raw.lower()
+            else:
+                translated_ok = True
+            log_reasoning(
+                f"KB retrieval EN gloss: lang={lang} chars={len(raw)}→{len(gloss)}"
+            )
+    except TimeoutError:
+        log_reasoning(
+            f"KB retrieval translate timeout — embedding original ({len(raw)} chars)."
+        )
+    except Exception as e:
+        log_reasoning(f"KB retrieval translate: {e}")
+
+    # Only cache successful MT — never permanently pin a timeout/raw miss.
+    if translated_ok:
+        if len(_RETRIEVAL_EN_CACHE) >= _RETRIEVAL_EN_CACHE_MAX:
+            try:
+                _RETRIEVAL_EN_CACHE.pop(next(iter(_RETRIEVAL_EN_CACHE)))
+            except StopIteration:
+                _RETRIEVAL_EN_CACHE.clear()
+        _RETRIEVAL_EN_CACHE[cache_key] = gloss
+    return gloss
+
+
 def to_en_for_routing(text: str, lang: str = "") -> str:
     """
     English hint for ai_brain_route / OpenSearch — includes Hinglish and native scripts.
@@ -653,10 +748,20 @@ def is_live_api_structured_html(text: str) -> bool:
     return any(m.lower() in low for m in _LIVE_API_HTML_MARKERS)
 
 
-def finalize_customer_reply(text: str, user_msg: str, reply_lang: str = "") -> str:
+def finalize_customer_reply(
+    text: str,
+    user_msg: str,
+    reply_lang: str = "",
+    *,
+    allow_llm_style_rewrite: bool = True,
+) -> str:
     """
     Last-mile localization before sending to the customer.
     Match language/script/style of the customer's latest message.
+
+    allow_llm_style_rewrite=False: skip English↔Hinglish LLM rewrite (use when the
+    answer LLM already received reply_lang instructions — avoids a second 1–7s call).
+    Native-script localization still runs when needed.
     """
     if text is None:
         return text
@@ -673,12 +778,12 @@ def finalize_customer_reply(text: str, user_msg: str, reply_lang: str = "") -> s
         if is_live_api_structured_html(body):
             _log_language_preservation(user_msg, rl, body, out, translation_applied=False)
             return text
-        if _reply_needs_style_rewrite(body, rl, user_msg):
+        if allow_llm_style_rewrite and _reply_needs_style_rewrite(body, rl, user_msg):
             rewritten = _llm_rewrite_customer_reply(text, user_msg, rl)
             if rewritten and rewritten.strip() and rewritten.strip() != body:
                 out = rewritten
                 translation_applied = True
-        if not translation_applied:
+        if allow_llm_style_rewrite and not translation_applied:
             out_lang = _infer_reply_text_language(out)
             if out_lang != rl:
                 rewritten = _llm_rewrite_customer_reply(out, user_msg, rl)

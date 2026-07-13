@@ -759,9 +759,9 @@ def resolve_kb_turn_ai_first(
     if kb_turn_is_informational(classified):
         topic = (classified.get("kb_topic") or "general_faq").strip().lower()
         try:
-            from services.knowledge_query_pipeline import KB_TOPIC_KEYS
+            from services.knowledge_query_pipeline import kb_keys_for_topic
 
-            keys = list(KB_TOPIC_KEYS.get(topic) or KB_TOPIC_KEYS["general_faq"])
+            keys = kb_keys_for_topic(topic)
         except ImportError:
             keys = ["faqs"]
         um = (classified.get("user_meaning_en") or "").strip()

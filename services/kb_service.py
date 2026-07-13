@@ -8,7 +8,6 @@ from html import escape as html_escape
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
-from support_paths import KNOWLEDGE_DIR
 from services.embedding import embeddings_disabled, encode_texts
 from utils.cache import _cache, _cache_get, _cache_set
 from utils.reasoning_log import log_reasoning
@@ -33,14 +32,16 @@ from utils.helpers import (
 _KB_SNAPSHOT = ""
 _KB_VECTOR_STATUS = "not_loaded"
 _KB_REFRESH_LOCK = threading.RLock()
+_KB_CATALOG_CACHE: dict[str, str] = {}
 
 # Unified semantic thresholds (env-tunable; cosine similarity 0–1)
-KB_SEMANTIC_MIN_SCORE = float(os.getenv("KB_SEMANTIC_MIN_SCORE", "0.22") or "0.22")
-KB_CONTEXT_MIN_SCORE = float(os.getenv("KB_CONTEXT_MIN_SCORE", "0.18") or "0.18")
-KB_DIRECT_MIN_SCORE = float(os.getenv("KB_DIRECT_MIN_SCORE", "0.22") or "0.22")
-KB_STRONG_MATCH_SCORE = float(os.getenv("KB_STRONG_MATCH_SCORE", "0.32") or "0.32")
-KB_ANSWER_MIN_CONFIDENCE = float(os.getenv("KB_ANSWER_MIN_CONFIDENCE", "0.26") or "0.26")
-KB_RETRIEVAL_STRONG_SCORE = float(os.getenv("KB_RETRIEVAL_STRONG_SCORE", "0.38") or "0.38")
+KB_SEMANTIC_MIN_SCORE = float(os.getenv("KB_SEMANTIC_MIN_SCORE", "0.16") or "0.16")
+KB_CONTEXT_MIN_SCORE = float(os.getenv("KB_CONTEXT_MIN_SCORE", "0.14") or "0.14")
+KB_DIRECT_MIN_SCORE = float(os.getenv("KB_DIRECT_MIN_SCORE", "0.16") or "0.16")
+KB_STRONG_MATCH_SCORE = float(os.getenv("KB_STRONG_MATCH_SCORE", "0.28") or "0.28")
+# Soft answer floor — retrieve/recall above this; gray-band hits still answer via extractive path.
+KB_ANSWER_MIN_CONFIDENCE = float(os.getenv("KB_ANSWER_MIN_CONFIDENCE", "0.18") or "0.18")
+KB_RETRIEVAL_STRONG_SCORE = float(os.getenv("KB_RETRIEVAL_STRONG_SCORE", "0.34") or "0.34")
 
 
 def get_kb_vector_status() -> str:
@@ -105,11 +106,17 @@ def _embeddings_ready() -> bool:
     return all_vectors is not None and len(all_vectors) > 0
 
 
+def _knowledge_key_from_title(title: str) -> str:
+    """Normalize MySQL document title to the same key formerly derived from .txt filenames."""
+    from services.knowledge_keys import canonical_knowledge_key
+
+    return canonical_knowledge_key(title)
+
+
 def _is_internal_kb_key(key: str) -> bool:
-    k = (key or "").lower()
-    if k in INTERNAL_KB_KEYS:
-        return True
-    return k.startswith("welfog_api") or k in ("system_messages", "system_messages_2")
+    from services.knowledge_keys import is_internal_agent_knowledge_key
+
+    return is_internal_agent_knowledge_key(key)
 
 
 def _build_flat_vectors_from_keys() -> np.ndarray:
@@ -126,46 +133,59 @@ def _build_flat_vectors_from_keys() -> np.ndarray:
 
 def get_runtime_knowledge_files():
     """
-    Auto-discovers all .txt files from knowledge folder.
-    No hardcoded mapping required.
+    Active knowledge documents from MySQL as {key: content}.
+    Production runtime must not read support/knowledge/*.txt.
     """
-    runtime = {}
-    if not os.path.exists(KNOWLEDGE_DIR):
-        os.makedirs(KNOWLEDGE_DIR, exist_ok=True)
+    runtime: dict[str, str] = {}
+    try:
+        from services.mysql_service import list_active_knowledge_documents
+
+        docs = list_active_knowledge_documents()
+    except Exception as e:
+        print(f"get_runtime_knowledge_files MySQL error: {e}")
         return runtime
-    for filename in sorted(os.listdir(KNOWLEDGE_DIR)):
-        if not filename.endswith(".txt"):
+
+    for doc in docs:
+        title = (doc.get("title") or "").strip()
+        if not title:
             continue
-        file_path = os.path.join(KNOWLEDGE_DIR, filename)
-        if not os.path.isfile(file_path):
-            continue
-        key_base = os.path.splitext(filename)[0].replace("-", "_").replace(" ", "_").lower()
-        key = re.sub(r"[^a-z0-9_]", "", key_base)
+        key = _knowledge_key_from_title(title)
         if not key:
             continue
-        # Avoid key collisions if two files normalize to same key
         if key in runtime:
             n = 2
             while f"{key}_{n}" in runtime:
                 n += 1
             key = f"{key}_{n}"
-        runtime[key] = file_path
+        runtime[key] = doc.get("content") or ""
     return runtime
 
+
 def get_allowed_knowledge_filenames():
-    return sorted({os.path.basename(path) for path in get_runtime_knowledge_files().values() if path.endswith(".txt")})
+    """Admin UI labels — title.txt for URL compatibility; content lives in MySQL."""
+    try:
+        from services.mysql_service import list_active_knowledge_documents
+
+        titles = [
+            (doc.get("title") or "").strip()
+            for doc in list_active_knowledge_documents()
+            if (doc.get("title") or "").strip()
+        ]
+    except Exception as e:
+        print(f"get_allowed_knowledge_filenames MySQL error: {e}")
+        return []
+    return sorted({f"{t}.txt" for t in titles})
+
 
 def _compute_kb_snapshot(runtime_files):
-    """Detect any add/update/delete — size, mtime, and content hash (same-size edits)."""
+    """Detect any add/update/delete via content hash of MySQL-backed documents."""
     parts = []
-    for key, path in sorted(runtime_files.items()):
-        try:
-            with open(path, "rb") as f:
-                raw = f.read()
-            digest = hashlib.md5(raw).hexdigest()[:16]
-            parts.append(f"{key}:{len(raw)}:{digest}")
-        except OSError:
-            parts.append(f"{key}:missing")
+    for key, content in sorted((runtime_files or {}).items()):
+        raw = (content if isinstance(content, str) else str(content or "")).encode(
+            "utf-8", errors="replace"
+        )
+        digest = hashlib.md5(raw).hexdigest()[:16]
+        parts.append(f"{key}:{len(raw)}:{digest}")
     return "|".join(parts)
 
 
@@ -380,20 +400,19 @@ def load_knowledge_index(runtime_files=None, *, build_vectors: bool = True):
     all_sources_local = []
 
     files_map = runtime_files if runtime_files is not None else get_runtime_knowledge_files()
-    for k, path in files_map.items():
+    for k, content in files_map.items():
         try:
-            if not os.path.exists(path):
-                print(f"Warning: File missing at {path}")
+            if content is None:
+                print(f"Warning: Empty knowledge document for key={k}")
                 chunks_by_key[k] = []
                 vectors_by_key[k] = []
                 continue
 
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
+            text = content if isinstance(content, str) else str(content)
 
             chunks = [
                 c
-                for c in _split_kb_chunks(content, file_key=k)
+                for c in _split_kb_chunks(text, file_key=k)
                 if not _chunk_is_agent_instruction_blob(c)
             ]
             chunks_by_key[k] = chunks
@@ -409,7 +428,7 @@ def load_knowledge_index(runtime_files=None, *, build_vectors: bool = True):
             else:
                 vectors_by_key[k] = []
         except Exception as e:
-            print(f"Error loading {path}: {e}")
+            print(f"Error loading knowledge key={k}: {e}")
             chunks_by_key[k] = []
             vectors_by_key[k] = []
 
@@ -496,10 +515,9 @@ def refresh_knowledge_cache(*, build_vectors: bool = True):
         )
         log_reasoning(f"[kb-vector] vector_update_status={_KB_VECTOR_STATUS}")
         try:
-            sys_path = runtime_files.get("system_messages")
-            if sys_path and os.path.exists(sys_path):
-                with open(sys_path, "r", encoding="utf-8") as f:
-                    _SYSTEM_MESSAGES = _parse_system_messages(f.read())
+            sys_body = runtime_files.get("system_messages")
+            if isinstance(sys_body, str) and sys_body.strip():
+                _SYSTEM_MESSAGES = _parse_system_messages(sys_body)
             else:
                 _SYSTEM_MESSAGES = {}
         except Exception as e:
@@ -525,6 +543,8 @@ def ensure_knowledge_cache_fresh():
     log_reasoning(
         "[kb-vector] knowledge snapshot changed — text reload now, vectors async"
     )
+    global _KB_CATALOG_CACHE
+    _KB_CATALOG_CACHE.clear()
     acquired = _KB_REFRESH_LOCK.acquire(timeout=2.0)
     if not acquired:
         log_reasoning("[kb-vector] text reload skipped — refresh lock busy")
@@ -611,14 +631,21 @@ def get_customer_kb_keys():
     return [k for k in get_runtime_knowledge_files().keys() if not _is_internal_kb_key(k)]
 
 
-def build_kb_catalog_for_brain_prompt(*, max_files: int = 32, blurb_chars: int = 140) -> str:
+def build_kb_catalog_for_brain_prompt(*, max_files: int = 500, blurb_chars: int = 140) -> str:
     """
-    Auto-built catalog of admin knowledge files for the routing LLM.
-    Any .txt added/updated via admin panel appears here — no code change for new topics.
+    Auto-built catalog of ALL active Admin knowledge documents for the routing LLM.
+    Any document added via Admin appears here — no code change for new topics.
     """
+    global _KB_CATALOG_CACHE
     _schedule_kb_refresh_if_stale()
+    snap = (_KB_SNAPSHOT or "").strip() or "empty"
+    cache_key = f"{snap}|{max_files}|{blurb_chars}"
+    cached = _KB_CATALOG_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     lines: list[str] = []
-    for k in get_customer_kb_keys()[:max_files]:
+    for k in get_customer_kb_keys()[: max(1, int(max_files))]:
         blurb = ""
         for chunk in (kb_chunks_by_key.get(k) or [])[:2]:
             plain = _plain_chunk_for_embed(chunk).strip()
@@ -626,15 +653,15 @@ def build_kb_catalog_for_brain_prompt(*, max_files: int = 32, blurb_chars: int =
                 blurb = re.sub(r"\s+", " ", plain)[:blurb_chars]
                 break
         if not blurb:
-            path = get_runtime_knowledge_files().get(k)
-            if path and os.path.isfile(path):
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        blurb = re.sub(r"\s+", " ", f.read().strip())[:blurb_chars]
-                except OSError:
-                    blurb = ""
+            body = get_runtime_knowledge_files().get(k)
+            if isinstance(body, str) and body.strip():
+                blurb = re.sub(r"\s+", " ", body.strip())[:blurb_chars]
         lines.append(f'  "{k}": {blurb or "(admin knowledge — read file at answer time)"}')
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    if len(_KB_CATALOG_CACHE) >= 4:
+        _KB_CATALOG_CACHE.clear()
+    _KB_CATALOG_CACHE[cache_key] = out
+    return out
 
 
 def resolve_brain_kb_keys(
@@ -646,13 +673,21 @@ def resolve_brain_kb_keys(
     conversation_context: str = "",
 ) -> list[str]:
     """
-    Pick admin KB files: validate brain kb_keys, else semantic search across all customer .txt files.
-    Works for any language — admin panel CRUD on knowledge needs no deploy.
+    Soft Brain kb_keys only — never a hardcoded file catalog.
+
+    Valid Brain keys are kept as retrieval hints. Missing/invalid keys fall back
+    to semantic file picking across ALL customer Admin documents. Empty result
+    means unscoped Qdrant retrieval (pure semantic).
     """
     ensure_knowledge_cache_fresh()
     route = route or {}
     customer = set(get_customer_kb_keys())
-    raw_brain_keys = [k for k in (route.get("kb_keys") or []) if str(k).strip()]
+    raw_brain_keys = [
+        _knowledge_key_from_title(str(k))
+        for k in (route.get("kb_keys") or [])
+        if str(k).strip()
+    ]
+    raw_brain_keys = [k for k in raw_brain_keys if k]
     brain_keys = [
         k
         for k in raw_brain_keys
@@ -673,8 +708,8 @@ def resolve_brain_kb_keys(
                 merged = list(dict.fromkeys(merged + extra))[:max_files]
         return merged[:max_files]
 
-    # Brain may suggest keys that are not real admin files — semantic pick, not company default.
-    if raw_brain_keys:
+    # Brain suggested unknown keys — semantic pick across all Admin docs.
+    if raw_brain_keys or original_msg or msg_en:
         semantic_keys = resolve_kb_keys_for_question(
             original_msg or (route.get("user_meaning") or ""),
             msg_en or (route.get("user_meaning") or ""),
@@ -686,39 +721,8 @@ def resolve_brain_kb_keys(
         if semantic_keys:
             return semantic_keys[:max_files]
 
-    intent = (route.get("intent") or "").strip().lower()
-    _intent_files = {
-        "payment": ["payment"],
-        "refund": ["refund"],
-        "general": ["company"],
-        "seller": ["company", "faqs"],
-    }
-    intent_keys = [
-        k
-        for k in _intent_files.get(intent, [])
-        if k not in INTERNAL_KB_KEYS and k in customer
-    ]
-    if not intent_keys:
-        files_map = get_runtime_knowledge_files()
-        intent_keys = [
-            k
-            for k in _intent_files.get(intent, [])
-            if k in files_map and k not in INTERNAL_KB_KEYS
-        ]
-    if intent_keys:
-        return list(dict.fromkeys(intent_keys))[:max_files]
-
-    keys = resolve_kb_keys_for_question(
-        original_msg or (route.get("user_meaning") or ""),
-        msg_en or (route.get("user_meaning") or ""),
-        suggested_keys=None,
-        max_files=max_files,
-        conversation_context=conversation_context,
-        ai_route=route,
-    )
-    if keys:
-        return keys[:max_files]
-    return list(customer)[: min(3, max_files)]
+    # No hardcoded intent→file map. Empty → unscoped semantic retrieval.
+    return []
 
 
 def get_support_contact_kb_keys():
@@ -749,23 +753,19 @@ def get_support_contact_kb_keys():
 
 
 def read_concatenated_kb_file_contents(keys: list) -> str:
-    """Raw UTF-8 text from knowledge files — always read live from disk after cache check."""
+    """Raw UTF-8 text from MySQL knowledge documents — always read live after cache check."""
     ensure_knowledge_cache_fresh()
     if not keys:
         return ""
     files_map = get_runtime_knowledge_files()
     parts = []
     for k in keys:
-        path = files_map.get(k)
-        if not path or not os.path.isfile(path):
+        body = files_map.get(k)
+        if not isinstance(body, str):
             continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                body = (f.read() or "").strip()
-            if body:
-                parts.append(f"=== FILE key={k} path={os.path.basename(path)} ===\n{body}")
-        except OSError:
-            continue
+        body = body.strip()
+        if body:
+            parts.append(f"=== FILE key={k} path={k}.txt ===\n{body}")
     return "\n\n".join(parts).strip()
 
 
@@ -1372,30 +1372,86 @@ def build_kb_retrieval_query(
     ai_route: dict | None = None,
 ) -> str:
     """
-    Multilingual retrieval query for embedding search — AI meaning + English gloss + context.
-    No keyword lists; admin KB files matched by semantic similarity.
-    """
-    parts: list[str] = []
-    meaning = ((ai_route or {}).get("user_meaning") or "").strip()
-    if meaning:
-        parts.append(meaning)
-    en = (msg_en or "").strip()
-    raw = (original_msg or "").strip()
-    if en and en.lower() != raw.lower():
-        parts.append(en)
-    if raw:
-        parts.append(raw)
+    Multilingual retrieval query for embedding search.
 
-    merged = " — ".join(p for p in parts if p).strip()
+    Always includes an English gloss (Brain meaning or retrieval translate) so
+    Hinglish/Hindi/other Indian-language questions align with English KB chunks.
+    Distinct parts joined with ' — ' for multi-query RRF; no keyword lists.
+    """
+    from services.translation_service import (
+        resolve_customer_reply_lang,
+        text_usable_as_english_retrieval,
+        to_en_for_retrieval,
+    )
+
+    raw = (original_msg or "").strip()
+    meaning = ((ai_route or {}).get("user_meaning") or "").strip()
+    en = (msg_en or "").strip()
+    reply_lang = resolve_customer_reply_lang(
+        raw, str((ai_route or {}).get("reply_lang") or "")
+    )
+    preflight = bool((ai_route or {}).get("_preflight_kb"))
+    ctx_tail = (conversation_context or "")[-800:]
+    cache_key = f"{raw}|{en}|{meaning}|{reply_lang}|{preflight}|{ctx_tail}"
+    try:
+        from services.chat_flow_telemetry import get_kb_turn_cache, set_kb_turn_cache
+
+        qcache = get_kb_turn_cache("kb_retrieval_query_cache") or {}
+        hit = qcache.get(cache_key)
+        if isinstance(hit, str) and hit.strip():
+            return hit
+    except ImportError:
+        qcache = None
+
+    english_gloss = ""
+    # Prefer Brain English meaning first — never wait on Google when brain already glossed.
+    if meaning:
+        if text_usable_as_english_retrieval(meaning):
+            english_gloss = meaning
+        else:
+            # Brain sometimes returns lightly Hinglish "meaning"; still better than raw
+            # for dense match against English chunks (no topic keyword maps).
+            meaning_en = to_en_for_retrieval(meaning, reply_lang)
+            english_gloss = meaning_en or meaning
+    elif en and text_usable_as_english_retrieval(en) and en.lower() != raw.lower():
+        english_gloss = en
+    elif raw:
+        english_gloss = to_en_for_retrieval(raw, reply_lang)
+
+    parts: list[str] = []
+    seen: set[str] = set()
+
+    def _add(part: str) -> None:
+        p = (part or "").strip()
+        if not p:
+            return
+        key = p.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        parts.append(p)
+
+    _add(english_gloss)
+    # Keep raw only when it differs — fulltext/hybrid can still use customer wording.
+    if raw and raw.lower() != (english_gloss or "").lower():
+        _add(raw)
+
+    merged = " — ".join(parts).strip()
     route = ai_route or {}
-    cat = (route.get("intent") or "").strip().lower()
-    kb_keys = route.get("kb_keys") or []
-    if (not cat or cat in ("general", "order_history")) and kb_keys:
-        cat = str(kb_keys[0]).strip().lower()
-    if cat and cat not in ("general", "order_history", "product", "order"):
-        merged = f"{merged} — topic: {cat}".strip(" —")
+    # Do NOT append "topic: …" into the embed string — it creates fake variants and
+    # dilutes similarity. Soft kb_keys already rerank in the retriever.
+
     if route.get("_preflight_kb"):
-        return _normalize_retrieval_query(merged or raw)
+        out = _normalize_retrieval_query(merged or english_gloss or raw)
+        try:
+            from services.chat_flow_telemetry import get_kb_turn_cache, set_kb_turn_cache
+
+            qcache = get_kb_turn_cache("kb_retrieval_query_cache") or {}
+            qcache[cache_key] = out
+            set_kb_turn_cache("kb_retrieval_query_cache", qcache)
+        except ImportError:
+            pass
+        return out
 
     try:
         from services.query_understanding import _is_short_or_vague_message, _last_user_snippets
@@ -1404,10 +1460,26 @@ def build_kb_retrieval_query(
             prior_snippets = _last_user_snippets(conversation_context)
             prior = " — ".join(s for s in prior_snippets if s).strip()
             if prior and prior.lower() not in (merged or "").lower():
-                merged = f"{prior} — {merged}".strip(" —") if merged else prior
+                # Prefer English gloss of prior+current for short follow-ups.
+                prior_en = to_en_for_retrieval(prior, reply_lang)
+                follow = english_gloss or raw
+                merged = " — ".join(
+                    dict.fromkeys(
+                        p for p in (prior_en, follow, raw if raw.lower() != (follow or "").lower() else "") if p
+                    )
+                )
     except ImportError:
         pass
-    return _normalize_retrieval_query(merged or raw)
+    out = _normalize_retrieval_query(merged or english_gloss or raw)
+    try:
+        from services.chat_flow_telemetry import get_kb_turn_cache, set_kb_turn_cache
+
+        qcache = get_kb_turn_cache("kb_retrieval_query_cache") or {}
+        qcache[cache_key] = out
+        set_kb_turn_cache("kb_retrieval_query_cache", qcache)
+    except ImportError:
+        pass
+    return out
 
 
 def log_kb_retrieval(
@@ -1516,7 +1588,8 @@ def format_direct_reply_from_kb_hit(
 
     rl_resolved = resolve_customer_reply_lang(original_msg, rl)
     src_list = [src] if src and src != "general" else None
-    if _kb_ai_focus_answer_enabled() and excerpt.strip():
+    # Fast lane = preflight / zero-LLM vector hit — skip extra focus LLM (latency).
+    if (not fast_lane) and _kb_ai_focus_answer_enabled() and excerpt.strip():
         grounded = _ground_kb_excerpt_for_customer(
             original_msg,
             excerpt,
@@ -1530,8 +1603,13 @@ def format_direct_reply_from_kb_hit(
     if not body:
         return ""
     if fast_lane:
+        # Zero extra LLM: polish + light finalize only (no localization grounding LLM).
         body = polish_faq_reply_for_customer(body, original_msg)
-        return _finalize_kb_customer_reply(body, original_msg, rl_resolved)
+        from services.translation_service import finalize_customer_reply
+
+        return finalize_customer_reply(
+            body, original_msg, rl_resolved, allow_llm_style_rewrite=False
+        )
     body = polish_faq_reply_for_customer(body, original_msg)
     return _finalize_kb_customer_reply(body, original_msg, rl_resolved)
 
@@ -1741,8 +1819,11 @@ def promote_route_from_semantic_kb_match(
     min_score: float = 0.28,
 ) -> dict | None:
     """
-    Strong admin-KB embedding match → lock welfog_support (any language).
-    Prevents brain JSON from misrouting FAQ/policy turns to OOD or chitchat.
+    Strong Admin-KB semantic match (Qdrant SoT) → lock welfog_support.
+
+    Used to rescue Brain OOD/chitchat misroutes when an active+indexed Admin
+    document already answers the question. No filename / keyword routing —
+    eligibility is embedding similarity only.
     """
     out = dict(route or {})
     if out.get("run_catalog_search") or out.get("_product_catalog_locked"):
@@ -1754,6 +1835,22 @@ def promote_route_from_semantic_kb_match(
             return None
     except ImportError:
         pass
+    # Never steal live transactional intents.
+    intent_now = (out.get("intent") or "").strip().lower()
+    channel_now = (out.get("data_channel") or "").strip().lower()
+    if intent_now in (
+        "order",
+        "order_history",
+        "wishlist",
+        "product",
+        "pincode_check",
+        "deals",
+        "categories",
+        "category_feed",
+    ) or channel_now in ("live_api", "catalog"):
+        return None
+    if out.get("_pincode_delivery_locked") or out.get("_pincode_delivery_fast"):
+        return None
     combined = f"{original_msg or ''} {msg_en or ''}".strip()
     if not combined:
         return None
@@ -1768,32 +1865,43 @@ def promote_route_from_semantic_kb_match(
     except ImportError:
         pass
 
-    q = build_kb_retrieval_query(original_msg, msg_en, "", ai_route=out)
+    # Probe with a temporary KB intent so Qdrant (not OOD-blocked memory probes) runs.
+    probe = dict(out)
+    probe["data_channel"] = "kb"
+    probe["is_welfog_related"] = True
+    probe["conversation_scope"] = "welfog_support"
+    probe["kb_keys"] = []  # unscoped — full Admin catalog
+
+    q = build_kb_retrieval_query(original_msg, msg_en, "", ai_route=probe)
     best = retrieve_best_kb_chunk(
         q or combined,
-        ai_route=out,
+        keys=get_customer_kb_keys() or None,
+        ai_route=probe,
         min_score=max(0.14, min_score - 0.12),
+        grounded=True,
     )
     score = float((best or {}).get("score") or 0)
     if not best or score < min_score:
         return None
 
-    src = str(best.get("source") or "").strip().lower()
-    intent = (out.get("intent") or "general").strip().lower()
-    if src == "seller":
-        intent = "seller"
-    elif src == "refund":
-        intent = "refund"
-    elif src == "payment" and intent not in ("order", "order_history"):
-        intent = "payment"
-    elif intent not in ("seller", "refund", "payment"):
-        intent = "general"
+    src = str(best.get("source") or "").strip()
+    try:
+        from services.knowledge_keys import canonical_knowledge_key
 
-    keys = resolve_brain_kb_keys(out, original_msg, msg_en)
+        src = canonical_knowledge_key(src) or src
+    except ImportError:
+        src = (src or "").lower()
+
+    keys: list[str] = []
     if src:
-        keys = list(dict.fromkeys([*(keys or []), src]))[:4]
+        keys = [src]
+    # Soft-merge any prior Brain hints after the semantic winner.
+    for k in resolve_brain_kb_keys(out, original_msg, msg_en) or []:
+        if k and k not in keys:
+            keys.append(k)
+    keys = keys[:4]
 
-    out["intent"] = intent
+    out["intent"] = "general"
     out["data_channel"] = "kb"
     out["conversation_scope"] = "welfog_support"
     out["is_welfog_related"] = True
@@ -1801,10 +1909,12 @@ def promote_route_from_semantic_kb_match(
     out["run_catalog_search"] = False
     out["search_query"] = ""
     out["scope_reply"] = ""
+    out["needs_order_id"] = False
     out.pop("category_only_browse", None)
     out.pop("category_browse", None)
     out.pop("_product_catalog_locked", None)
     out["_turn_promotions_done"] = True
+    out["_semantic_kb_rescue"] = True
     try:
         from services.chat_flow_telemetry import lock_authoritative_kb_route_from_retrieval
 
@@ -1815,6 +1925,10 @@ def promote_route_from_semantic_kb_match(
         )
     except ImportError:
         pass
+    log_reasoning(
+        f"Admin KB semantic rescue — source={src or '-'} score={score:.2f} "
+        f"(Brain OOD/misroute overridden by indexed knowledge)."
+    )
     return out
 
 
@@ -1829,8 +1943,8 @@ def select_best_kb_hit_for_customer_question(
     min_score: float | None = None,
 ) -> dict | None:
     """
-    Pick the strongest embedding match across brain-hinted files + faqs + related admin KB.
-    Brain kb_keys are hints — a higher-scoring chunk in another file always wins.
+    Strongest semantic match across ALL customer Admin docs.
+    preferred_keys / Brain hints are soft only — higher raw score always wins.
     """
     floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
     filter_q = build_kb_retrieval_query(
@@ -1840,49 +1954,29 @@ def select_best_kb_hit_for_customer_question(
     if not combined:
         return None
 
+    route = dict(ai_route or {})
     valid = [
         k
         for k in (preferred_keys or [])
         if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS
     ][:4]
+    if valid and not route.get("kb_keys"):
+        route["kb_keys"] = valid
 
-    key_sets: list[list[str] | None] = []
-    if valid:
-        key_sets.append(valid)
-    if "faqs" in kb_chunks_by_key:
-        key_sets.append(["faqs"])
-    for hint in ("seller", "privacy", "company", "payment", "refund", "shipping", "support"):
-        if hint in kb_chunks_by_key and hint not in valid:
-            key_sets.append([hint])
-    if not brain_locked_kb:
-        key_sets.append(None)
+    # One catalog-wide search — never a predefined classic-file loop.
+    if brain_locked_kb and valid:
+        search_keys = valid
+    else:
+        search_keys = get_customer_kb_keys() or None
 
-    best_hit: dict | None = None
-    best_score = -1.0
-    seen: set[str] = set()
-    search_floor = max(0.12, floor - 0.12)
-
-    for keys in key_sets:
-        hit = retrieve_best_kb_chunk(
-            combined,
-            keys=keys,
-            ai_route=ai_route,
-            min_score=search_floor,
-        )
-        if not hit:
-            continue
-        norm = _chunk_dedup_key(hit.get("chunk") or "")
-        if norm and norm in seen:
-            continue
-        if norm:
-            seen.add(norm)
-        sc = float(hit.get("score") or 0)
-        if sc > best_score:
-            best_score = sc
-            best_hit = hit
-
-    if best_hit and best_score >= floor:
-        return best_hit
+    hit = retrieve_best_kb_chunk(
+        combined,
+        keys=search_keys,
+        ai_route=route,
+        min_score=max(0.12, floor - 0.12),
+    )
+    if hit and float(hit.get("score") or 0) >= floor:
+        return hit
     return None
 
 
@@ -1893,12 +1987,31 @@ def retrieve_best_kb_chunk(
     ai_route: dict | None = None,
     min_score: float | None = None,
     conflict_check: bool = True,
+    grounded: bool = True,
 ) -> dict | None:
-    """Semantic search + rerank; None when confidence is below answer threshold."""
+    """
+    Semantic search + rerank.
+    grounded=True (default): when Qdrant KB backend is on, use Qdrant only for answer chunks.
+    grounded=False: MiniLM memory path allowed (routing / intent assists).
+    """
     floor = float(min_score if min_score is not None else KB_ANSWER_MIN_CONFIDENCE)
     search_floor = max(0.12, floor - 0.1)
+    kb_intent = False
+    if grounded:
+        try:
+            from services.knowledge_retriever import is_qdrant_kb_retrieval_enabled
+
+            kb_intent = bool(is_qdrant_kb_retrieval_enabled())
+        except ImportError:
+            kb_intent = False
     hits = semantic_kb_search(
-        query, keys=keys, top_n=8, min_score=search_floor, log_retrieval=False, ai_route=ai_route
+        query,
+        keys=keys,
+        top_n=8,
+        min_score=search_floor,
+        log_retrieval=False,
+        ai_route=ai_route,
+        kb_intent=kb_intent,
     )
     return _pick_best_kb_hit_for_query(
         query,
@@ -1919,8 +2032,10 @@ def resolve_kb_keys_for_question(
     ai_route: dict | None = None,
 ) -> list[str]:
     """
-    Pick which admin knowledge files to use — no hardcoded topic→file map.
-    Uses Groq kb_keys when valid, else embedding + keyword search across ALL customer .txt files.
+    Soft file hints via semantic ranking across ALL active Admin customer docs.
+
+    No predefined topic→file map, no contact keyword force, no classic-name boost.
+    Empty return → callers run unscoped Qdrant retrieval.
     """
     ensure_knowledge_cache_fresh()
     query = build_kb_retrieval_query(
@@ -1933,105 +2048,37 @@ def resolve_kb_keys_for_question(
         return []
 
     try:
-        from utils.helpers import _text_asks_customer_care_contact
-
-        if _user_requests_grievance_channel(query):
-            prefer = [k for k in ("company", "privacy") if k in customer_keys]
-            if prefer:
-                return prefer[:max_files]
-        if _text_asks_customer_care_contact(query) and not _user_requests_grievance_channel(query):
-            sc = get_support_contact_kb_keys()
-            if sc:
-                return sc[:max_files]
+        from services.knowledge_keys import canonical_knowledge_key
     except ImportError:
-        pass
+        canonical_knowledge_key = lambda t: (t or "").strip().lower()  # noqa: E731
 
-    valid_suggested = [
-        k for k in (suggested_keys or []) if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS
-    ]
+    valid_suggested = []
+    for k in suggested_keys or []:
+        ck = canonical_knowledge_key(str(k or ""))
+        if ck and ck in kb_chunks_by_key and ck not in INTERNAL_KB_KEYS and ck in customer_keys:
+            valid_suggested.append(ck)
+    valid_suggested = list(dict.fromkeys(valid_suggested))
 
-    try:
-        from services.query_understanding import (
-            filter_kb_keys_for_intent,
-            infer_kb_query_category,
-            scoped_kb_keys_for_retrieval,
-        )
-
-        category = infer_kb_query_category(
-            original_msg,
-            msg_en,
-            ai_route=ai_route,
-            conversation_context=conversation_context,
-        )
-        scoped_keys = scoped_kb_keys_for_retrieval(
-            category, ai_route=ai_route, user_meaning=query
-        )
-        if valid_suggested:
-            valid_suggested = filter_kb_keys_for_intent(
-                valid_suggested,
-                category,
-                user_meaning=query,
-            )
-    except ImportError:
-        category = "general"
-        scoped_keys = None
-
-    try:
-        from services.query_understanding import filter_kb_keys_for_intent
-
-        if valid_suggested and not scoped_keys:
-            intent_guess = category if category != "general" else ""
-            valid_suggested = filter_kb_keys_for_intent(
-                valid_suggested,
-                intent_guess or "general",
-                user_meaning=query,
-            )
-    except ImportError:
-        pass
-
-    ranked: list[tuple[float, str]] = []
-    search_keys = [k for k in (scoped_keys if scoped_keys else customer_keys) if k in customer_keys]
     file_rank_floor = min(0.12, KB_CONTEXT_MIN_SCORE)
-    cat_l = (category or "general").strip().lower()
-    effective_cat = cat_l
     best_per_key: dict[str, float] = {}
-    if search_keys:
-        hits = semantic_kb_search(
-            query,
-            keys=search_keys,
-            top_n=min(32, max(len(search_keys) * 4, max_files * 6)),
-            min_score=file_rank_floor,
-            customer_only=False,
-            log_retrieval=False,
-        )
-        for h in hits:
-            src = str(h.get("source") or "")
-            sc = float(h.get("score") or 0)
-            if src in search_keys and sc >= file_rank_floor:
-                best_per_key[src] = max(best_per_key.get(src, 0.0), sc)
-    for k, score in best_per_key.items():
-        kl = k.lower()
-        if effective_cat not in ("", "general"):
-            if kl == effective_cat or effective_cat in kl:
-                score += 0.1
-            elif effective_cat in ("refund", "return") and "refund" in kl:
-                score += 0.08
-            elif effective_cat == "payment" and "payment" in kl:
-                score += 0.08
-            elif effective_cat == "shipping" and "shipping" in kl:
-                score += 0.08
-            elif effective_cat == "seller" and "seller" in kl:
-                score += 0.08
-        ranked.append((score, k))
-    ranked.sort(key=lambda x: x[0], reverse=True)
-    keys_from_embed = [k for _, k in ranked[:max_files]]
-    if effective_cat not in ("", "general"):
-        prim = next((k for k in customer_keys if k == effective_cat), "")
-        if not prim:
-            prim = next((k for k in customer_keys if effective_cat in k), "")
-        if prim and best_per_key.get(prim, 0.0) >= file_rank_floor:
-            keys_from_embed = [prim] + [k for k in keys_from_embed if k != prim]
-            keys_from_embed = keys_from_embed[:max_files]
+    hits = semantic_kb_search(
+        query,
+        keys=customer_keys,
+        top_n=min(32, max(len(customer_keys) * 4, max_files * 6)),
+        min_score=file_rank_floor,
+        customer_only=False,
+        log_retrieval=False,
+        ai_route=ai_route,
+        kb_intent=True,
+    )
+    for h in hits:
+        src = str(h.get("source") or "")
+        sc = float(h.get("score") or 0)
+        if src in customer_keys and sc >= file_rank_floor:
+            best_per_key[src] = max(best_per_key.get(src, 0.0), sc)
+
+    ranked = sorted(best_per_key.items(), key=lambda x: x[1], reverse=True)
+    keys_from_embed = [k for k, _ in ranked[:max_files]]
 
     if keys_from_embed:
         try:
@@ -2039,18 +2086,19 @@ def resolve_kb_keys_for_question(
                 query, keys=keys_from_embed, min_score=0.14, top_n=3, log_retrieval=False
             )
             log_kb_retrieval(
-                query_intent=category,
+                query_intent="semantic",
                 query_meaning=((ai_route or {}).get("user_meaning") or "").strip(),
                 retrieval_query=query,
                 matched_file=keys_from_embed[0],
-                selected_category=category,
+                selected_category="semantic",
                 similarity_score=float(hits_preview[0].get("score") or 0) if hits_preview else 0.0,
                 selected_chunks=hits_preview,
             )
         except Exception:
             pass
         if valid_suggested:
-            merged = list(dict.fromkeys(valid_suggested + keys_from_embed))
+            # Soft merge: semantic winners first, then Brain hints.
+            merged = list(dict.fromkeys(keys_from_embed + valid_suggested))
             return merged[:max_files]
         return keys_from_embed
 
@@ -2061,7 +2109,7 @@ def resolve_kb_keys_for_question(
     if best and best.get("source") in customer_keys:
         return [best["source"]]
 
-    return customer_keys[: min(2, len(customer_keys))]
+    return []
 
 
 def _ai_response_looks_like_placeholder(text: str) -> bool:
@@ -2679,7 +2727,10 @@ def format_kb_answer_from_brain_keys(
             should_generate_qdrant_kb_answer,
         )
 
-        if should_generate_qdrant_kb_answer(route):
+        q_route = dict(route)
+        if (q_route.get("data_channel") or "").strip().lower() != "kb":
+            q_route["data_channel"] = "kb"
+        if should_generate_qdrant_kb_answer(q_route):
             qdrant_answer = generate_grounded_kb_answer_from_qdrant(
                 original_msg,
                 msg_en=msg_en,
@@ -2687,10 +2738,20 @@ def format_kb_answer_from_brain_keys(
                 reply_lang=reply_lang,
                 conversation_context=conversation_context,
                 user_meaning_en=user_meaning_en,
-                ai_route=route,
+                ai_route=q_route,
             )
             if qdrant_answer is not None:
                 return qdrant_answer
+    except ImportError:
+        pass
+
+    # Single retrieval SoT: when Qdrant KB backend is on, never answer from MiniLM
+    # memory index or raw MySQL blob (avoids stale / unindexed grounded answers).
+    try:
+        from services.knowledge_retriever import is_qdrant_kb_retrieval_enabled
+
+        if is_qdrant_kb_retrieval_enabled():
+            return _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang) or ""
     except ImportError:
         pass
 
@@ -2730,28 +2791,27 @@ def format_kb_answer_from_brain_keys(
         and valid_key_set.issubset(brain_raw_keys)
     )
 
-    # Brain-hinted files + cross-file semantic winner (brain keys are hints, not prisons).
-    if valid or "faqs" in kb_chunks_by_key:
-        semantic_hit = select_best_kb_hit_for_customer_question(
+    # Brain-hinted files are soft preferred_keys only — search all customer docs.
+    semantic_hit = select_best_kb_hit_for_customer_question(
+        original_msg,
+        msg_en,
+        conversation_context=conversation_context,
+        preferred_keys=valid,
+        ai_route=route,
+        brain_locked_kb=brain_locked_kb,
+        min_score=KB_ANSWER_MIN_CONFIDENCE,
+    )
+    if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
+        direct = format_direct_reply_from_kb_hit(
+            semantic_hit,
             original_msg,
-            msg_en,
+            reply_lang=lang,
+            retrieval_query=filter_q or combined,
+            fast_lane=True,
             conversation_context=conversation_context,
-            preferred_keys=valid,
-            ai_route=route,
-            brain_locked_kb=brain_locked_kb,
-            min_score=KB_ANSWER_MIN_CONFIDENCE,
         )
-        if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-            direct = format_direct_reply_from_kb_hit(
-                semantic_hit,
-                original_msg,
-                reply_lang=lang,
-                retrieval_query=filter_q or combined,
-                fast_lane=True,
-                conversation_context=conversation_context,
-            )
-            if direct:
-                return direct
+        if direct:
+            return direct
 
     if valid:
         scoped_hit = retrieve_best_kb_chunk(
@@ -2793,14 +2853,13 @@ def format_kb_answer_from_brain_keys(
     budget = _infer_kb_answer_budget(combined)[0]
     filtered = ""
     keys_scoped = brain_locked_kb
-    search_scope = list(valid)[:4]
-    if not keys_scoped:
-        search_scope = list(
-            dict.fromkeys(
-                search_scope
-                + [k for k in ("faqs",) if k in kb_chunks_by_key and k not in search_scope]
-            )
-        )[:4]
+    # Prefer Brain soft hints when present; otherwise search all customer docs.
+    search_scope = list(valid)[:4] if valid else None
+    if not keys_scoped and not search_scope:
+        try:
+            search_scope = get_customer_kb_keys()
+        except Exception:
+            search_scope = None
 
     semantic_hit = retrieve_best_kb_chunk(
         filter_q or combined,
@@ -2808,32 +2867,18 @@ def format_kb_answer_from_brain_keys(
         ai_route=route,
         min_score=KB_ANSWER_MIN_CONFIDENCE,
     )
-    if "faqs" in kb_chunks_by_key and not brain_locked_kb:
-        faq_hit = resolve_best_faq_chunk_for_question(
-            original_msg,
-            msg_en,
-            conversation_context,
-            ai_route=route,
-        )
-        if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-            if not semantic_hit or float(faq_hit.get("score") or 0) >= float(
-                semantic_hit.get("score") or 0
-            ):
-                semantic_hit = faq_hit
-    elif "faqs" in kb_chunks_by_key and brain_locked_kb and "faqs" in search_scope:
-        faq_hit = resolve_best_faq_chunk_for_question(
-            original_msg,
-            msg_en,
-            "" if keys_scoped else conversation_context,
-            ai_route=route,
-        )
-        if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-            if semantic_hit and float(faq_hit.get("score") or 0) < float(
-                semantic_hit.get("score") or 0
-            ):
-                pass
-            elif not semantic_hit:
-                semantic_hit = faq_hit
+    # Soft FAQ-style boost only when it does not lose to a stronger semantic hit.
+    faq_hit = resolve_best_faq_chunk_for_question(
+        original_msg,
+        msg_en,
+        conversation_context if not keys_scoped else "",
+        ai_route=route,
+    )
+    if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
+        if not semantic_hit or float(faq_hit.get("score") or 0) >= float(
+            semantic_hit.get("score") or 0
+        ):
+            semantic_hit = faq_hit
     if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
         direct = format_direct_reply_from_kb_hit(
             semantic_hit,
@@ -3694,20 +3739,17 @@ def format_short_video_rules_reply_from_kb(
     reply_lang: str = "",
     conversation_context: str = "",
 ) -> str:
-    """Delegates to universal admin KB (terms/seller/privacy files — auto-discovered)."""
-    from utils.helpers import _text_asks_short_video_content_rules
-
-    combined = f"{original_msg} {msg_en}"
-    if not _text_asks_short_video_content_rules(combined, conversation_context):
-        return ""
-    keys = [k for k in ("terms", "seller", "privacy") if k in kb_chunks_by_key]
+    """
+    Answer short-video / reels questions via universal Admin semantic KB.
+    No hardcoded terms/seller/privacy keys — any indexed Admin doc can win.
+    """
     return format_dynamic_kb_answer(
         original_msg,
         msg_en,
         reply_lang=reply_lang,
         conversation_context=conversation_context,
-        suggested_keys=keys or None,
-        title_hint="Welfog Short Video / Shorts",
+        suggested_keys=None,
+        title_hint="",
     )
 
 
@@ -3727,13 +3769,8 @@ def get_welfog_social_links_from_kb() -> list[tuple[str, str, str]]:
     seen_slugs: set[str] = set()
 
     for key in get_customer_kb_keys():
-        path = get_runtime_knowledge_files().get(key)
-        if not path or not os.path.isfile(path):
-            continue
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                text = f.read()
-        except OSError:
+        text = get_runtime_knowledge_files().get(key)
+        if not isinstance(text, str) or not text.strip():
             continue
         for raw in text.splitlines():
             line = raw.strip()
@@ -4320,6 +4357,7 @@ def get_knowledge_context(query, keys=None, top_k=3, min_score=None, ai_route=No
     """
     If keys provided, search within those knowledge files only; else customer KB files.
     Returns an HTML string to inject into the system prompt.
+    When Qdrant KB backend is enabled, uses Qdrant only (no MiniLM context cache).
     """
     floor = float(min_score if min_score is not None else KB_CONTEXT_MIN_SCORE)
     norm_q = _normalize_retrieval_query(query)
@@ -4329,10 +4367,22 @@ def get_knowledge_context(query, keys=None, top_k=3, min_score=None, ai_route=No
     try:
         from services.knowledge_retriever import (
             format_knowledge_context_string,
+            is_qdrant_kb_retrieval_enabled,
             should_use_qdrant_retrieval,
             retrieve_knowledge_context,
         )
 
+        if is_qdrant_kb_retrieval_enabled():
+            result = retrieve_knowledge_context(
+                norm_q,
+                top_k=top_k,
+                min_score=floor,
+                categories=keys,
+                ai_route=ai_route,
+                kb_intent=True,
+                log=True,
+            )
+            return format_knowledge_context_string(result.hits)
         if should_use_qdrant_retrieval(ai_route=ai_route, kb_intent=True):
             result = retrieve_knowledge_context(
                 norm_q,
@@ -4427,15 +4477,26 @@ def rank_customer_kb_files_by_embedding(
     return [(k, s) for k, s in ranked[:top_n] if s >= floor]
 
 
-def best_kb_hit(query, keys=None, min_score=None):
+def best_kb_hit(query, keys=None, min_score=None, ai_route=None):
     """
-    Returns the best matching KB chunk (raw HTML chunk) with its score and source.
-    Uses semantic search + rerank (same as retrieve_best_kb_chunk).
+    Best matching KB chunk for grounded answers.
+    Qdrant backend: does not require MiniLM in-memory index.
     """
-    if not (query or "").strip() or not all_chunks:
+    if not (query or "").strip():
         return None
     floor = float(min_score if min_score is not None else KB_SEMANTIC_MIN_SCORE)
-    return retrieve_best_kb_chunk(query, keys=keys, min_score=floor)
+    try:
+        from services.knowledge_retriever import is_qdrant_kb_retrieval_enabled
+
+        if is_qdrant_kb_retrieval_enabled():
+            return retrieve_best_kb_chunk(
+                query, keys=keys, min_score=floor, ai_route=ai_route
+            )
+    except ImportError:
+        pass
+    if not all_chunks:
+        return None
+    return retrieve_best_kb_chunk(query, keys=keys, min_score=floor, ai_route=ai_route)
 
 
 def top_kb_hits(
