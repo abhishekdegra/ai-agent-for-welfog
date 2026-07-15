@@ -302,39 +302,44 @@ def ai_chitchat_reply(
         return ""
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    compact_ctx = _compact_conversation_context(conversation_context or "", 1800)
-    user_line = _trim_text_mid(comb, 240)
+    # Tiny context — chitchat must stay snappy.
+    compact_ctx = _compact_conversation_context(conversation_context or "", 280)
+    user_line = _trim_text_mid(comb, 120)
 
-    system_prompt = f"""You are Welfog's friendly shopping support assistant in live chat.
+    system_prompt = f"""Welfog live-chat assistant. User sent CASUAL chitchat (hi/thanks/bye/smalltalk) in ANY language.
 
-The user sent CASUAL CHIT-CHAT (not a shopping/order question): greeting, thanks, praise, bye,
-"how are you", "what are you doing", "are you free/busy", light small talk — ANY language/script.
+JSON only: {{"reasoning":"1 line","response":"reply"}}
 
-Return ONLY JSON: {{"reasoning":"1 line","response":"reply"}}
-
-RULES:
-- "response" in the SAME language, script, and conversational STYLE as the user's LATEST message
-  (Hinglish, Hindi, English, slang, formal, poetic, playful — mirror their vibe; never default to plain "Hi").
-- 1-3 short sentences — warm, natural, human (like ChatGPT in live chat, not a corporate bot).
-- Greeting (any wording) → greet back in their style; light mention you help with Welfog shopping/orders if natural.
-- Thanks / praise / satisfaction ("maza aa gaya", "bahut accha", "help ke liye dhanyawad") → warm acknowledgment;
-  do NOT restart with "Hello! How can I help"; say they can return anytime for Welfog help.
-- "Are you free/busy?" → you are always here on chat; light friendly tone in their language.
-- "What are you doing?" → you're on Welfog support chat, ready to help — match their casual/formal tone.
-- Bye / closing / no more help → friendly sign-off; welcome them back whenever they need Welfog support.
-- Do NOT search products, do NOT ask for Order ID, do NOT dump policies.
-- Do NOT echo the user's message verbatim.
-{language_reply_instruction(rl)}
-JSON only."""
+Rules:
+- Mirror user's language, script, slang/typos (Hinglish stays Hinglish).
+- 1-2 short warm lines. Vary wording; never stock "Hello! Good to see you on Welfog…".
+- Bye/thanks → sign-off/ack, do not restart with Hello.
+- No products, Order ID, policies, or verbatim echo.
+{language_reply_instruction(rl)}"""
 
     user_payload = ""
     if compact_ctx:
-        user_payload += f"RECENT CONVERSATION:\n{compact_ctx}\n\n"
-    user_payload += f"LATEST USER MESSAGE (chitchat):\n{user_line}"
+        user_payload += f"RECENT:\n{compact_ctx}\n\n"
+    user_payload += f"LATEST:\n{user_line}"
 
-    providers = _llm_classifier_provider_chain()
+    try:
+        from services.llm_providers import get_fast_chitchat_provider_chain
+
+        # Prefer Groq Instant when available — admin often pins OpenAI first for Brain.
+        # Allow one fallback if Groq stalls (still within short timeout).
+        cap = max(1, min(2, int(os.getenv("CHITCHAT_AI_MAX_PROVIDERS", "2") or "2")))
+        providers = get_fast_chitchat_provider_chain(max_providers=cap)
+    except ImportError:
+        providers = _llm_classifier_provider_chain()[:1]
     if not providers:
         return ""
+
+    try:
+        timeout_sec = max(
+            1.5, min(5.0, float(os.getenv("CHITCHAT_AI_TIMEOUT_SEC", "2.5") or 2.5))
+        )
+    except (TypeError, ValueError):
+        timeout_sec = 2.5
 
     data = _llm_json_with_provider_fallback(
         providers,
@@ -342,10 +347,10 @@ JSON only."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ],
-        max_tokens=200,
-        timeout_sec=8,
+        max_tokens=140,
+        timeout_sec=timeout_sec,
         max_attempts=1,
-        temperature=0.35,
+        temperature=0.45,
     )
     if not data:
         return ""
@@ -369,7 +374,7 @@ def ai_ood_reply(
     conversation_context: str = "",
     reply_lang: str = "en",
 ) -> str:
-    """Out-of-domain reply — AI only, mirrors user language/style."""
+    """Out-of-domain reply — AI only, mirrors user language/style. Fast path for production."""
     if (os.getenv("CHITCHAT_AI_REPLY", "1") or "1").strip().lower() in (
         "0",
         "false",
@@ -381,7 +386,6 @@ def ai_ood_reply(
     from services.ai_service import (
         _compact_conversation_context,
         _llm_json_with_provider_fallback,
-        _llm_classifier_provider_chain,
         _trim_text_mid,
     )
     from services.translation_service import (
@@ -395,8 +399,9 @@ def ai_ood_reply(
         return ""
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    compact_ctx = _compact_conversation_context(conversation_context or "", 1800)
-    user_line = _trim_text_mid(comb, 240)
+    # Tiny context — OOD must finish in ~1s, not re-read a long thread.
+    compact_ctx = _compact_conversation_context(conversation_context or "", 600)
+    user_line = _trim_text_mid(comb, 200)
 
     system_prompt = f"""You are Welfog's shopping support assistant in live chat.
 
@@ -405,22 +410,38 @@ The user's message is OUT OF DOMAIN — not about Welfog shopping, orders, deliv
 Return ONLY JSON: {{"reasoning":"1 line","response":"reply"}}
 
 RULES:
-- "response" in the SAME language, script, and tone as the user's LATEST message.
-- 1-3 short sentences: briefly acknowledge their topic in their style, say you only help
-  with Welfog shopping/orders/delivery, invite a Welfog question.
-- Do NOT answer off-topic facts (weather, cricket, recipes, homework, etc.).
-- Warm and human — not a stiff corporate template.
+- "response" MUST match the user's LATEST message language, script, and tone
+  (Hinglish stays Hinglish; English stays English; Hindi script stays Hindi).
+- 1–2 short sentences only: briefly nod to their topic in their words, then say you only
+  help with Welfog products/orders/delivery/returns, and invite one short Welfog question.
+- Do NOT answer the off-topic question with facts, advice, forecasts, or steps.
+- Warm and human — never paste the same corporate template every time; vary with their topic.
 {language_reply_instruction(rl)}
 JSON only."""
 
     user_payload = ""
     if compact_ctx:
-        user_payload += f"RECENT CONVERSATION:\n{compact_ctx}\n\n"
-    user_payload += f"LATEST USER MESSAGE (off-topic):\n{user_line}"
+        user_payload += f"RECENT:\n{compact_ctx}\n\n"
+    user_payload += f"LATEST (off-topic):\n{user_line}"
 
-    providers = _llm_classifier_provider_chain()
+    try:
+        from services.llm_providers import get_fast_chitchat_provider_chain
+
+        cap = max(1, min(2, int(os.getenv("OOD_AI_MAX_PROVIDERS", "1") or "1")))
+        providers = get_fast_chitchat_provider_chain(max_providers=cap)
+    except ImportError:
+        from services.ai_service import _llm_classifier_provider_chain
+
+        providers = _llm_classifier_provider_chain()[:1]
     if not providers:
         return ""
+
+    try:
+        timeout_sec = max(
+            1.5, min(5.0, float(os.getenv("OOD_AI_TIMEOUT_SEC", "2.5") or 2.5))
+        )
+    except (TypeError, ValueError):
+        timeout_sec = 2.5
 
     data = _llm_json_with_provider_fallback(
         providers,
@@ -428,10 +449,10 @@ JSON only."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ],
-        max_tokens=200,
-        timeout_sec=8,
+        max_tokens=120,
+        timeout_sec=timeout_sec,
         max_attempts=1,
-        temperature=0.35,
+        temperature=0.45,
     )
     if not data:
         return ""
@@ -584,6 +605,107 @@ def resolve_brain_scope_customer_reply(
     if body:
         log_reasoning(f"Brain scope AI reply ({scope}) — no template fallback.")
     return body or ""
+
+
+def brain_locked_conversational_scope(brain_route: dict | None) -> str:
+    """
+    Return general_chitchat | out_of_domain | harm_sensitive when Brain already locked
+    a non-commerce conversational turn — else empty.
+
+    Uses Brain JSON only (no customer keyword lists). Never conflicts with locked
+    product catalog / KB / live order / account-list turns.
+    """
+    if not isinstance(brain_route, dict):
+        return ""
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        if product_catalog_route_is_locked(brain_route):
+            return ""
+    except ImportError:
+        pass
+    try:
+        from services.ai_route_semantics import (
+            brain_route_indicates_product_catalog,
+            brain_route_prefers_kb_answer,
+        )
+
+        if brain_route_indicates_product_catalog(brain_route):
+            return ""
+        if brain_route_prefers_kb_answer(brain_route):
+            return ""
+    except ImportError:
+        pass
+    channel = (brain_route.get("data_channel") or "").strip().lower()
+    if channel == "catalog" and brain_route.get("run_catalog_search"):
+        return ""
+    if channel == "kb" and (brain_route.get("kb_keys") or []):
+        return ""
+    if brain_route.get("needs_order_id"):
+        return ""
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+
+        if account_list_route_is_locked(brain_route):
+            return ""
+    except ImportError:
+        pass
+
+    intent = (brain_route.get("intent") or "").strip().lower()
+    scope = (brain_route.get("conversation_scope") or "").strip().lower()
+    if scope == "harm_sensitive":
+        return "harm_sensitive"
+    if intent == "out_of_domain" or scope == "out_of_domain":
+        return "out_of_domain"
+    if brain_route.get("is_welfog_related") is False and intent not in (
+        "product",
+        "order",
+        "order_history",
+        "wishlist",
+        "refund",
+        "payment",
+        "seller",
+        "pincode_check",
+        "deals",
+        "categories",
+    ):
+        return "out_of_domain"
+    if scope == "general_chitchat":
+        return "general_chitchat"
+    return ""
+
+
+def try_immediate_brain_scope_reply(
+    brain_route: dict | None,
+    *,
+    original_msg: str,
+    msg_en: str = "",
+    conversation_context: str = "",
+    reply_lang: str = "en",
+    ctx: dict | None = None,
+) -> str:
+    """
+    Production OOD/chitchat/harm path: Brain-lock → customer reply in one shot.
+
+    Prefer Brain-authored scope_reply (already in routing LLM). Otherwise one short
+    AI decline. Never probes OpenSearch / KB / order APIs.
+    """
+    scope = brain_locked_conversational_scope(brain_route)
+    if not scope:
+        return ""
+    body = resolve_brain_scope_customer_reply(
+        brain_route,
+        scope,
+        original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+        reply_lang=reply_lang,
+        ctx=ctx,
+    )
+    if body and str(body).strip():
+        log_reasoning(f"Immediate Brain scope reply ({scope}) — skip catalog/KB/order.")
+        return str(body).strip()
+    return ""
 
 
 def resolve_natural_conversational_reply(

@@ -168,6 +168,26 @@ def resolve_explicit_turn_goal_from_message(
 
     _EXPLICIT_GOAL_GUARD.active = True
     try:
+        try:
+            from services.refund_status_semantics import (
+                KIND_PERSONAL_STATUS,
+                resolve_refund_turn,
+            )
+
+            # Latest user meaning first — do not let a stale track olk on ai_route win.
+            resolved = resolve_refund_turn(
+                current_msg,
+                msg_en,
+                conversation_context,
+                ai_route=None,
+                reply_lang=reply_lang,
+                allow_llm=False,
+            )
+            if resolved.kind == KIND_PERSONAL_STATUS:
+                return "refund_status"
+        except ImportError:
+            pass
+
         route_goal = _thread_goal_from_ai_route_meaning(ai_route)
         if route_goal:
             return route_goal

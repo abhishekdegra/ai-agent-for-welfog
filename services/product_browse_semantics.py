@@ -166,6 +166,13 @@ def llm_meaning_is_not_product_browse(route: dict | None) -> bool:
         r"\b(?:wishlist|saved\s+items)\b",
         r"\b(?:privacy|terms|policy)\s+(?:read|show)\b",
         r"\b(?:founder|ceo|company\s+story)\b",
+        # English Brain/classifier meaning — not customer keyword routing
+        r"\bcasually\s+talking\b",
+        r"\bnot\s+asking\s+for\s+shopping\b",
+        r"\bnot\s+(?:a\s+)?(?:shopping|product|catalog)\b",
+        r"\b(?:greeting|small\s*talk|chitchat|chit-?chat|farewell|sign[-\s]?off)\b",
+        r"\b(?:thanks|thanking|goodbye|signing\s+off)\b",
+        r"\bno\s+product\s+(?:or\s+)?shopping\b",
     )
     return any(re.search(p, blob) for p in block_patterns)
 

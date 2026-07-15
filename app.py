@@ -87,10 +87,46 @@ def _warmup_ai_on_startup() -> None:
         print(f"[startup] embedding warmup failed (lazy load on first use): {exc}", flush=True)
 
 
+def _resolve_sqlalchemy_database_uri() -> str:
+    """
+    Admin SQLite URI from .env, always rooted at support/ BASE_DIR.
+
+    Flask turns bare relative ``sqlite:///welfog_v2.db`` into
+    ``support/instance/welfog_v2.db`` (often empty) — that caused
+    "Invalid username or password" after DATABASE_URL was added to .env.
+    """
+    raw = (os.getenv("DATABASE_URL") or "").strip()
+    default_path = os.path.join(BASE_DIR, "welfog_v2.db")
+    if not raw:
+        return "sqlite:///" + default_path.replace("\\", "/")
+    if raw.startswith("sqlite:///"):
+        path_part = raw[len("sqlite:///") :]
+        # Absolute POSIX or Windows (C:/...) — keep as-is.
+        if path_part.startswith("/") or (
+            len(path_part) >= 3 and path_part[1] == ":" and path_part[2] in "/\\"
+        ):
+            return "sqlite:///" + path_part.replace("\\", "/")
+        # Relative path → support/ (never Flask instance/)
+        abs_path = os.path.normpath(os.path.join(BASE_DIR, path_part))
+        return "sqlite:///" + abs_path.replace("\\", "/")
+    return raw
+
+
 def create_app():
     app = Flask(__name__)
-    app.secret_key = os.getenv("FLASK_SECRET_KEY") or token_hex(32)
-    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///" + os.path.join(BASE_DIR, "welfog_v2.db")
+    # Secrets only from support/.env — never hardcode FLASK_SECRET_KEY / SECRET_KEY.
+    secret = (os.getenv("FLASK_SECRET_KEY") or os.getenv("SECRET_KEY") or "").strip()
+    if not secret:
+        secret = token_hex(32)
+        print(
+            "[startup] FLASK_SECRET_KEY missing in .env — using ephemeral key "
+            "(set FLASK_SECRET_KEY in support/.env for stable sessions).",
+            flush=True,
+        )
+    app.secret_key = secret
+    db_url = _resolve_sqlalchemy_database_uri()
+    app.config["SQLALCHEMY_DATABASE_URI"] = db_url
+    print(f"[startup] Admin SQLite: {db_url}", flush=True)
     app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
     app.config["SESSION_COOKIE_HTTPONLY"] = True
     app.config["SESSION_COOKIE_SAMESITE"] = "Lax"

@@ -613,6 +613,8 @@ PRODUCT_TYPE_NOUNS = frozenset(
         "shirt", "tshirt", "mobile", "phone", "tablet", "watch", "wallet", "bag", "shoe", "shoes",
         "saree", "dress", "sunglasses", "spectacles", "book", "books", "accessory", "accessories",
         "lipstick", "perfume", "belt", "cap", "hat", "socks", "sandal", "sandals", "slipper", "slippers",
+        "flipflop", "flipflops", "baniyan", "banyan", "baniya", "vest", "topi", "undershirt",
+        "innerwear", "pajama", "adaptor",
         "rice", "wheat", "jug", "bottle", "flour", "atta", "dal", "lentil", "oil", "milk", "bread",
         "cooker", "pan", "pot", "utensil", "toy", "toys", "sofa", "chair", "table", "bedsheet",
         "towel", "soap", "shampoo", "cream", "lotion", "fan", "bulb", "lamp", "keyboard", "mouse",
@@ -980,45 +982,9 @@ def _split_product_query(query: str) -> list:
         tokens = re.findall(r"[a-z0-9]+", text.lower())
         return any(_token_is_product_noun(tok) for tok in tokens)
 
-    if len(parts) == 2 and _has_product_noun(parts[-1]) and not _has_product_noun(parts[0]):
-        tail_tokens = re.findall(r"[a-z0-9]+", parts[-1].lower())
-        tail = []
-        generic_prefixed = {
-            "mobile",
-            "phone",
-            "tablet",
-            "watch",
-            "bag",
-            "wallet",
-            "shoe",
-            "shoes",
-            "case",
-            "cover",
-            "charger",
-            "cable",
-            "adapter",
-            "earphone",
-            "earbud",
-            "glass",
-            "protector",
-            "shirt",
-            "pant",
-            "pants",
-            "jeans",
-            "sunglasses",
-            "spectacles",
-        }
-        for idx in range(len(tail_tokens) - 1, -1, -1):
-            tok = tail_tokens[idx]
-            if tok in product_nouns:
-                if idx > 0 and tail_tokens[idx - 1] in generic_prefixed:
-                    tail = tail_tokens[idx - 1 :]
-                else:
-                    tail = tail_tokens[idx:]
-                break
-        if tail:
-            tail_text = " ".join(tail)
-            parts[0] = _normalize_query_part(f"{parts[0]} {tail_text}".strip())
+    # Legacy share-tail grafting removed — multi-item English titles come from Brain /
+    # Product Entity Extraction (product_requests), not product-noun dictionaries.
+    _ = (product_nouns, _has_product_noun)
     return [part for part in parts if part]
 
 
@@ -1054,7 +1020,7 @@ def fetch_catalog_browse_products(*, max_pages: int = 5) -> list[dict]:
                         "name": name,
                         "price": format_customer_price_display(p, sysmsg("na_price")),
                         "image": f"{IMAGE_BASE_URL}{thumb}" if thumb else "",
-                        "link": f"https://welfog.com/product_details/{slug}" if slug else "https://welfog.com",
+                        "link": f"https://welfog.com/products/{slug}" if slug else "https://welfog.com",
                         "rating": p.get("rating"),
                         "brand": p.get("brand") or "",
                         "sku": p.get("sku") or "",
@@ -1301,7 +1267,7 @@ def fetch_products_from_api(query, category_id=None, color=None, page=1):
                         "image": (IMAGE_BASE_URL + p.get("thumbnail_image", "").lstrip("/"))
                         if p.get("thumbnail_image")
                         else "",
-                        "link": f"https://welfog.com/product_details/{p.get('slug', '')}" if p.get("slug") else "https://welfog.com",
+                        "link": f"https://welfog.com/products/{p.get('slug', '')}" if p.get("slug") else "https://welfog.com",
                         "score": score,
                     }
                 )
@@ -3266,7 +3232,7 @@ def _ph_render_card(row):
     img_url = ""
     if img_raw:
         img_url = PH_IMG_BASE + str(img_raw).lstrip("/")
-    link = f"https://welfog.com/product_details/{slug}" if slug else "https://welfog.com"
+    link = f"https://welfog.com/products/{slug}" if slug else "https://welfog.com"
 
     if img_url:
         img_html = f"<img class='wf-ph-img' src='{html_escape(img_url)}' alt=''>"
@@ -3300,7 +3266,7 @@ def _ph_render_card(row):
         f"<span class='wf-ph-status-badge {badge_cls}'>{current_status}</span>"
         "</div>"
         f"{meta_extra}"
-        f"<a class='wf-ph-link' href='{html_escape(link)}' target='_blank' rel='noopener noreferrer'>View product</a>"
+        f"<a class='wf-ph-link' href='{html_escape(link)}' >View product</a>"
         "</div></div></div>"
         f"<div class='wf-ph-track-panel' id='{panel_id}' hidden>"
         "<div class='wf-ph-track-panel-title'>Order progress</div>"
@@ -3569,7 +3535,7 @@ def _wl_render_card(row):
     stock = row.get("stock")
     img_raw = row.get("thumbnail_image") or ""
     img_url = PH_IMG_BASE + str(img_raw).lstrip("/") if img_raw else ""
-    link = f"https://welfog.com/product_details/{slug}" if slug else "https://welfog.com"
+    link = f"https://welfog.com/products/{slug}" if slug else "https://welfog.com"
     stock_txt = "In stock" if stock not in (0, "0", None, False) else "Out of stock"
     rating_txt = f"★ {rating}" if rating not in (None, "", 0) else ""
 
@@ -3602,7 +3568,7 @@ def _wl_render_card(row):
         "<div class='wf-wl-card-body'>"
         f"<div class='wf-wl-name'>{title}</div>"
         + "".join(meta_bits)
-        + f"<a class='wf-wl-link' href='{html_escape(link)}' target='_blank' rel='noopener noreferrer'>View product</a>"
+        + f"<a class='wf-wl-link' href='{html_escape(link)}' >View product</a>"
         "</div></div></div>"
     )
 
@@ -4566,7 +4532,7 @@ def format_order_details_reply(
     addr_html = _format_shipping_address_html(_normalize_shipping_address(row))
     img_url = _ph_details_img_url(row)
     slug = row.get("product_slug") or ""
-    product_link = f"https://welfog.com/product_details/{slug}" if slug else ""
+    product_link = f"https://welfog.com/products/{slug}" if slug else ""
 
     show_order = focus in ("summary", "payment", "status", "all")
     show_shipping = focus in ("summary", "delivery", "all")
@@ -4629,7 +4595,7 @@ def format_order_details_reply(
             parts.append(f"<div class='wf-od-meta wf-od-meta--price'>{labels['total']}: <b>{grand_total}</b></div>")
         if product_link:
             parts.append(
-                f"<a class='wf-od-link' href='{html_escape(product_link)}' target='_blank' rel='noopener noreferrer'>"
+                f"<a class='wf-od-link' href='{html_escape(product_link)}' >"
                 f"{labels['view_product']}</a>"
             )
         parts.append("</div></div></div>")
@@ -4662,7 +4628,7 @@ def format_order_invoice_reply_html(order_id: str, lang: str = "en") -> str:
         f"<div class='wf-od-title'>{title}</div>"
         f"<p class='wf-od-hint'>{hint}</p>"
         f"<p class='wf-od-meta wf-invoice-card__oid'><b>Order ID:</b> {oid}</p>"
-        f"<a class='wf-invoice-btn' href='{url}' target='_blank' rel='noopener noreferrer' "
+        f"<a class='wf-invoice-btn' href='{url}'  "
         f"download role='button'><span class='wf-invoice-btn__label'>{html_escape(btn)}</span></a>"
         "</div></div>"
     )

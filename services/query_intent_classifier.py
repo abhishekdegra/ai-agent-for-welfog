@@ -542,21 +542,30 @@ def build_non_welfog_reply(
                 or ""
             )
         elif decision.detected_intent == INTENT_CHITCHAT:
-            use_h = rl == "hinglish" or is_hinglish_message(original_msg or msg_en)
-            body = (
-                sysmsg("warm_smalltalk_hinglish_3" if use_h else "warm_smalltalk_3")
-                or sysmsg("greeting")
-                or ""
-            )
-        elif decision.detected_intent == INTENT_OUT:
-            use_h = rl == "hinglish" or is_hinglish_message(original_msg or msg_en)
-            body = (
-                sysmsg("off_topic_polite_hinglish" if use_h else "off_topic_polite")
-                or sysmsg("out_of_domain")
-                or ""
-            )
+            try:
+                from services.conversational_ack_flow import ai_chitchat_reply
 
-    if body and rl not in ("en", "hinglish"):
+                body = ai_chitchat_reply(
+                    original_msg, msg_en, "", reply_lang=rl
+                ) or ""
+            except ImportError:
+                body = ""
+        elif decision.detected_intent == INTENT_OUT:
+            try:
+                from services.conversational_ack_flow import ai_ood_reply
+
+                body = ai_ood_reply(original_msg, msg_en, "", reply_lang=rl) or ""
+            except ImportError:
+                body = ""
+            if not body:
+                use_h = rl == "hinglish" or is_hinglish_message(original_msg or msg_en)
+                body = (
+                    sysmsg("off_topic_polite_hinglish" if use_h else "off_topic_polite")
+                    or sysmsg("out_of_domain")
+                    or ""
+                )
+
+    if body and rl not in ("en", "hinglish") and "<" not in body:
         body = localize_for_customer(body, rl)
 
     return finalize_intent_reply_html(body, original_msg, reply_lang=rl)

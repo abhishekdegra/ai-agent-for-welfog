@@ -11,6 +11,7 @@ Fallback: dedicated lightweight scope LLM. Last resort: generic template (no wor
 """
 from __future__ import annotations
 
+import os
 import re
 import threading
 from dataclasses import dataclass
@@ -259,53 +260,56 @@ def ai_classify_scope_and_reply(
         return None
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
-    providers = _llm_classifier_provider_chain()
+    try:
+        from services.llm_providers import get_fast_chitchat_provider_chain
+
+        # Fast path for chat scope+reply — prefer Groq Instant over admin OpenAI pin.
+        providers = get_fast_chitchat_provider_chain(max_providers=2)
+    except ImportError:
+        providers = _llm_classifier_provider_chain()
     if not providers:
         return None
 
-    compact_ctx = _compact_conversation_context(conversation_context or "", 1800)
-    user_line = _trim_text_mid(comb, 480)
+    compact_ctx = _compact_conversation_context(
+        conversation_context or "", 280 if not preflight else 200
+    )
+    user_line = _trim_text_mid(comb, 120)
 
-    system_prompt = f"""You classify the LATEST user message for the Welfog shopping support chatbot.
+    system_prompt = f"""Welfog support chat classifier. Latest message only.
 
-Welfog IN SCOPE: products to buy on Welfog, order tracking, order history, wishlist, delivery/PIN,
-returns/refunds, payments, seller account, Welfog policies/FAQ/company info, customer care on Welfog.
+Scopes:
+- welfog_support: shopping/orders/wishlist/PIN/refund/policies on Welfog
+- general_chitchat: greeting, thanks, bye, how-are-you, bot smalltalk (any language)
+- out_of_domain: unrelated topics (weather, cricket, homework, other apps…)
 
-OUT OF DOMAIN: anything NOT tied to Welfog shopping/support (weather, cricket, recipes, other apps'
-orders, homework, life advice, random personal stories, jokes, politics, etc.) — any language.
-
-GENERAL CHIT-CHAT: pure greeting, thanks, praise, bye, "who are you", "what can you do" about THIS bot,
-casual wellbeing, "what are you doing", "are you free/busy right now", "are you okay" — friendly natural
-reply like a human chat assistant (NOT a product search, NOT Order ID, NOT policy dump).
-
-OUT OF DOMAIN examples (any language): weather, cricket, Amazon/other apps, homework, jokes,
-relationship requests ("make me a girlfriend"), personal money questions, politics, random facts.
-
-Return ONLY valid JSON:
+JSON only:
 {{
-  "user_meaning": "one English sentence — what they want this turn",
+  "user_meaning": "one English sentence",
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain",
-  "scope_reply": "REQUIRED when scope is general_chitchat or out_of_domain: 1-3 sentences in the CUSTOMER's language/script AND conversational style (casual, formal, slang, poetic — mirror how they wrote). Warm, polite, human like ChatGPT. For out_of_domain: briefly acknowledge their topic in their tone, say you only help with Welfog shopping/support, invite a Welfog question. Do NOT answer off-topic facts. For general_chitchat: natural reply — greeting in their style (not plain Hi), thanks/praise with welcome-back, bye with invite to return. EMPTY string when welfog_support.",
-  "confidence": 0.0 to 1.0
+  "scope_reply": "REQUIRED unless welfog_support: 1-2 sentences mirroring user language/style. Empty if welfog_support.",
+  "confidence": 0.0-1.0
 }}
-
 {language_reply_instruction(rl)}
-Infer meaning semantically — never match fixed keyword lists."""
+No keyword lists — use meaning."""
 
-    user_payload = f"LATEST USER MESSAGE:\n{user_line}"
+    user_payload = f"LATEST:\n{user_line}"
     if compact_ctx:
-        user_payload = f"RECENT CONVERSATION:\n{compact_ctx}\n\n{user_payload}"
+        user_payload = f"RECENT:\n{compact_ctx}\n\n{user_payload}"
 
     try:
-        scope_timeout = 8 if preflight else 11
-        scope_attempts = 1 if preflight else 2
+        scope_timeout = float(os.getenv("SCOPE_AI_TIMEOUT_SEC", "2.5") or 2.5)
+        if preflight:
+            scope_timeout = min(scope_timeout, 2.0)
+        scope_timeout = max(1.5, min(3.0, scope_timeout))
+        scope_attempts = 1
+        log_reasoning(f"Scope LLM timeout budget={scope_timeout:.1f}s providers={len(providers)}")
         data = _llm_json_with_provider_fallback(
             providers,
             [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_payload},
             ],
-            max_tokens=220,
+            max_tokens=120,
             timeout_sec=scope_timeout,
             max_attempts=scope_attempts,
             temperature=0.25,
@@ -769,12 +773,9 @@ def resolve_conversation_scope(
 def _generic_scope_fallback(scope: str, use_hinglish: bool) -> str:
     from services.kb_service import sysmsg
 
+    # Chitchat must never fall back to stock "Hello! Good to see you on Welfog…"
     if scope == SCOPE_CHITCHAT:
-        return (
-            sysmsg("greeting_variant_2")
-            or sysmsg("greeting")
-            or ""
-        )
+        return ""
     if scope == SCOPE_OUT:
         return (
             sysmsg("off_topic_polite_hinglish" if use_hinglish else "off_topic_polite")

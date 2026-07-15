@@ -1397,6 +1397,48 @@ def understand_single_order_request(
             }
     except Exception:
         pass
+    # Product catalog already decided by Brain — never run order-intent heuristic
+    # spam (logs showed 4× [order-intent] while finalize had not yet set
+    # run_catalog_search / _product_catalog_locked → wasted latency on Hinglish).
+    try:
+        from services.product_catalog_resolver import product_catalog_route_is_locked
+
+        route = ai_route if isinstance(ai_route, dict) else None
+        if route is None:
+            try:
+                from services.chat_flow_telemetry import get_cached_brain_route
+
+                route = get_cached_brain_route()
+            except ImportError:
+                route = None
+        intent_early = (
+            ((route or {}).get("intent") or "").strip().lower() if route else ""
+        )
+        channel_early = (
+            ((route or {}).get("data_channel") or "").strip().lower() if route else ""
+        )
+        productish = intent_early in ("product", "product_search") or channel_early == "catalog"
+        indicates = False
+        if route and not productish:
+            try:
+                from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+                indicates = brain_route_indicates_product_catalog(route)
+            except ImportError:
+                indicates = False
+        if productish or indicates or product_catalog_route_is_locked(route):
+            return {
+                "goal": "",
+                "action": "not_order_topic",
+                "field_focus": "summary",
+                "order_id": "",
+                "confidence": "high",
+                "source": "product_catalog_locked",
+                "reasoning": "Brain locked product catalog — skip order-intent.",
+                "is_welfog_related": True,
+            }
+    except ImportError:
+        pass
     try:
         from services.chat_flow_telemetry import should_defer_micro_classifiers_to_brain
 
@@ -2375,11 +2417,21 @@ def run_order_details_ai_flow(
                 selected_flow="order_details_api",
                 invoice_status="need_order_id",
             )
-        body = _localized_sysmsg("ask_order_id_for_intent", original_msg, reply_lang=rl, intent="order") or ""
+        ask_intent = (
+            "invoice"
+            if action == "order_invoice"
+            else "order"
+        )
+        body = _localized_sysmsg(
+            "ask_order_id_for_intent",
+            original_msg,
+            reply_lang=rl,
+            intent=ask_intent,
+        ) or ""
         return OrderFlowResult(
             handled=True,
             reply_html=body,
-            intent="order",
+            intent=ask_intent,
             needs_order_id=True,
         )
 

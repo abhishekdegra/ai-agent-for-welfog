@@ -133,7 +133,7 @@ Deals product field mapping (UI):
   - product name: p.name
   - product image: p.thumbnail_img  (NOTE: key is thumbnail_img, not thumbnail_image)
   - price to show: p.new_price (and strike-through p.old_price if present)
-  - product link: https://welfog.com/product_details/<p.slug>
+  - product link: https://welfog.com/products/<p.slug>
 
 ------------------------------------------------------------
 4) CATEGORY-WISE PRODUCT FEED (Home feed style)
@@ -187,7 +187,7 @@ Category-wise field mapping (UI):
   - show 3-5 products per category: item.products[]
   - product image: product.image
   - product price: product.price
-  - product link: https://welfog.com/product_details/<product.link>
+  - product link: https://welfog.com/products/<product.link>
   - pagination: use meta.next_page if available, else page+1 only if has_next_page=true
 
 ------------------------------------------------------------

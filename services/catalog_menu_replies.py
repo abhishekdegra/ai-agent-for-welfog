@@ -47,7 +47,7 @@ def build_today_deals_reply_html(original_msg: str, *, reply_lang: str = "en") -
         slug = p.get("slug") or ""
         thumb = p.get("thumbnail_img") or p.get("thumbnail_image") or p.get("image") or ""
         image = (image_base + str(thumb).lstrip("/")) if thumb else ""
-        link = f"https://welfog.com/product_details/{slug}" if slug else "https://welfog.com"
+        link = f"https://welfog.com/products/{slug}" if slug else "https://welfog.com"
 
         response_text += "<div class='wf-product-card'>"
         if image:
@@ -84,7 +84,7 @@ def build_today_deals_reply_html(original_msg: str, *, reply_lang: str = "en") -
                 f"margin-bottom: 12px; margin-top: auto;'>₹{new_price}</div>"
             )
         response_text += (
-            f"<a href='{link}' target='_blank' rel='noopener noreferrer'>{sysmsg('view_deal')}</a>"
+            f"<a href='{link}' >{sysmsg('view_deal')}</a>"
         )
         response_text += "</div>"
         shown += 1

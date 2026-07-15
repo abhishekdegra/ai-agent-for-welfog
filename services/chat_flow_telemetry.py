@@ -61,6 +61,7 @@ def begin_chat_turn() -> str:
     _TLS.authoritative_route_lock = None
     _TLS.kb_grounding_hits: list[dict[str, Any]] = []
     _TLS.kb_grounding_corpus = ""
+    _TLS.kb_grounding_query = ""
     # KB latency: turn-scoped reuse (same request only — identical semantics).
     _TLS.kb_active_doc_ids = None
     _TLS.kb_active_doc_ids_ready = False
@@ -85,6 +86,7 @@ def set_kb_grounding_context(
     hits: list[dict[str, Any]] | None = None,
     *,
     corpus: str = "",
+    retrieval_query: str = "",
 ) -> None:
     """Store authoritative KB chunks/corpus for final fact-contract enforcement."""
     if hits:
@@ -98,6 +100,9 @@ def set_kb_grounding_context(
             _TLS.kb_grounding_corpus = _chunk_corpus(hits)
         except ImportError:
             pass
+    q = (retrieval_query or "").strip()
+    if q:
+        _TLS.kb_grounding_query = q[:900]
 
 
 def append_kb_grounding_corpus(corpus: str) -> None:
@@ -117,6 +122,17 @@ def get_kb_grounding_context() -> tuple[list[dict[str, Any]], str]:
     return list(hits), corpus
 
 
+def get_kb_grounding_query() -> str:
+    return (getattr(_TLS, "kb_grounding_query", "") or "").strip()
+
+
+def clear_kb_grounding_context() -> None:
+    """Drop cached hits when the retrieval question changes (avoid wrong FAQ dumps)."""
+    _TLS.kb_grounding_hits = []
+    _TLS.kb_grounding_corpus = ""
+    _TLS.kb_grounding_query = ""
+
+
 def _route_lock() -> dict[str, Any]:
     lock = getattr(_TLS, "authoritative_route_lock", None)
     if not isinstance(lock, dict):
@@ -130,13 +146,18 @@ def brain_route_authoritative_kb_lock(ai_route: dict | None) -> bool:
     if not isinstance(ai_route, dict):
         return False
     try:
-        from services.ai_route_semantics import brain_route_indicates_product_catalog
+        from services.ai_route_semantics import (
+            brain_route_indicates_product_catalog,
+            brain_route_is_order_nav_howto,
+        )
         from services.product_catalog_resolver import product_catalog_route_is_locked
 
         if product_catalog_route_is_locked(ai_route) or brain_route_indicates_product_catalog(
             ai_route
         ):
             return False
+        if brain_route_is_order_nav_howto(ai_route):
+            return True
     except ImportError:
         pass
     if ai_route.get("run_catalog_search"):
@@ -144,7 +165,7 @@ def brain_route_authoritative_kb_lock(ai_route: dict | None) -> bool:
     channel = (ai_route.get("data_channel") or "").strip().lower()
     if channel != "kb":
         return False
-    if ai_route.get("needs_order_id"):
+    if ai_route.get("needs_order_id") and not ai_route.get("_order_nav_howto_locked"):
         return False
     intent = (ai_route.get("intent") or "").strip().lower()
     if intent == "out_of_domain":

@@ -76,6 +76,13 @@ def _chunk_payload(row: dict[str, Any]) -> dict[str, Any]:
 
 
 def embed_texts_openai(texts: list[str]) -> list[list[float]]:
+    try:
+        from services.chat_resilience import chat_turn_abandoned
+
+        if chat_turn_abandoned():
+            raise RuntimeError("chat_turn_abandoned")
+    except ImportError:
+        pass
     api_key = _openai_api_key()
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY missing in .env")
@@ -84,7 +91,7 @@ def embed_texts_openai(texts: list[str]) -> list[list[float]]:
 
     model = _embedding_model()
     dimensions = _embedding_dimensions()
-    timeout = float(os.getenv("OPENAI_EMBED_TIMEOUT_SEC") or "60")
+    timeout = float(os.getenv("OPENAI_EMBED_TIMEOUT_SEC") or "5")
 
     resp = requests.post(
         OPENAI_EMBEDDINGS_URL,

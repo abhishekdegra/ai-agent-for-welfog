@@ -415,7 +415,9 @@ def ai_classify_product_search_turn(
     try:
         from services.turn_intent_coordinator import account_list_ai_blocks_product_path
 
-        if account_list_ai_blocks_product_path(
+        # force_llm (product-agent rescue) must not be stolen by account-list
+        # false positives ("flip flop dika de" ≠ wishlist).
+        if not force_llm and account_list_ai_blocks_product_path(
             original_msg,
             msg_en,
             conversation_context,
@@ -497,10 +499,18 @@ Rules:
 - Product id: "product id de rha hu 2815318 iska product bta" → product_id=2815318, search_query="".
 - Brand typos/spaces: infer the intended brand from meaning; keep brand + product noun in entities.
 - Availability asks (any language/phrasing) → still product_search; extract corrected catalog noun + filters.
+- Short informal stock/buy asks are STILL product_search — never policy_kb or none:
+  "X h kya", "tumhare pass X", "X mil jayega", "X lena h", "baniyan dikhao", "flip flop dika de",
+  "mereko X chahiye", "do you have X on welfog" — ANY product noun (typos OK).
+  Translate vernacular to English catalog titles (baniyan→vest, topi→cap, etc. by meaning).
 - Do NOT put rating/price/filter words in search_query or product_name.
 - Do NOT answer availability from memory — only classify.
 
 Examples (many languages/styles — same intent = product_search):
+- "cap h kya" / "tumhare pass cap h kya" → search_query="cap"
+- "baniyan mil jayega kya" / "baniya h kyaaaa" → search_query="vest"
+- "bhai mereko tu na ek cap lena h" → search_query="cap"
+- "mereko flip flop dekhen h ki h welfog pe ya nhi" → search_query="flip flops"
 - "mujhe lal mirch chahiye" → search_query="red chilli"
 - "flour mil jayga kya welfog pe" → search_query="flour"
 - "neenga inga mobile cover vangalaama" (Tamil) → search_query="mobile cover"
@@ -640,15 +650,25 @@ def understanding_from_locked_product_route(
     )
     if not u:
         return None
-    # Only attach search_terms from structured product_name (already in u) —
-    # never promote free-form route search_query / Brain paraphrase.
+    # Prefer structured product_name; when Brain already stamped English catalog
+    # title onto search_query / _product_nlu_from_ai, allow that as search_terms.
     _ = sq
     if isinstance(ai_route, dict) and ai_route.get("_product_nlu_from_ai"):
         u["_product_nlu_from_ai"] = True
         entity_terms = (u.get("search_terms") or "").strip()
-        if not entity_terms and sq and ai_route.get("_product_nlu_from_ai"):
-            # Upstream already ran Product Entity Extraction into search_query.
+        if not entity_terms and sq:
             u["search_terms"] = sq
+        elif entity_terms and sq and entity_terms.lower() != sq.lower():
+            # Prefer route SoT when Brain overwrote vernacular name with English.
+            try:
+                from services.ai_route_semantics import _phrase_is_catalog_english
+
+                if not _phrase_is_catalog_english(entity_terms) and (
+                    _phrase_is_catalog_english(sq) or len(sq.split()) <= 4
+                ):
+                    u["search_terms"] = sq
+            except ImportError:
+                u["search_terms"] = sq
     return u
 
 
@@ -948,7 +968,7 @@ def resolve_product_search_turn(
         if isinstance(brain, dict):
             ch = (brain.get("data_channel") or "").strip().lower()
             intent = (brain.get("intent") or "").strip().lower()
-            if ch in ("kb", "live_api") and intent not in (
+            if ch == "live_api" and intent not in (
                 "product",
                 "deals",
                 "categories",
@@ -956,6 +976,8 @@ def resolve_product_search_turn(
             ):
                 if not brain_route_indicates_product_catalog(brain):
                     return ResolvedProductSearchTurn(kind=KIND_NONE)
+            # KB channel: do NOT hard-exit — Brain often mislabels shopping as FAQ.
+            # Downstream AI classifier / locked route decide product vs policy.
         if should_defer_micro_classifiers_to_brain():
             if isinstance(brain, dict) and brain_route_indicates_product_catalog(brain):
                 pass
@@ -1689,12 +1711,22 @@ def entities_to_understanding(
     out: dict[str, Any] = {"action": "search_products", "is_shopping": True}
 
     product_name = (e.get("product_name") or "").strip()
-    # Do NOT fall back to free-form search_query — callers historically passed Brain
-    # paraphrases (user_meaning) here, which became OpenSearch title_query.
-    # Product Entity Extraction must put the noun phrase in product_name / search_terms.
-    _ = search_query
+    # Prefer explicit product_name; allow Brain/NLU English search_query when name empty.
+    sq = (search_query or "").strip()
     if product_name:
         out["search_terms"] = product_name
+    elif sq:
+        try:
+            from services.ai_route_semantics import (
+                _phrase_is_catalog_english,
+                is_generic_catalog_search_phrase,
+            )
+
+            if _phrase_is_catalog_english(sq) and not is_generic_catalog_search_phrase(sq):
+                out["search_terms"] = sq
+        except ImportError:
+            if len(sq.split()) <= 6:
+                out["search_terms"] = sq
 
     brand = sanitize_catalog_brand(
         (e.get("brand") or "").strip(),

@@ -2062,6 +2062,25 @@ def try_kb_informational_locked_reply(
     ):
         return None
 
+    # Brain already locked a non-KB turn — never steal with vector/KB micro-LLMs.
+    if isinstance(route, dict):
+        scope = (route.get("conversation_scope") or "").strip().lower()
+        intent = (route.get("intent") or "").strip().lower()
+        if scope in ("general_chitchat", "out_of_domain", "harm_sensitive"):
+            return None
+        if intent in ("order_history", "wishlist", "out_of_domain"):
+            return None
+        rh = (route.get("route_handler") or "").strip().lower()
+        if rh in ("order_history_api", "wishlist_api"):
+            return None
+        try:
+            from services.account_list_semantics import account_list_route_is_locked
+
+            if account_list_route_is_locked(route):
+                return None
+        except ImportError:
+            pass
+
     try:
         from services.ai_route_semantics import brain_route_indicates_product_catalog
         from utils.helpers import turn_is_obvious_product_shopping_turn
@@ -2105,19 +2124,26 @@ def try_kb_informational_locked_reply(
     )
 
     try:
+        from services.ai_route_semantics import brain_route_prefers_kb_answer
         from services.turn_intent_coordinator import (
             kb_turn_blocks_product_catalog,
             peek_or_classify_kb_turn,
         )
 
-        classified = peek_or_classify_kb_turn(
-            original_msg,
-            msg_en,
-            conversation_context,
-            reply_lang,
-            preflight=True,
-        )
-        if kb_turn_blocks_product_catalog(classified):
+        # After brain KB lock, skip classify LLM — vector/brain reply already tried.
+        if not (
+            isinstance(route, dict) and brain_route_prefers_kb_answer(route)
+        ):
+            classified = peek_or_classify_kb_turn(
+                original_msg,
+                msg_en,
+                conversation_context,
+                reply_lang,
+                preflight=False,
+            )
+            if kb_turn_blocks_product_catalog(classified):
+                blocks_catalog = True
+        else:
             blocks_catalog = True
     except ImportError:
         classified = None
@@ -2130,7 +2156,7 @@ def try_kb_informational_locked_reply(
         msg_en,
         conversation_context,
         reply_lang=reply_lang,
-        preflight=True,
+        preflight=False,
         ai_route=route if isinstance(route, dict) else None,
     )
     if body and body.strip():
@@ -2245,8 +2271,18 @@ def _try_knowledge_reply_before_interference_impl(
             original_msg,
             reply_lang=reply_lang,
             retrieval_query=semantic.retrieval_query,
-            fast_lane=embedding_only,
+            # Prefer grounded/complete answers unless pure embedding preflight.
+            fast_lane=bool(embedding_only),
+            conversation_context=conversation_context,
+            ai_route=ai_route,
         )
+        try:
+            from services.kb_service import _kb_answer_body_is_usable
+
+            if direct and not _kb_answer_body_is_usable(direct, min_chars=20):
+                direct = ""
+        except ImportError:
+            pass
         if direct:
             log_reasoning(
                 f"Pre-scope KB direct chunk (score={float(decision.kb_hit.get('score') or 0):.2f})."

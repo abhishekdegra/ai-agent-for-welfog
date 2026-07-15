@@ -207,17 +207,19 @@ def _reply_needs_style_rewrite(text: str, target_lang: str, user_msg: str = "") 
     return False
 
 
-def _llm_rewrite_customer_reply(text: str, user_msg: str, reply_lang: str) -> str:
+def _llm_rewrite_customer_reply(
+    text: str,
+    user_msg: str,
+    reply_lang: str,
+    *,
+    timeout_sec: float | None = None,
+    max_tokens: int | None = None,
+    max_providers: int | None = None,
+) -> str:
     """Rewrite answer text into customer's language/style — facts and numbers preserved."""
     if not (text or "").strip() or not (user_msg or "").strip():
         return text
     rl = resolve_customer_reply_lang(user_msg, reply_lang)
-    try:
-        from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
-
-        ensure_product_rescue_llm_slot()
-    except ImportError:
-        pass
     try:
         from services.ai_service import (
             _llm_json_with_provider_fallback,
@@ -229,19 +231,39 @@ def _llm_rewrite_customer_reply(text: str, user_msg: str, reply_lang: str) -> st
     providers = _llm_classifier_provider_chain()
     if not providers:
         return text
+    try:
+        from services.chat_resilience import chat_turn_abandoned
+
+        if chat_turn_abandoned():
+            return text
+    except ImportError:
+        pass
+    to = float(timeout_sec) if timeout_sec is not None else float(
+        os.getenv("LLM_REWRITE_TIMEOUT_SEC") or "4"
+    )
+    toks = int(max_tokens) if max_tokens is not None else 700
+    # One provider only — rewrite cascade was stacking second/third LLMs past deadline.
+    if max_providers is None:
+        try:
+            max_providers = int(os.getenv("LLM_REWRITE_MAX_PROVIDERS") or "1")
+        except (TypeError, ValueError):
+            max_providers = 1
+    providers = providers[: max(1, int(max_providers))]
     system_prompt = f"""Rewrite the ANSWER for the customer. Return ONLY JSON: {{"response":"..."}}
 
 RULES:
-- Match the customer's LATEST message language, script, and conversational style exactly.
+- Detect the customer's language/script/style ONLY from CUSTOMER WROTE (not from guesses or keyword lists).
+- Match that language and conversational style exactly in the rewritten answer.
 - {language_reply_instruction(rl)}
 - Copy every number, phone, email, URL, day-count, and policy fact EXACTLY from the source.
 - Do NOT add facts. Do NOT change meaning. Do NOT answer a different question.
+- Keep the answer as short as the source allows — do not expand into extra policy sections.
 - Keep HTML tags/structure when the source has HTML.
 - Roman Hinglish = casual WhatsApp-style mixed Hindi+English in Latin script — never formal Sanskritized transliteration.
 JSON only."""
     user_payload = (
         f"CUSTOMER WROTE:\n{_trim_text_mid(user_msg, 320)}\n\n"
-        f"ANSWER TO REWRITE:\n{_trim_text_mid(text, 2200)}"
+        f"ANSWER TO REWRITE:\n{_trim_text_mid(text, 1800)}"
     )
     data = _llm_json_with_provider_fallback(
         providers,
@@ -249,8 +271,8 @@ JSON only."""
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ],
-        max_tokens=700,
-        timeout_sec=14,
+        max_tokens=toks,
+        timeout_sec=to,
         max_attempts=1,
     )
     resp = (data.get("response") or "").strip() if data else ""
@@ -481,9 +503,23 @@ def text_usable_as_english_retrieval(text: str) -> bool:
         return False
     if is_hinglish_message(plain):
         return False
-    # Mixed Roman (e.g. "welfog ka owner kon h") is not clear English even if
-    # hinglish-marker lists miss particles like ka/kon — require English signal.
+    # Script + existing language detectors only — no word/topic lists.
     return _looks_english_only_latin(plain)
+
+
+def _retrieval_gloss_looks_corrupted(raw: str, gloss: str) -> bool:
+    """
+    Reject MT that clearly inverted polarity vs the customer text.
+
+    Structural only: contracted/English negation appeared in gloss but not source.
+    """
+    src = re.sub(r"<[^>]+>", " ", raw or "").lower()
+    dst = re.sub(r"<[^>]+>", " ", gloss or "").lower()
+    if not src or not dst or src == dst:
+        return False
+    src_neg = bool(re.search(r"\bn'?t\b|\bnot\b", src))
+    dst_neg = bool(re.search(r"\bn'?t\b|\bnot\b|n't\b", dst))
+    return bool(dst_neg and not src_neg)
 
 
 def to_en_for_retrieval(text: str, lang: str = "") -> str:
@@ -502,6 +538,12 @@ def to_en_for_retrieval(text: str, lang: str = "") -> str:
         return raw.lower()
     if text_usable_as_english_retrieval(raw) and lang not in NATIVE_SCRIPT_LANGS:
         # Already English-like (even if reply_lang mis-detected).
+        return raw.lower()
+
+    # Latin script (English / Roman Hinglish / mixed): never block on Google MT.
+    # Dense+fulltext hybrid + brain meaning/keys already align retrieval; MT adds
+    # latency and polarity flips. Only native scripts need an English gloss.
+    if _latin_script_only(raw) and lang not in NATIVE_SCRIPT_LANGS:
         return raw.lower()
 
     cache_key = f"{lang}|{raw.lower()[:900]}"
@@ -539,11 +581,16 @@ def to_en_for_retrieval(text: str, lang: str = "") -> str:
             # If MT produced non-English junk, keep raw — dense+fulltext still run on it.
             if not text_usable_as_english_retrieval(gloss) and is_hinglish_message(gloss):
                 gloss = raw.lower()
+            elif _retrieval_gloss_looks_corrupted(raw, gloss):
+                log_reasoning(
+                    f"KB retrieval EN gloss rejected (corrupted MT) chars={len(raw)}"
+                )
+                gloss = raw.lower()
             else:
                 translated_ok = True
-            log_reasoning(
-                f"KB retrieval EN gloss: lang={lang} chars={len(raw)}→{len(gloss)}"
-            )
+                log_reasoning(
+                    f"KB retrieval EN gloss: lang={lang} chars={len(raw)}→{len(gloss)}"
+                )
     except TimeoutError:
         log_reasoning(
             f"KB retrieval translate timeout — embedding original ({len(raw)} chars)."

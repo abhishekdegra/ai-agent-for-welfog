@@ -609,7 +609,7 @@ def _is_instant_greeting_thanks_lane(
     conversation_context: str = "",
 ) -> bool:
     """
-    Ultra-short hello / thanks / bye only — zero LLM.
+    Ultra-short hello / thanks / bye — served by fast AI chitchat (user language).
     Anything longer or substantive goes to ai_brain_route (no keyword shopping lists).
     """
     comb = _combined(original_msg, msg_en)
@@ -682,15 +682,9 @@ def try_scope_ai_early_reply(
     if preflight:
         return None
 
-    try:
-        from services.conversation_zero_llm_fallback import _zero_llm_kb_turn_blocked
-
-        if not preflight and _zero_llm_kb_turn_blocked(
-            original_msg, msg_en, conversation_context
-        ):
-            return None
-    except ImportError:
-        pass
+    # Early social scope path skips heavy KB/orderguards (those load embeds +
+    # order-intent LLM and can burn 60s+ before the actual scope LLM).
+    # Shopping/order structural turns are filtered by the chat_routes caller.
 
     if not preflight:
         try:
@@ -719,6 +713,7 @@ def try_scope_ai_early_reply(
         SCOPE_WELFOG,
         ai_classify_scope_and_reply,
         build_scope_reply,
+        finalize_scope_reply_html,
     )
 
     rl = resolve_customer_reply_lang(original_msg or msg_en, reply_lang)
@@ -732,9 +727,14 @@ def try_scope_ai_early_reply(
     if dec.confidence < 0.48 and not (dec.reply or "").strip():
         return None
 
-    body = build_scope_reply(
-        dec, original_msg, msg_en, rl, prefer_llm=False
-    )
+    # Prefer scope LLM authored reply — never call a second chitchat LLM here.
+    reply_raw = (dec.reply or "").strip()
+    if not reply_raw:
+        body = build_scope_reply(
+            dec, original_msg, msg_en, rl, prefer_llm=False
+        )
+    else:
+        body = finalize_scope_reply_html(reply_raw, original_msg, reply_lang=rl)
     if not body:
         return None
 
@@ -749,7 +749,7 @@ def try_scope_ai_early_reply(
         "needs_order_id": False,
         "user_meaning": (dec.user_meaning or "")[:200],
         "route_handler": "warm_feedback" if is_chitchat else "off_topic",
-        "scope_reply": (dec.reply or "")[:500],
+        "scope_reply": reply_raw[:500],
     }
     log_reasoning(
         f"Early scope AI ({dec.scope}) — natural reply before brain."

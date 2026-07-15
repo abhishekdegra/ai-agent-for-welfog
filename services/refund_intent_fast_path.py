@@ -526,9 +526,12 @@ def try_refund_intent_fast_reply(
 
     if isinstance(ctx, dict):
         if reset_context_fn:
-            reset_context_fn(ctx)
+            from utils.helpers import reset_context_unless_order_pending
+
+            reset_context_unless_order_pending(ctx)
         ctx["last"] = "refund"
-        ctx["awaiting"] = None
+        if action != "ask_order_id":
+            ctx["awaiting"] = None
 
     if action == "policy_kb":
         from services.kb_service import format_policy_help_reply_from_kb
@@ -545,7 +548,14 @@ def try_refund_intent_fast_reply(
         )
         if body:
             if isinstance(ctx, dict):
-                ctx["awaiting"] = "order_id"
+                try:
+                    from services.order_id_handoff_fast_path import lock_order_id_ask_session
+
+                    lock_order_id_ask_session(
+                        ctx, "refund_status", intent_label="refund"
+                    )
+                except ImportError:
+                    ctx["awaiting"] = "order_id"
             return body
 
     oid = resolve_refund_order_id(original_msg, msg_en, conversation_context)

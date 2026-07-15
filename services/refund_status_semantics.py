@@ -647,6 +647,24 @@ Return ONLY valid JSON:
     return {"refund_turn_kind": kind, "user_meaning": um, "confidence": conf}
 
 
+def _route_or_message_mentions_refund_topic(route: dict | None, comb: str) -> bool:
+    """True when text or Brain meaning indicates refund/return — any language via Brain fields."""
+    if _message_has_refund_topic(comb):
+        return True
+    r = route or {}
+    intent = (r.get("intent") or "").strip().lower()
+    if intent in ("refund", "refund_status"):
+        return True
+    olk = (r.get("order_lookup_kind") or "").strip().lower()
+    rh = (r.get("route_handler") or "").strip().lower()
+    if olk == "refund_status" or rh == "refund_status_api":
+        return True
+    blob = _meaning_blob(r)
+    if _kind_from_meaning_blob(blob) in (KIND_PERSONAL_STATUS, KIND_POLICY_HOWTO):
+        return True
+    return False
+
+
 def promote_refund_status_on_route(
     route: dict | None,
     original_msg: str = "",
@@ -667,16 +685,18 @@ def promote_refund_status_on_route(
             resolve_explicit_turn_goal_from_message,
         )
 
+        # Resolve from the latest user message only — do not trust a mislabeled
+        # track/details ai_route snapshot (that was the bug: track stole refund).
         explicit = resolve_explicit_turn_goal_from_message(
-            original_msg, msg_en, conversation_context, out, allow_llm=False
+            original_msg, msg_en, conversation_context, None, allow_llm=False
         )
-        if explicit and explicit != "refund_status":
-            return out
+        if explicit == "refund_status":
+            return _apply_refund_status_to_route(out, "explicit_turn")
         if message_needs_thread_continuation(comb, conversation_context):
             thread = infer_order_thread_goal(
                 conversation_context,
                 comb,
-                ai_route=out,
+                ai_route=None,
                 reply_lang=reply_lang,
                 allow_llm=False,
             )
@@ -685,7 +705,7 @@ def promote_refund_status_on_route(
     except ImportError:
         pass
 
-    if not _message_has_refund_topic(comb):
+    if not _route_or_message_mentions_refund_topic(out, comb):
         return out
 
     try:
@@ -715,21 +735,7 @@ def promote_refund_status_on_route(
     if resolved.kind != KIND_PERSONAL_STATUS:
         return out
 
-    try:
-        from services.order_tracking_semantics import (
-            ai_route_requests_order_tracking_lookup,
-            order_tracking_route_is_locked,
-        )
-
-        if order_tracking_route_is_locked(out):
-            return out
-        if ai_route_requests_order_tracking_lookup(
-            out, original_msg, msg_en, conversation_context
-        ):
-            return out
-    except ImportError:
-        pass
-
+    # Personal refund status confirmed — do not let a track mis-lock steal the turn.
     return _apply_refund_status_to_route(out, resolved.source or "current_turn_refund")
 
 

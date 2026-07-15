@@ -139,13 +139,18 @@ def soften_echoed_typo_search_terms(terms: str) -> str:
     for tok in raw.split():
         if re.search(r"(.)\1", tok):
             soft = soft_collapse_repeated_letters(tok)
-            # After collapsing keysmash, prefer a balanced space split when the
-            # token is still a long compound (fliipflops→flipflops→flip flops).
-            if soft and " " not in soft and len(re.sub(r"[^a-z0-9]", "", soft)) >= 8:
+            # Mid-split ONLY when keysmash was actually collapsed (fliiipflops→flipflops).
+            # Never invent spaces inside valid orthography (slippers → slip pers).
+            if (
+                soft
+                and soft != tok
+                and " " not in soft
+                and len(re.sub(r"[^a-z0-9]", "", soft)) >= 8
+            ):
                 spaced = _prefer_balanced_compound_space(soft)
                 parts.append(spaced or soft)
             else:
-                parts.append(soft)
+                parts.append(soft or tok)
         else:
             parts.append(tok)
     return " ".join(parts).strip()
@@ -177,6 +182,9 @@ def polish_search_terms(terms: str, original_msg: str = "") -> str:
 
     terms = scrub_conversational_tail_from_terms(terms)
     terms = soften_echoed_typo_search_terms(terms)
+    # Pull parenthetical English gloss into plain tokens: "chunri (scarf)." → keep both.
+    terms = re.sub(r"[()\[\]{}]+", " ", terms or "")
+    terms = re.sub(r"[.]+$", "", terms).strip()
     if original_msg:
         terms = align_search_terms_with_message(original_msg, terms)
     size_val = _extract_size_from_text(f"{terms} {original_msg}")
@@ -526,6 +534,10 @@ def shopping_extract_plausible(
     sq_words = re.findall(r"[a-z0-9]+", sq.lower())
     if any(w in sq_words for w in ("instagram", "facebook", "youtube", "twitter", "linkedin", "telegram", "social", "link", "handle")):
         return False
+    # Trust Product NLU / classifier English noun phrases for ANY catalog item —
+    # do not require a fixed product-noun dictionary hit.
+    if 1 <= len(sq_words) <= 8 and 2 <= len(sq) <= 80:
+        return True
     return False
 
 
@@ -650,9 +662,9 @@ Messages may be indirect ("paani peene ke liye jug", "pahan ne ke liye safed shi
 - ENTITY CONTRACT (critical):
 - search_terms = ONLY the searchable product noun phrase the user wants.
 - NEVER write a full English sentence. NEVER paraphrase ("see …", "tell about …", "user wants …", "show me …").
-- NEVER invent a broad category word (clothes, products, items, stuff) when the user named a specific product.
+- NEVER invent a broad category word (clothes, clothing, fashion, apparel, garment, products, items, stuff) when the user named a specific product — emit the English title noun ecommerce listings use.
 - CATALOG ENGLISH: Translate any language/vernacular to the English noun phrase that typically appears in ecommerce product titles. Correct spelling/spacing/compounding using meaning (not a fixed word list). Drop show/buy filler verbs from search_terms.
-- related_search_terms: optional alternate English catalog noun if the primary might miss titles (else empty). allow_related_fallback=true when set.
+- related_search_terms: when the ask is vernacular/romanized/typo OR the primary noun might miss titles, set 1–2 alternate English catalog nouns and allow_related_fallback=true (else empty).
 - Put price budgets in max_price/min_price — NOT inside search_terms.
 - Put colour in color — NOT inside search_terms when separable.
 - Do NOT rewrite into a different unrelated product.
@@ -698,12 +710,12 @@ RULES:
 - If the user tells a story then asks for a NEW product, use ONLY the new product — ignore the old story.
 - Long messages: extract 2-4 words for the product they want NOW, not the full sentence.
 - search_terms must NOT duplicate tokens.
-- Vernacular → catalog English when titles use English (e.g. undershirt/vest words → vest / men vest) and put the vernacular as related_search_terms when helpful.
+- Vernacular → English catalog title nouns from meaning; always set related_search_terms to another plausible title noun when input is romanized/vernacular/typo; allow_related_fallback=true.
 - match_mode strict when brand/model is in the ask; universal for unbranded generic types.
 - If user only asks about orders/tracking/refund with NO product to buy, is_shopping=false and search_terms="".
 - If user vents about relationships/emotions with NO product to buy, is_shopping=false and search_terms="".
 - "cable/cabel tumhare pass" / "milega kya" on Welfog = shopping for that product — NOT internet/WiFi.
-- If unsure of product, best-guess noun phrase (2-4 words) — never "clothes"/"products"/"items".
+- If unsure of product, best-guess English catalog noun phrase (2-4 words) — never "clothes"/"clothing"/"fashion"/"apparel"/"products"/"items".
 - max_price / min_price → customer purchase price (NOT MRP/unit_price). Use for rs/budget/range only.
 - rating_min / rating_max for star filters.
 - pro_id when user gives numeric product id — set pro_id, search_terms="".
@@ -1175,7 +1187,7 @@ def display_label_for_product_search(
         tq = (spec.get("title_query") or "").strip()
         if tq and len(tq) >= 2:
             return tq
-        return "your search"
+        return ""
     extras = []
     try:
         from services.opensearch_products import _is_valid_sku_token

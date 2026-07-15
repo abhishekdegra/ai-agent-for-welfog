@@ -66,6 +66,10 @@ def merge_ai_into_catalog_spec(
     terms = polish_search_terms((ai.get("search_terms") or "").strip(), original_msg)
     if terms:
         spec["title_query"] = terms
+    # Vernacular gloss / NLU alternate nouns — OpenSearch soft-token miss recovery.
+    related = (ai.get("related_search_terms") or "").strip()
+    if related:
+        spec["related_search_terms"] = related
 
     skip_cat_lookup = bool(spec.get("_ai_single_pass") or ai.get("_ai_first"))
     if terms and not skip_cat_lookup:

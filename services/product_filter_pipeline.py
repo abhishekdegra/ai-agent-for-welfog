@@ -420,7 +420,11 @@ def _locked_catalog_spec_ready(
     nlu_done = bool(
         locked.get("_product_nlu_from_ai") or route.get("_product_nlu_from_ai")
     )
-    has_title = bool((locked.get("search_terms") or "").strip())
+    has_title = bool(
+        (locked.get("search_terms") or "").strip()
+        or (brain_search_query or "").strip()
+        or (route.get("search_query") or "").strip()
+    )
     if nlu_done and (
         has_title
         or locked.get("pro_id")
@@ -432,6 +436,10 @@ def _locked_catalog_spec_ready(
         or locked.get("rating_min") is not None
     ):
         # Filters-only browse (price/rating) may have empty title intentionally.
+        return True
+
+    # Brain already resolved catalog English and marked NLU unnecessary.
+    if route.get("_needs_product_nlu_llm") is False and has_title:
         return True
 
     if route.get("_needs_product_nlu_llm"):

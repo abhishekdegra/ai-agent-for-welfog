@@ -648,6 +648,102 @@ def repair_brain_json_quality(route: dict | None, user_msg: str = "", msg_en: st
     except ImportError:
         pass
 
+    # Short/vague turns must not inherit prior catalog topic (hyee → charger).
+    # NEVER demote Brain product/availability using product-noun keyword lists —
+    # "cap h kya" / "baniyan h kya" are catalog even when ≤3 tokens.
+    try:
+        from services.query_understanding import _is_short_or_vague_message
+
+        comb = f"{raw} {en}".strip() or raw
+        if _is_short_or_vague_message(comb):
+            prefers_kb = False
+            try:
+                prefers_kb = brain_route_prefers_kb_answer(out) or (
+                    (out.get("conversation_scope") or "").strip().lower()
+                    == "welfog_support"
+                )
+            except Exception:
+                prefers_kb = (out.get("data_channel") or "").strip().lower() == "kb" or bool(
+                    out.get("kb_keys")
+                )
+            pe = out.get("entities") or out.get("_product_entities") or {}
+            if not isinstance(pe, dict):
+                pe = {}
+            intent_s = (out.get("intent") or "").strip().lower()
+            scope_s = (out.get("conversation_scope") or "").strip().lower()
+            brain_product = (
+                intent_s in ("product", "product_search")
+                or bool(out.get("_product_catalog_locked"))
+                or bool(
+                    pe.get("product_name")
+                    or pe.get("brand")
+                    or pe.get("sku")
+                    or pe.get("pro_id")
+                    or pe.get("product_id")
+                )
+                or (
+                    bool(out.get("run_catalog_search"))
+                    and intent_s not in ("general", "", "out_of_domain")
+                    and scope_s not in ("general_chitchat", "out_of_domain", "harm_sensitive")
+                )
+            )
+            if brain_product:
+                # Brain already chose shopping — keep catalog; only drop sticky continue.
+                out["continue_previous_topic"] = False
+                out["intent"] = "product"
+                out["data_channel"] = "catalog"
+                out["run_catalog_search"] = True
+                out["kb_keys"] = []
+                if scope_s in ("", "general_chitchat"):
+                    out["conversation_scope"] = "welfog_support"
+                log_reasoning(
+                    "Brain repair — short product/availability ask kept on catalog "
+                    "(no noun-list demotion)."
+                )
+            elif (
+                out.get("continue_previous_topic")
+                and intent_s
+                not in (
+                    "order_history",
+                    "wishlist",
+                    "order",
+                    "refund",
+                    "payment",
+                    "pincode_check",
+                )
+                and (out.get("order_lookup_kind") or "none").strip().lower()
+                in ("none", "")
+            ):
+                # Sticky catalog from prior turn on a vague non-product opener.
+                out["continue_previous_topic"] = False
+                out["run_catalog_search"] = False
+                out["search_query"] = ""
+                out.pop("_product_catalog_locked", None)
+                if prefers_kb:
+                    if intent_s in ("product", "product_search"):
+                        out["intent"] = "general"
+                    out["data_channel"] = "kb"
+                    if scope_s in ("", "general_chitchat"):
+                        out["conversation_scope"] = "welfog_support"
+                    log_reasoning(
+                        "Brain repair — short/vague cleared sticky catalog; "
+                        "kept informational KB lock."
+                    )
+                elif intent_s in ("product", "product_search", "general", ""):
+                    out["intent"] = "general"
+                    out["conversation_scope"] = "general_chitchat"
+                    out["data_channel"] = "none"
+                    out["scope_reply"] = (out.get("scope_reply") or "").strip()
+                    log_reasoning(
+                        "Brain repair — short/vague turn cleared sticky catalog "
+                        "(no Brain product lock this message)."
+                    )
+            elif scope_s == "general_chitchat" and not prefers_kb:
+                out["continue_previous_topic"] = False
+                out["run_catalog_search"] = False
+    except ImportError:
+        pass
+
     intent = (out.get("intent") or "").strip().lower()
     if intent == "product" and (out.get("meta_kind") or "none") == "none":
         try:
@@ -910,19 +1006,18 @@ def _ai_meaning_denies_order_tracking(blob: str) -> bool:
 
 def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
     """
-    Trust brain user_meaning when customer wants category/department products
-    but intent drifted to KB/chitchat/delivery — no customer-text keyword lists.
+    Trust Brain JSON when customer wants category/department products but intent
+    drifted to KB/chitchat/delivery.
+
+    Department vs named-item is Brain's job (category_only_browse / category_browse /
+    product_name) — no apparel/department keyword tables here.
     """
     out = dict(route or {})
     um = (out.get("user_meaning") or "").strip().lower()
     if not um:
         return out
+    # Structural English-meaning cues only (Brain writes English user_meaning).
     browse_markers = (
-        "electronics",
-        "beauty",
-        "fashion",
-        "grocery",
-        "home kitchen",
         "products in",
         "products from",
         "show products",
@@ -932,7 +1027,12 @@ def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
         "category",
     )
     if not any(m in um for m in browse_markers):
-        return out
+        # Also accept when Brain already filled department fields.
+        if not (
+            (out.get("category_browse") or "").strip()
+            or out.get("category_only_browse")
+        ):
+            return out
     if (out.get("data_channel") or "").strip().lower() == "catalog" and (
         out.get("category_browse") or out.get("category_only_browse")
     ):
@@ -943,6 +1043,29 @@ def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
         r"\b(track|tracking|refund|invoice|pincode|delivery service|deliver to)\b", um
     ):
         return out
+
+    pe = out.get("product_entities") if isinstance(out.get("product_entities"), dict) else {}
+    named = (
+        (pe.get("product_name") or "").strip()
+        or (out.get("search_query") or "").strip()
+    )
+    # Brain already named a product title and did not mark category-only → keep
+    # product search (vernacular → NLU). Do not invent department-only browse.
+    if named and not out.get("category_only_browse"):
+        out["intent"] = "product"
+        out["data_channel"] = "catalog"
+        out["run_catalog_search"] = True
+        out["category_only_browse"] = False
+        out["needs_order_id"] = False
+        out["order_lookup_kind"] = "none"
+        out["conversation_scope"] = "welfog_support"
+        out["scope_reply"] = ""
+        log_reasoning(
+            "Brain meaning browse-ish but product_name/search_query set "
+            f"{named!r} without category_only — catalog product search."
+        )
+        return out
+
     out["intent"] = "product"
     out["data_channel"] = "catalog"
     out["run_catalog_search"] = True
@@ -951,18 +1074,8 @@ def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
     out["order_lookup_kind"] = "none"
     out["conversation_scope"] = "welfog_support"
     out["scope_reply"] = ""
-    if not (out.get("category_browse") or "").strip():
-        for name in (
-            "electronics",
-            "beauty",
-            "men fashion",
-            "women fashion",
-            "home kitchen",
-            "grocery",
-        ):
-            if name in um:
-                out["category_browse"] = name
-                break
+    # category_browse must come from Brain JSON (English department name) — never
+    # inferred from a hardcoded department vocabulary.
     if not (out.get("search_query") or "").strip():
         out["search_query"] = ""
     log_reasoning(
@@ -1111,6 +1224,13 @@ def brain_route_indicates_informational_kb(
             return False
     except ImportError:
         pass
+    try:
+        from services.product_browse_semantics import llm_meaning_is_product_browse
+
+        if llm_meaning_is_product_browse(route):
+            return False
+    except ImportError:
+        pass
     if brain_route_prefers_kb_answer(route):
         return True
     if original_msg or msg_en:
@@ -1196,13 +1316,31 @@ def brain_route_prefers_kb_answer(route: dict | None) -> bool:
     """Brain already chose knowledge-base answer — do not re-run delivery micro-classifiers."""
     if not isinstance(route, dict):
         return False
+    intent = coerce_route_str(route.get("intent")).lower()
     ch = coerce_route_str(route.get("data_channel")).lower()
+    # Clear product-catalog turns never lose to incidental kb_keys.
+    if intent in ("product", "product_search") or ch == "catalog" or route.get(
+        "run_catalog_search"
+    ) or route.get("_product_catalog_locked"):
+        return False
+    if brain_route_is_order_nav_howto(route):
+        return True
     if ch == "kb":
         return True
     if route.get("kb_keys"):
         return True
     rh = coerce_route_str(route.get("route_handler")).lower()
-    if rh in ("kb", "knowledge", "faq", "faqs", "kb_search"):
+    if rh in (
+        "kb",
+        "knowledge",
+        "faq",
+        "faqs",
+        "kb_search",
+        "order_id_help_kb",
+        "order_tracking_howto_kb",
+        "invoice_howto_kb",
+        "order_history_howto_kb",
+    ):
         return True
     if route.get("_preflight_kb"):
         return True
@@ -1242,6 +1380,147 @@ def reconcile_categories_from_brain_meaning(route: dict | None) -> dict:
     return out
 
 
+def brain_route_is_order_nav_howto(route: dict | None) -> bool:
+    """HOW/WHERE to find Order ID / invoice / track steps — KB, not live ask-ID."""
+    if not isinstance(route, dict):
+        return False
+    if route.get("_order_nav_howto_locked"):
+        return True
+    help_kind = (route.get("order_help_kind") or "").strip().lower()
+    if help_kind == "nav_howto":
+        return True
+    rh = (route.get("route_handler") or "").strip().lower()
+    if rh in (
+        "order_id_help_kb",
+        "order_tracking_howto_kb",
+        "order_history_howto_kb",
+        "invoice_howto_kb",
+    ):
+        return True
+    um = f" {(route.get('user_meaning') or '').lower()} {(route.get('reasoning') or '').lower()} "
+    if not um.strip():
+        return False
+    nav_markers = (
+        "where to find order id",
+        "how to find order id",
+        "where is order id",
+        "locate order id",
+        "order id location",
+        "where to find invoice",
+        "how to find invoice",
+        "where is invoice",
+        "how to download invoice",
+        "invoice location",
+        "how to track order",
+        "tracking howto",
+        "navigation for order id",
+        "steps to find order id",
+        "steps to download invoice",
+    )
+    if any(m in um for m in nav_markers):
+        if any(
+            x in um
+            for x in (
+                "fetch my invoice",
+                "download my invoice for order",
+                "track my order now",
+                "status of my order",
+                "refund status for",
+            )
+        ):
+            return False
+        return True
+    return False
+
+
+def apply_order_nav_howto_route(route: dict | None, *, topic: str = "") -> dict:
+    """Lock KB navigation howto — never ask Order ID, never product catalog."""
+    out = dict(route or {})
+    topic_l = (topic or "").strip().lower()
+    out["order_help_kind"] = "nav_howto"
+    out["_order_nav_howto_locked"] = True
+    out["data_channel"] = "kb"
+    out["needs_order_id"] = False
+    out["numeric_context"] = "none"
+    out["run_catalog_search"] = False
+    out["order_lookup_kind"] = "none"
+    out["conversation_scope"] = "welfog_support"
+    out["is_welfog_related"] = True
+    out["intent"] = "general"
+    out.pop("_product_catalog_locked", None)
+    out.pop("search_query", None)
+    if topic_l in ("invoice", "invoice_location"):
+        out["route_handler"] = "invoice_howto_kb"
+    elif topic_l in ("track", "tracking"):
+        out["route_handler"] = "order_tracking_howto_kb"
+    else:
+        out["route_handler"] = "order_id_help_kb"
+    # Keep existing Brain kb_keys; never run resolve_brain_kb_keys (second OpenAI
+    # embed + hang). Empty → single unscoped Qdrant retrieval on answer path.
+    if not (out.get("kb_keys") or []):
+        out["kb_keys"] = []
+    return out
+
+
+def reconcile_order_nav_howto_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    conversation_context: str = "",
+) -> dict:
+    """
+    Promote Order-ID / invoice / track HOWTO to KB when Brain meaning says navigation.
+    """
+    out = dict(route or {})
+    if brain_route_is_order_nav_howto(out):
+        topic = "order_id"
+        rh = (out.get("route_handler") or "").strip().lower()
+        um = (out.get("user_meaning") or "").lower()
+        if "invoice" in rh or "invoice" in um:
+            topic = "invoice"
+        elif "track" in rh or (
+            "track" in um and "order id" not in um and "find order id" not in um
+        ):
+            topic = "track"
+        return apply_order_nav_howto_route(out, topic=topic)
+
+    help_kind = (out.get("order_help_kind") or "").strip().lower()
+    if help_kind == "personal_live":
+        return out
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    um = (out.get("user_meaning") or "").strip()
+
+    try:
+        from utils.helpers import (
+            _text_is_order_id_help_request,
+            _text_is_tracking_howto_request,
+        )
+
+        if _text_is_order_id_help_request(um) or _text_is_order_id_help_request(comb):
+            log_reasoning("Order nav howto — Order ID location → KB (not ask-ID live).")
+            return apply_order_nav_howto_route(out, topic="order_id")
+        if _text_is_tracking_howto_request(um) or _text_is_tracking_howto_request(comb):
+            if not out.get("needs_order_id") or help_kind == "nav_howto":
+                log_reasoning("Order nav howto — tracking steps → KB.")
+                return apply_order_nav_howto_route(out, topic="track")
+    except ImportError:
+        pass
+    try:
+        from services.order_details_flow import text_asks_invoice_howto_navigation
+
+        if text_asks_invoice_howto_navigation(um, conversation_context) or (
+            not re.search(r"\b\d{4,20}\b", comb)
+            and text_asks_invoice_howto_navigation(comb, conversation_context)
+        ):
+            log_reasoning("Order nav howto — invoice location → KB (not catalog/live).")
+            return apply_order_nav_howto_route(out, topic="invoice")
+    except ImportError:
+        pass
+    return out
+
+
 def reconcile_welfog_kb_from_brain_meaning(
     route: dict | None,
     *,
@@ -1250,7 +1529,17 @@ def reconcile_welfog_kb_from_brain_meaning(
     conversation_context: str = "",
 ) -> dict:
     out = dict(route or {})
-    out["intent"] = "general"
+    out = reconcile_order_nav_howto_from_brain_meaning(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        conversation_context=conversation_context,
+    )
+    if brain_route_is_order_nav_howto(out):
+        return out
+    intent = (out.get("intent") or "").strip().lower()
+    if intent not in ("seller", "refund", "payment"):
+        out["intent"] = "general"
     out["data_channel"] = "kb"
     out["conversation_scope"] = "welfog_support"
     out["is_welfog_related"] = True
@@ -1258,19 +1547,10 @@ def reconcile_welfog_kb_from_brain_meaning(
     out["needs_order_id"] = False
     out["scope_reply"] = ""
     out["meta_kind"] = "none"
+    # Keep Brain kb_keys as-is. Do NOT call resolve_brain_kb_keys here — that runs a
+    # full semantic pass (OpenAI embed + rank) and then answer retrieval embeds again
+    # (double cost / hang). Empty keys → format_kb_answer unscoped Qdrant once.
     keys = [k for k in (out.get("kb_keys") or []) if k]
-    if not keys:
-        try:
-            from services.kb_service import resolve_brain_kb_keys
-
-            keys = resolve_brain_kb_keys(
-                out,
-                original_msg,
-                msg_en,
-                conversation_context=conversation_context,
-            )
-        except ImportError:
-            keys = []
     out["kb_keys"] = keys
     return out
 
@@ -1306,27 +1586,375 @@ def _brain_product_name_is_noisy(name: str, route: dict | None = None) -> bool:
         return False
 
 
+def _extract_brain_parenthetical_gloss(name: str) -> str:
+    """
+    Pull English gloss from Brain titles like 'chunri (scarf).' → 'scarf'.
+    Used as related_search_terms only — never a keyword map.
+    """
+    m = re.search(r"\(([^)]{2,40})\)", (name or "").strip())
+    if not m:
+        return ""
+    gloss = re.sub(r"\s+", " ", m.group(1)).strip(" .,-")
+    if not gloss or len(gloss) > 40:
+        return ""
+    # Keep short English noun phrases only.
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9\s\-]{1,39}", gloss):
+        return ""
+    return gloss.lower()
+
+
 def _clean_brain_product_name(name: str) -> str:
+    """Strip Brain-authored English request shells — keep the catalog noun phrase."""
     s = (name or "").strip()
     low = s.lower()
+    # Brain / NLU English wrappers only (not customer keyword maps).
     for prefix in (
         "i want a ",
+        "i want an ",
         "i want ",
         "i need a ",
+        "i need an ",
         "i need ",
+        "show me a ",
+        "show me an ",
         "show me ",
+        "find me a ",
+        "find me ",
+        "find a ",
         "find ",
+        "search for a ",
         "search for ",
         "search ",
+        "looking for a ",
+        "looking for ",
+        "customer wants to buy a ",
+        "customer wants to buy an ",
+        "customer wants to buy ",
+        "customer wants a ",
+        "customer wants an ",
         "customer wants ",
+        "user wants to buy a ",
+        "user wants to buy an ",
+        "user wants to buy ",
+        "user wants to see a ",
+        "user wants to see ",
+        "user wants to get a ",
+        "user wants to get ",
+        "user wants to view ",
+        "user wants a ",
+        "user wants an ",
         "user wants ",
+        "user is looking for a ",
+        "user is looking for ",
+        "user is asking for a ",
+        "user is asking for ",
+        "the user wants a ",
+        "the user wants an ",
+        "the user wants ",
+        "the customer wants a ",
+        "the customer wants ",
     ):
         if low.startswith(prefix):
             s = s[len(prefix) :].strip()
             low = s.lower()
     s = re.sub(r"\s+for\s+my\s+.+$", "", s, flags=re.I).strip()
-    s = re.sub(r"\s+ke\s+liye\s*$", "", s, flags=re.I).strip()
+    s = re.sub(r"^(a|an|the)\s+", "", s, flags=re.I).strip()
+    s = re.sub(r"\s+products?\s*$", "", s, flags=re.I).strip()
+    # Brain often writes vernacular + English gloss: "chunri (scarf)." / "baniyan (vest)".
+    # Prefer the head noun for OpenSearch; polish will still keep gloss tokens if useful.
+    s = re.sub(r"\s*\([^)]*\)\s*", " ", s).strip()
+    s = re.sub(r"[.]+$", "", s).strip()
+    s = re.sub(r"\s+", " ", s).strip()
     return s
+
+
+def _catalog_phrase_echoes_customer_raw(
+    phrase: str,
+    original_msg: str = "",
+    msg_en: str = "",
+    *,
+    brain_route: dict | None = None,
+) -> bool:
+    """
+    True when phrase is still the customer's romanized/raw tokens — not catalog English.
+
+    Structural only (no product synonym maps): if every title token already appears in
+    the customer text and the ask is Hinglish/short roman, Product Entity Extraction
+    must map meaning → English title nouns before OpenSearch.
+
+    Exception: Brain already wrote English user_meaning that contains the same noun
+    (e.g. product_name=socks + meaning="User wants to buy socks…") — that is NOT a
+    vernacular echo; OpenSearch can use it immediately (skip redundant 2nd LLM).
+    """
+    p = (phrase or "").strip().lower()
+    raw = (original_msg or "").strip()
+    if not p or not raw:
+        return False
+    phrase_toks = re.findall(r"[a-zA-Z]{3,}", p)
+    cust_toks = set(re.findall(r"[a-zA-Z]{3,}", raw.lower()))
+    if not phrase_toks or not set(phrase_toks) <= cust_toks:
+        return False
+    try:
+        from services.translation_service import (
+            _hinglish_marker_count,
+            _latin_script_only,
+            is_hinglish_message,
+        )
+    except ImportError:
+        return len(phrase_toks) == 1
+
+    # Brain English meaning already confirms this catalog noun → not vernacular echo.
+    if _brain_english_meaning_confirms_product_noun(brain_route, p):
+        return False
+
+    # Multi-word Latin product already typed by the customer ("nike shoes", "flip flop")
+    # is OpenSearch-ready even inside a Hinglish sentence.
+    if len(phrase_toks) >= 2 and _latin_script_only(p) and not is_hinglish_message(p):
+        return False
+    # Single Latin noun that is itself not Hinglish, when customer (or gloss) already
+    # typed that English product word — OpenSearch-ready (socks/caps/belt/jeans).
+    # Vernacular romanization without Brain English confirmation still returns True below.
+    if (
+        len(phrase_toks) == 1
+        and _latin_script_only(p)
+        and not is_hinglish_message(p)
+        and _brain_english_meaning_confirms_product_noun(brain_route, p)
+    ):
+        return False
+    if is_hinglish_message(raw) or _hinglish_marker_count(raw.lower()) > 0:
+        return True
+    # Short Latin-only ask that merely echoes one raw token — may be romanization
+    # UNLESS Brain English meaning already confirms the noun.
+    if len(phrase_toks) == 1 and _latin_script_only(raw) and len(cust_toks) <= 3:
+        hint = (msg_en or "").strip().lower()
+        hint_toks = set(re.findall(r"[a-zA-Z]{3,}", hint)) if hint else set()
+        # English gloss already translated away from the raw token → not an echo.
+        if hint_toks and not set(phrase_toks) <= hint_toks:
+            return False
+        return True
+    return False
+
+
+def _brain_english_meaning_confirms_product_noun(
+    route: dict | None, noun: str
+) -> bool:
+    """
+    True when Brain English user_meaning already contains this catalog noun.
+
+    No product dictionaries — only script/Hinglish detectors + token containment.
+    Saves a full Product Entity Extraction LLM when Brain already resolved English.
+    """
+    r = route if isinstance(route, dict) else {}
+    um = str(r.get("user_meaning") or "").strip()
+    n = (noun or "").strip()
+    if not um or not n:
+        return False
+    try:
+        from services.translation_service import (
+            _latin_script_only,
+            _looks_english_only_latin,
+            is_hinglish_message,
+            text_usable_as_english_retrieval,
+        )
+    except ImportError:
+        return False
+    if not _latin_script_only(n) or is_hinglish_message(n):
+        return False
+    um_l = um.lower()
+    if is_hinglish_message(um):
+        return False
+    meaning_english = (
+        text_usable_as_english_retrieval(um)
+        or _looks_english_only_latin(um)
+        or um_l.startswith(
+            (
+                "user ",
+                "customer ",
+                "the user ",
+                "the customer ",
+                "i want",
+                "show ",
+                "find ",
+            )
+        )
+    )
+    if not meaning_english:
+        return False
+    noun_toks = re.findall(r"[a-zA-Z]{2,}", n.lower())
+    if not noun_toks:
+        return False
+    um_toks = set(re.findall(r"[a-zA-Z]{2,}", um_l))
+    # Light plural fold (belt↔belts) — structural only, no synonym maps.
+    um_fold = um_toks | {t[:-1] for t in um_toks if len(t) > 3 and t.endswith("s")}
+    um_fold |= {f"{t}s" for t in um_toks if len(t) >= 3}
+    return all(t in um_fold or (t.endswith("s") and t[:-1] in um_fold) for t in noun_toks)
+
+
+def _phrase_is_catalog_english(phrase: str, *, brain_route: dict | None = None) -> bool:
+    """
+    True when phrase is confident OpenSearch catalog English from Brain/NLU.
+    No product-noun dictionaries — script + Hinglish detectors only.
+
+    Single Latin tokens are catalog-ready ONLY when Brain English meaning
+    already confirms them (socks confirmed by \"User wants socks…\").
+    Bare romanization without English meaning still fails → Entity Extraction.
+    """
+    p = (phrase or "").strip()
+    if len(p) < 2 or len(p.split()) > 6:
+        return False
+    if is_generic_catalog_search_phrase(p):
+        return False
+    try:
+        from services.translation_service import (
+            _hinglish_marker_count,
+            _latin_script_only,
+            _looks_english_only_latin,
+            is_hinglish_message,
+            text_usable_as_english_retrieval,
+        )
+
+        if not _latin_script_only(p):
+            return False
+        if is_hinglish_message(p) or _hinglish_marker_count(p.lower()) > 0:
+            return False
+        if text_usable_as_english_retrieval(p) or _looks_english_only_latin(p):
+            return True
+        tokens = re.findall(r"[a-zA-Z]{2,}", p)
+        if len(tokens) >= 2:
+            return True
+        # Single token: trust only when Brain English meaning already named it.
+        return bool(tokens) and _brain_english_meaning_confirms_product_noun(
+            brain_route, p
+        )
+    except ImportError:
+        tokens = re.findall(r"[a-zA-Z]{2,}", p)
+        return len(tokens) >= 2
+
+
+def _english_catalog_phrase_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> str:
+    """
+    Catalog title from Brain English user_meaning first (any product language in).
+    Strips Brain shells — no vernacular synonym table.
+
+    Only trust user_meaning when Brain wrote English understanding (not when
+    meaning is still romanized vernacular like \"topi leni h\").
+    """
+    r = route or {}
+    try:
+        from services.translation_service import (
+            _latin_script_only,
+            _looks_english_only_latin,
+            is_hinglish_message,
+            text_usable_as_english_retrieval,
+        )
+    except ImportError:
+
+        def _latin_script_only(t: str) -> bool:  # type: ignore
+            return bool(re.fullmatch(r"[A-Za-z0-9\s\-']+", t or ""))
+
+        def is_hinglish_message(t: str) -> bool:  # type: ignore
+            return False
+
+        def _looks_english_only_latin(t: str) -> bool:  # type: ignore
+            return bool(t) and bool(re.search(r"\b(want|buy|show|need|user|customer)\b", t or "", re.I))
+
+        def text_usable_as_english_retrieval(t: str) -> bool:  # type: ignore
+            return _looks_english_only_latin(t)
+
+    um_raw = str(r.get("user_meaning") or "").strip()
+    um_clean = _clean_brain_product_name(um_raw)
+    # Brain SoT: English paraphrase of intent → strip shell → catalog noun.
+    # Reject vernacular residue that never looked like English understanding.
+    # Shell strip catches "User wants Samsung phone covers" even when the small
+    # conversational-token set misses "user"/"wants" (no synonym maps).
+    shell_stripped = bool(um_clean) and um_clean.lower() != um_raw.lower() and any(
+        um_raw.lower().startswith(p)
+        for p in (
+            "i want",
+            "i need",
+            "show me",
+            "find me",
+            "find a",
+            "find ",
+            "search for",
+            "search ",
+            "looking for",
+            "customer wants",
+            "user wants",
+            "user is looking",
+            "user is asking",
+            "the user wants",
+            "the customer wants",
+        )
+    )
+    meaning_is_english = bool(um_raw) and _latin_script_only(um_raw) and not is_hinglish_message(
+        um_raw
+    ) and (
+        text_usable_as_english_retrieval(um_raw)
+        or _looks_english_only_latin(um_raw)
+        or shell_stripped
+    )
+    if (
+        um_clean
+        and meaning_is_english
+        and not is_generic_catalog_search_phrase(um_clean)
+        and _latin_script_only(um_clean)
+        and not is_hinglish_message(um_clean)
+        and not _catalog_phrase_echoes_customer_raw(
+            um_clean, original_msg, msg_en, brain_route=r
+        )
+    ):
+        toks = um_clean.split()
+        # Short catalog noun only. Longer residue ("kurta for myself") → Product Entity
+        # Extraction LLM owns the English title — no filler-phrase regex dictionaries.
+        # Multi-word English titles, or single noun Brain shell-stripped to catalog English.
+        if 1 <= len(toks) <= 3 and (len(toks) >= 2 or shell_stripped):
+            return um_clean[:120]
+        # Longer English meaning with a short product_name entity that it confirms —
+        # trust entity (socks from "User wants to buy socks for his niece").
+        pe_pn = _usable_catalog_entity_phrase(
+            (_raw_route_product_entities(r).get("product_name") or ""), r
+        )
+        if pe_pn and _brain_english_meaning_confirms_product_noun(r, pe_pn):
+            return pe_pn[:120]
+
+    for raw in (r.get("search_query"),):
+        cleaned = _usable_catalog_entity_phrase(str(raw or ""), r)
+        if (
+            cleaned
+            and _phrase_is_catalog_english(cleaned, brain_route=r)
+            and not _catalog_phrase_echoes_customer_raw(
+                cleaned, original_msg, msg_en, brain_route=r
+            )
+        ):
+            return cleaned[:120]
+
+    # Noun extract only from English meaning/search_query fields.
+    if meaning_is_english or (
+        r.get("search_query")
+        and _phrase_is_catalog_english(str(r.get("search_query") or ""), brain_route=r)
+    ):
+        noun = _product_noun_from_brain_english(
+            f"{r.get('user_meaning') or ''} {r.get('search_query') or ''}"
+        )
+        if (
+            noun
+            and not is_generic_catalog_search_phrase(noun)
+            and not _catalog_phrase_echoes_customer_raw(
+                noun, original_msg, msg_en, brain_route=r
+            )
+            and (
+                _phrase_is_catalog_english(noun, brain_route=r)
+                or (len(noun.split()) >= 2 and noun.replace(" ", "").isalpha())
+            )
+        ):
+            return noun[:120]
+    return ""
 
 
 def _product_noun_from_brain_english(blob: str) -> str:
@@ -1513,6 +2141,13 @@ def _repair_brain_product_entities(
             else:
                 out.pop(k, None)
 
+    # Preserve Brain gloss "(scarf)" as related before paren strip cleans the title.
+    gloss_related = ""
+    for blob in (pn, um, sq):
+        gloss_related = _extract_brain_parenthetical_gloss(blob or "")
+        if gloss_related:
+            break
+
     if pn and _brain_product_name_is_noisy(pn, r):
         cleaned = _clean_brain_product_name(pn)
         if cleaned and not _brain_product_name_is_noisy(cleaned, r):
@@ -1523,6 +2158,11 @@ def _repair_brain_product_entities(
             pn_um = _clean_brain_product_name(um)
             if pn_um and not _brain_product_name_is_noisy(pn_um, r):
                 pn = pn_um
+    elif pn:
+        # Still strip paren gloss / trailing dots from otherwise clean titles.
+        cleaned = _clean_brain_product_name(pn)
+        if cleaned:
+            pn = cleaned
 
     inferred_from_um = _product_noun_from_brain_english(brain_blob)
     if pn and inferred_from_um:
@@ -1704,6 +2344,15 @@ def _repair_brain_product_entities(
 
     if pn:
         out["product_name"] = pn
+    # Brain "chunri (scarf)" → primary title "chunri", related "scarf" for soft OS.
+    if gloss_related:
+        related_now = _coerce_brain_scalar_field(out.get("related_search_terms"))
+        if not related_now:
+            out["related_search_terms"] = gloss_related
+            out.setdefault("allow_related_fallback", True)
+        elif gloss_related.lower() not in related_now.lower():
+            out["related_search_terms"] = f"{related_now} {gloss_related}".strip()
+            out.setdefault("allow_related_fallback", True)
     return out
 
 
@@ -1742,9 +2391,10 @@ def _brain_product_entities_from_route(
     elif not isinstance(raw, dict):
         raw = {}
     ent: dict = {}
+    # List/bool fields handled below — do not drop related_search_terms (needed for
+    # vernacular gloss soft-retry: chunri → scarf).
     _skip_keys = frozenset(
         {
-            "related_search_terms",
             "exclude_title_tokens",
             "mandatory_match_tokens",
             "allow_related_fallback",
@@ -2010,25 +2660,75 @@ def resolve_catalog_search_phrase(
     ai_search_query: str = "",
 ) -> str:
     """
-    Optional Brain *structured* product_entities.product_name hint only.
+    Catalog OpenSearch title from Brain understanding.
 
-    OpenSearch title_query must NOT come from user_meaning / reasoning / search_query
-    paraphrases / category_browse / raw customer text. Prefer explicit product_name
-    from Brain product_entities JSON. Product Entity Extraction
-    (extract_semantic_product_entities) owns title_query when this returns empty.
+    Priority: Brain English meaning noun → confident English search_query /
+    product_name → empty (one Product Entity Extraction for vernacular).
+    Never let vernacular product_name=\"topi\" beat Brain meaning \"cap\".
     """
     r = ai_route or {}
-    _ = (original_msg, msg_en, ai_search_query)
 
-    # Explicit product_entities.product_name only (not synthesized from search_query).
     ent = _raw_route_product_entities(r)
     pn = _usable_catalog_entity_phrase(ent.get("product_name") or "", r)
-    if pn:
+    en_from_meaning = _english_catalog_phrase_from_brain_meaning(
+        r, original_msg=original_msg, msg_en=msg_en
+    )
+
+    if en_from_meaning:
+        if pn and pn.lower() != en_from_meaning.lower() and not _phrase_is_catalog_english(
+            pn, brain_route=r
+        ):
+            log_reasoning(
+                f"Catalog title — Brain English {en_from_meaning!r} over vernacular "
+                f"product_name {pn!r}."
+            )
+        return en_from_meaning
+
+    # Brain English meaning already names this product_name (socks, belt, caps…) —
+    # use it immediately. Skips a redundant Product Entity Extraction LLM that
+    # typically returns the same title.
+    if pn and _brain_english_meaning_confirms_product_noun(r, pn):
+        log_reasoning(
+            f"Catalog title — Brain meaning confirms {pn!r}; OpenSearch next "
+            "(skip entity NLU)."
+        )
+        return pn
+
+    sq_hint = _usable_catalog_entity_phrase(
+        (ai_search_query or r.get("search_query") or "").strip(), r
+    )
+    if (
+        sq_hint
+        and _phrase_is_catalog_english(sq_hint, brain_route=r)
+        and not _catalog_phrase_echoes_customer_raw(
+            sq_hint, original_msg, msg_en, brain_route=r
+        )
+    ):
+        return sq_hint
+
+    if (
+        pn
+        and _phrase_is_catalog_english(pn, brain_route=r)
+        and not _catalog_phrase_echoes_customer_raw(
+            pn, original_msg, msg_en, brain_route=r
+        )
+    ):
         um = (r.get("user_meaning") or "").strip().lower()
-        # Reject when Brain stuffed its paraphrase sentence into product_name.
         if um and pn.lower() == um:
             return ""
         return pn
+
+    if pn and (
+        not _phrase_is_catalog_english(pn, brain_route=r)
+        or _catalog_phrase_echoes_customer_raw(
+            pn, original_msg, msg_en, brain_route=r
+        )
+    ):
+        log_reasoning(
+            f"Catalog title — vernacular/echo product_name {pn!r}; "
+            "defer to Product Entity Extraction for catalog English."
+        )
+        return ""
 
     return ""
 
@@ -2253,7 +2953,30 @@ def reconcile_product_catalog_from_brain_meaning(
     Trust ai_brain_route JSON (user_meaning, search_query, entities) — not customer keywords.
     """
     out = dict(route or {})
-    if brain_route_indicates_informational_kb(out):
+    # Clear OOD/chitchat/harm without shopping signals — do not run product rescue LLMs.
+    intent0 = (out.get("intent") or "").strip().lower()
+    scope0 = (out.get("conversation_scope") or "").strip().lower()
+    if (
+        intent0 == "out_of_domain"
+        or scope0 in ("out_of_domain", "general_chitchat", "harm_sensitive")
+        or out.get("is_welfog_related") is False
+    ) and not brain_route_indicates_product_catalog(out):
+        return out
+    # Message-aware: shopping beats incidental KB lock (pass text so structural/AI can clear).
+    if brain_route_indicates_informational_kb(
+        out, original_msg=original_msg, msg_en=msg_en
+    ):
+        # Brain parked on KB — still allow AI shopping override when the turn is shopping.
+        try:
+            from services.ai_first_router import _try_brain_misroute_product_rescue_via_ai
+
+            rescued = _try_brain_misroute_product_rescue_via_ai(
+                out, original_msg, msg_en
+            )
+            if isinstance(rescued, dict) and rescued.get("_product_catalog_locked"):
+                return rescued
+        except ImportError:
+            pass
         return out
     try:
         from services.product_catalog_resolver import product_catalog_route_is_locked
@@ -2295,6 +3018,17 @@ def reconcile_product_catalog_from_brain_meaning(
         except ImportError:
             pass
     if not brain_route_indicates_product_catalog(out):
+        # Prefer AI agent rescue over structural keyword detectors.
+        try:
+            from services.ai_first_router import _try_brain_misroute_product_rescue_via_ai
+
+            rescued = _try_brain_misroute_product_rescue_via_ai(
+                out, original_msg, msg_en
+            )
+            if isinstance(rescued, dict) and rescued.get("_product_catalog_locked"):
+                return rescued
+        except ImportError:
+            pass
         try:
             from utils.helpers import turn_is_obvious_product_shopping_turn
 
@@ -2322,8 +3056,11 @@ def reconcile_product_catalog_from_brain_meaning(
     out["order_lookup_kind"] = "none"
     out["scope_reply"] = ""
     out["is_welfog_related"] = True
+    out["kb_keys"] = []
     if sq:
         out["search_query"] = sq
+        # Concrete product title search — do not keep empty department-only browse.
+        out.pop("category_only_browse", None)
     log_reasoning(
         f"Brain shopping reconcile — lock product catalog sq={sq!r} (AI JSON, no keyword gate)."
     )
@@ -2934,6 +3671,26 @@ def resolve_order_live_goal_for_turn(
     if refund_struct == "refund_status":
         return "refund_status"
 
+    # Personal refund without Order ID — never return track from a mislabeled brain JSON.
+    try:
+        from services.refund_status_semantics import (
+            ai_route_requests_refund_status_lookup,
+            current_turn_wants_personal_refund_status,
+        )
+
+        if ai_route_requests_refund_status_lookup(
+            route, original_msg, msg_en, conversation_context
+        ) or current_turn_wants_personal_refund_status(
+            original_msg,
+            msg_en,
+            conversation_context,
+            ai_route=route,
+            allow_llm=False,
+        ):
+            return "refund_status"
+    except ImportError:
+        pass
+
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if comb and not re.search(r"\b\d{4,20}\b", comb):
         try:
@@ -2952,6 +3709,27 @@ def resolve_order_live_goal_for_turn(
                     msg_en=msg_en,
                     conversation_context=conversation_context,
                 )
+                if brain_goal == "refund_status":
+                    return "refund_status"
+                if brain_goal == "track":
+                    # Brain may park "refund stuck" as track — double-check refund meaning.
+                    try:
+                        from services.refund_status_semantics import (
+                            promote_refund_status_on_route,
+                            refund_status_route_is_locked,
+                        )
+
+                        promoted = promote_refund_status_on_route(
+                            locked_pre,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                            conversation_context=conversation_context,
+                            allow_llm=False,
+                        )
+                        if refund_status_route_is_locked(promoted):
+                            return "refund_status"
+                    except ImportError:
+                        pass
                 if brain_goal in (
                     "refund_status",
                     "order_invoice",
@@ -3715,15 +4493,24 @@ def enrich_universal_brain_route(
                 msg_en=msg_en,
             )
             out["_product_catalog_locked"] = True
-            # Routing is locked; title_query still requires Product Entity Extraction.
-            out["_needs_product_nlu_llm"] = True
+            pe = out.get("_product_entities") or out.get("entities") or {}
+            if not isinstance(pe, dict):
+                pe = {}
+            if pe.get("sku") or pe.get("pro_id") or pe.get("product_id") or (
+                pe.get("product_name") or ""
+            ).strip():
+                out["_needs_product_nlu_llm"] = False
+                out["_product_nlu_from_ai"] = True
+            else:
+                # Routing locked; title_query still requires Product Entity Extraction.
+                out["_needs_product_nlu_llm"] = True
             out["_ai_single_pass"] = True
             out["_turn_promotions_done"] = True
             if isinstance(ctx, dict) and ctx.get("last"):
                 out["_ctx_last"] = ctx.get("last")
             log_reasoning(
                 "Universal brain — AI product catalog locked; skip enrich/embed stack "
-                "(Product Entity Extraction owns title_query)."
+                "(Product Entity Extraction owns title_query only when name empty)."
             )
             return out
     except ImportError:

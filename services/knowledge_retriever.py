@@ -18,6 +18,7 @@ from services.qdrant_service import (
     qdrant_health_check,
     search_knowledge_vectors,
 )
+from utils.reasoning_log import log_reasoning
 
 
 def _env_float(name: str, default: float) -> float:
@@ -453,35 +454,48 @@ def _soft_rerank_with_kb_hints(
     margin: float | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Soft Brain kb_keys boost for tie-breaking only.
+    Soft Brain kb_keys preference.
 
-    Semantic (raw) similarity ALWAYS wins over hint boost — a stronger match
-    is never ranked below a weaker legacy/classic document.
+    Raw semantic score stays primary. When Brain locks kb_keys, a hint-matched
+    chunk within ``margin`` of the top raw score is preferred — this stops
+    lexical near-misses (e.g. seller FAQ) from beating the keyed fact chunk.
     """
     if not raw_hits:
         return []
     hint_list = list(hints or [])
     b = float(boost if boost is not None else KB_KEY_HINT_BOOST)
     b = max(0.0, min(0.08, b))
+    m = float(margin if margin is not None else KB_KEY_HINT_MARGIN)
+    # Brain-locked keys need enough room to beat lexical false friends.
+    m = max(0.03, min(0.18, m if hint_list else m))
+    if hint_list:
+        m = max(m, 0.12)
     limit = max(1, min(20, int(limit)))
-    _ = margin  # retained for call-site compat; not used to override raw scores
 
     enriched: list[dict[str, Any]] = []
     for h in raw_hits:
         payload = h.get("payload") or {}
         score = float(h.get("score") or 0.0)
         matched = _hit_matches_kb_hints(payload, hint_list)
-        # Hint is secondary only — never inflate past a higher raw competitor.
         soft = score + (b if matched else 0.0)
         enriched.append({**h, "_hint_matched": matched, "_soft_score": soft, "_raw": score})
 
-    # Primary: raw semantic score. Secondary: soft score / hint match.
+    best_raw = max((float(x.get("_raw") or 0.0) for x in enriched), default=0.0)
+    best_hint_raw = max(
+        (float(x.get("_raw") or 0.0) for x in enriched if x.get("_hint_matched")),
+        default=-1.0,
+    )
+    prefer_hints = bool(hint_list) and best_hint_raw >= 0.0 and best_hint_raw >= (
+        best_raw - m
+    )
+
+    # Primary: raw semantic. When a keyed hit is close enough, promote it.
     by_rank = sorted(
         enriched,
         key=lambda x: (
+            1 if (prefer_hints and x.get("_hint_matched")) else 0,
             float(x.get("_raw") or 0.0),
             float(x.get("_soft_score") or 0.0),
-            1 if x.get("_hint_matched") else 0,
         ),
         reverse=True,
     )
@@ -687,33 +701,69 @@ def retrieve_knowledge_context(
             query_vector = list(vectors[0])
 
             dense_lists: list[list[dict[str, Any]]] = []
-            for vec in vectors:
-                dense_lists.append(
-                    search_knowledge_vectors(
-                        collection,
-                        vec,
-                        top_k=candidate_k,
-                        min_score=floor,
-                        category_filter=None,
-                        language_filter=lang_filter,
-                        doc_id_filter=doc_ids,
-                    )
-                )
-
             fulltext_lists: list[list[dict[str, Any]]] = []
             ft_q = (variants or [q])[0]
+
+            def _run_dense() -> list[list[dict[str, Any]]]:
+                out_lists: list[list[dict[str, Any]]] = []
+                for vec in vectors:
+                    out_lists.append(
+                        search_knowledge_vectors(
+                            collection,
+                            vec,
+                            top_k=candidate_k,
+                            min_score=floor,
+                            category_filter=None,
+                            language_filter=lang_filter,
+                            doc_id_filter=doc_ids,
+                        )
+                    )
+                return out_lists
+
+            def _run_fulltext() -> list[list[dict[str, Any]]]:
+                try:
+                    ft = lexical_knowledge_search(
+                        collection,
+                        ft_q,
+                        top_k=max(6, limit),
+                        doc_id_filter=doc_ids,
+                        language_filter=lang_filter,
+                    )
+                    return [ft] if ft else []
+                except Exception:
+                    return []
+
             try:
-                ft = lexical_knowledge_search(
-                    collection,
-                    ft_q,
-                    top_k=max(6, limit),
-                    doc_id_filter=doc_ids,
-                    language_filter=lang_filter,
+                from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+
+                # Prefer sequential under /chat worker — nested pools + async deadline
+                # caused 35s deadlocks (parent join waiting, child pool starved).
+                use_pool = (os.getenv("KB_RETRIEVAL_PARALLEL") or "0").strip().lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
                 )
-                if ft:
-                    fulltext_lists.append(ft)
+                if use_pool:
+                    with ThreadPoolExecutor(max_workers=2) as pool:
+                        dense_fut = pool.submit(_run_dense)
+                        ft_fut = pool.submit(_run_fulltext)
+                        try:
+                            dense_lists = dense_fut.result(timeout=8.0)
+                        except FuturesTimeout:
+                            dense_lists = []
+                            log_reasoning("Qdrant dense search timed out (8s) — skip.")
+                        try:
+                            fulltext_lists = ft_fut.result(timeout=8.0)
+                        except FuturesTimeout:
+                            fulltext_lists = []
+                            log_reasoning("Qdrant fulltext search timed out (8s) — skip.")
+                else:
+                    dense_lists = _run_dense()
+                    fulltext_lists = _run_fulltext()
             except Exception:
-                pass
+                dense_lists = _run_dense()
+                fulltext_lists = _run_fulltext()
 
             merge_lists = list(dense_lists) + fulltext_lists
             raw_merged = _rrf_merge_raw_hits(merge_lists)

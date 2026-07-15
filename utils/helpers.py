@@ -6716,10 +6716,6 @@ def message_is_bot_capability_question(text: str) -> bool:
     if not (text or "").strip():
         return False
     tl = f" {_normalize_conversational_text(text)} "
-    if _message_has_catalog_product_signal(text) and any(
-        x in tl for x in ("dikhao", "dikha", "chahiye", "lena", "kharid", "buy", "show me")
-    ):
-        return False
     if (
         re.search(r"\bjo\s+(?:bolu|bolun|bolenge)\b", tl)
         and re.search(r"\b(?:dega|dikha|dikhaye|milega|milta)\b", tl)
@@ -6732,9 +6728,10 @@ def message_is_bot_capability_question(text: str) -> bool:
         return True
     if re.search(r"\b(?:dikha|dikhao)\s+dega\s+ky", tl):
         return True
-    if any(x in tl for x in ("jo bolu", "jo chahiye", "jo chaiye", "tere pass", "tumhare pass")):
-        if any(x in tl for x in ("dega", "milega", "milta", "h kya", "hai kya", "dikha dega")):
-            if len(re.findall(r"[a-z]+", tl)) <= 12:
+    # Meta only for "whatever I ask / jo bolu" capability — NOT "tumhare pass <item> h kya".
+    if any(x in tl for x in ("jo bolu", "jo chahiye", "jo chaiye")):
+        if any(x in tl for x in ("dega", "milega", "milta", "h kya", "hai kya", "dikha dega", "pass")):
+            if len(re.findall(r"[a-z]+", tl)) <= 14:
                 return True
     return False
 
@@ -8001,12 +7998,13 @@ def message_is_seller_on_welfog_request(text: str) -> bool:
 
 def _text_mentions_social_platform(t: str) -> bool:
     tl = f" {(t or '').lower()} "
+    # Platforms / social URLs only — NOT in-app surfaces like Reels (those are KB policy).
     markers = (
         "instagram", " insta ", " insta.", " insta,", "linkedin", "linkdin",
         " facebook", " fb ", "youtube", " you tube", " twitter", " twiter ",
         " twittr ", " social media",
         " social link", " social account", " official link", " official page",
-        " handle", " profile", " x.com", " reels",
+        " handle", " x.com",
     )
     if any(m in tl for m in markers):
         return True

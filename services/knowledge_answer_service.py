@@ -42,12 +42,25 @@ def should_generate_qdrant_kb_answer(ai_route: dict | None) -> bool:
 
 
 def _trim_hits_for_answer_llm(hits: list[dict[str, Any]], *, limit: int | None = None) -> list[dict[str, Any]]:
-    """Keep highest-scoring chunks for the grounding prompt."""
+    """
+    Keep highest-scoring chunks for the grounding prompt.
+
+    Drop far-below-top hits so cancel/return/shipping glue does not dump
+    unrelated FAQ paragraphs into the LLM context.
+    """
     if not hits:
         return []
     cap = max(1, int(limit if limit is not None else ANSWER_CONTEXT_K))
     ranked = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)
-    return ranked[:cap]
+    if not ranked:
+        return []
+    top = float(ranked[0].get("score") or 0)
+    # Relative band: keep near-duplicates of the best match only.
+    floor = max(0.12, top * 0.72) if top > 0 else 0.12
+    tight = [h for h in ranked if float(h.get("score") or 0) >= floor]
+    if not tight:
+        tight = ranked[:1]
+    return tight[:cap]
 
 
 def _build_retrieval_query(
@@ -105,7 +118,12 @@ def _build_strict_llm_context(hits: list[dict[str, Any]]) -> str:
         "- Answer ONLY using facts present in the chunks above.\n"
         "- If the chunks do not contain the answer, say it is not in the available knowledge.\n"
         "- Do NOT invent policies, fees, timelines, phone numbers, or emails.\n"
-        "- Answer ONLY what the user asked — concise, no unrelated sections.\n"
+        "- Pick ONLY the chunk(s) that answer THIS question — never paste unrelated FAQs "
+        "(cancel ≠ return; refund timeline ≠ return steps; shipping days ≠ checkout/coupons).\n"
+        "- Be COMPLETE for what was asked: full relevant policy facts or full how-to steps. "
+        "Never answer with only a heading (e.g. 'Refund Policy:').\n"
+        "- Match the customer's language/script (Hinglish / Hindi / Tamil / Punjabi / "
+        "Kannada / Marathi / English / other Indian languages).\n"
         "- Do NOT repeat or restate the user's question.\n"
         "- Copy phone/email/addresses exactly from the chunks.\n"
     )
@@ -158,15 +176,30 @@ def _extractive_answer_from_hits(
     *,
     reply_lang: str = "",
     min_score: float = 0.14,
+    ai_route: dict | None = None,
+    retrieval_query: str = "",
 ) -> str:
     """
     When grounded LLM is empty/refuses but retrieval found usable chunks,
-    answer from the best chunk text (no extra LLM). Industry RAG fallback.
+    answer from the best meaning-matched chunk (not a stale/high-score wrong FAQ).
     """
     if not hits:
         return ""
     ranked = sorted(hits, key=lambda h: float(h.get("score") or 0), reverse=True)
     best = ranked[0]
+    try:
+        from services.kb_service import _pick_best_kb_hit_for_query
+
+        picked = _pick_best_kb_hit_for_query(
+            retrieval_query or original_msg,
+            ranked[:8],
+            ai_route=ai_route,
+            min_rerank_score=min_score,
+        )
+        if picked:
+            best = picked
+    except ImportError:
+        pass
     if float(best.get("score") or 0) < min_score:
         return ""
     try:
@@ -176,8 +209,9 @@ def _extractive_answer_from_hits(
             best,
             original_msg,
             reply_lang=reply_lang,
-            retrieval_query=original_msg,
-            fast_lane=True,
+            retrieval_query=retrieval_query or original_msg,
+            fast_lane=False,
+            ai_route=ai_route,
         )
         return (body or "").strip()
     except ImportError:
@@ -321,18 +355,29 @@ def generate_grounded_kb_answer_from_qdrant(
     route_keys = list(keys or (ai_route or {}).get("kb_keys") or [])
     t0 = time.perf_counter()
 
-    # Reuse same-turn Qdrant hits when authoritative corpus was already retrieved.
+    # Reuse same-turn Qdrant hits ONLY when the retrieval question is the same.
+    # Reusing cancel/return hits for a later owner/shipping ask dumps wrong FAQs.
     reused = False
     retrieval_hits: list[dict[str, Any]] = []
     top_score = 0.0
     try:
-        from services.chat_flow_telemetry import get_kb_grounding_context
+        from services.chat_flow_telemetry import (
+            clear_kb_grounding_context,
+            get_kb_grounding_context,
+            get_kb_grounding_query,
+        )
 
+        prior_q = get_kb_grounding_query()
         prior_hits, _prior_corpus = get_kb_grounding_context()
-        if prior_hits:
+        cur_q = (retrieval_query or "").strip().lower()
+        prior_norm = (prior_q or "").strip().lower()
+        same_q = bool(prior_norm and cur_q and prior_norm == cur_q)
+        if prior_hits and same_q:
             retrieval_hits = list(prior_hits)
             top_score = max((float(h.get("score") or 0) for h in retrieval_hits), default=0.0)
             reused = True
+        elif prior_hits and not same_q:
+            clear_kb_grounding_context()
     except ImportError:
         pass
 
@@ -367,7 +412,9 @@ def generate_grounded_kb_answer_from_qdrant(
                 top_score=top_score,
                 ai_route=ai_route,
             )
-            set_kb_grounding_context(answer_hits)
+            set_kb_grounding_context(
+                answer_hits, retrieval_query=retrieval_query
+            )
         except ImportError:
             pass
 
@@ -555,6 +602,8 @@ def generate_grounded_kb_answer_from_qdrant(
             original_msg,
             reply_lang=rl,
             min_score=0.14,
+            ai_route=ai_route,
+            retrieval_query=retrieval_query,
         )
         if extractive:
             log_kb_answer_grounding(
@@ -725,7 +774,11 @@ def ensure_kb_grounding_corpus_for_turn(
         )
         if retrieval.hits:
             chunk_corpus = _chunk_corpus(retrieval.hits)
-            set_kb_grounding_context(retrieval.hits, corpus=chunk_corpus)
+            set_kb_grounding_context(
+                retrieval.hits,
+                corpus=chunk_corpus,
+                retrieval_query=retrieval_query,
+            )
             lock_authoritative_kb_route_from_retrieval(
                 chunks=len(retrieval.hits),
                 top_score=retrieval.top_score,
@@ -858,6 +911,42 @@ def resolve_authoritative_kb_answer(
     )
     if structured:
         return structured
+
+    # Strong retrieval hit → extractive chunk before grounded answer LLM (latency).
+    if hits:
+        best = hits[0] if isinstance(hits[0], dict) else {}
+        try:
+            score = float(best.get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        strong_floor = max(float(DEFAULT_MIN_SCORE), 0.22)
+        if score >= strong_floor and (best.get("chunk") or "").strip():
+            try:
+                from services.kb_service import format_direct_reply_from_kb_hit
+
+                fast = format_direct_reply_from_kb_hit(
+                    best,
+                    original_msg,
+                    reply_lang=reply_lang,
+                    retrieval_query=_build_retrieval_query(
+                        original_msg,
+                        msg_en,
+                        conversation_context,
+                        ai_route=route,
+                    ),
+                    fast_lane=True,
+                    conversation_context=conversation_context,
+                )
+                if fast and fast.strip():
+                    from utils.reasoning_log import log_reasoning
+
+                    log_reasoning(
+                        f"Authoritative KB — extractive fast lane score={score:.2f} "
+                        f"(skip grounded LLM)."
+                    )
+                    return fast
+            except ImportError:
+                pass
 
     if should_generate_qdrant_kb_answer(route):
         qdrant_answer = generate_grounded_kb_answer_from_qdrant(

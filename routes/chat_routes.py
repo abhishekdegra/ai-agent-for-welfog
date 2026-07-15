@@ -120,7 +120,6 @@ from utils.helpers import (
     _is_light_smalltalk_fast,
     _is_short_pure_greeting,
     _is_welfog_about_fast_path,
-    fast_warm_reply_html,
     _message_looks_like_shopping_query,
     _merge_extracted_pincode,
     _merge_embedded_identifiers_from_message,
@@ -377,6 +376,73 @@ def _reply_for_live_order_id_lookup(
             "Sorry — please log in to Welfog and open this chat from your account "
             "so we can show your order status safely."
         )
+    if track_err == "not_owned":
+        return _localized_sysmsg("order_track_not_owned", original_msg, reply_lang=lang) or (
+            "Sorry — this Order ID doesn't seem linked to your account. "
+            "Please share the ID from your own order SMS/email or My Orders."
+        )
+    if track_err == "unverified":
+        return _localized_sysmsg("order_track_unverified", original_msg, reply_lang=lang) or (
+            "Sorry — I couldn't verify this Order ID with your logged-in account from here. "
+            "Please check My Orders in the Welfog app, or try again with the account that placed the order."
+        )
+    return _localized_sysmsg("order_track_not_found", original_msg, reply_lang=lang) or (
+        "Sorry — we couldn't find that Order ID. "
+        "Please check your confirmation SMS/email or My Orders and try again."
+    )
+
+
+def _lock_awaiting_order_id_from_flow(
+    ctx: dict,
+    *,
+    intent_label: str = "order",
+    ai_route: dict | None = None,
+) -> None:
+    """Persist invoice/track/refund session so the next Order ID hits the right API."""
+    try:
+        from services.order_id_handoff_fast_path import (
+            lock_order_id_ask_from_intent_label,
+            lock_order_id_ask_session,
+        )
+
+        label = (intent_label or "order").strip().lower()
+        if label == "invoice":
+            lock_order_id_ask_session(
+                ctx, "order_invoice", intent_label="invoice", ai_route=ai_route
+            )
+            return
+        if label == "refund":
+            lock_order_id_ask_session(
+                ctx, "refund_status", intent_label="refund", ai_route=ai_route
+            )
+            return
+        # "order" maps to track in label helper — upgrade when brain says invoice.
+        if label in ("order", "track", "") and isinstance(ai_route, dict):
+            olk = (ai_route.get("order_lookup_kind") or "").strip().lower()
+            rh = (ai_route.get("route_handler") or "").strip().lower()
+            ff = (ai_route.get("field_focus") or "").strip().lower()
+            if olk == "invoice" or ff == "invoice":
+                lock_order_id_ask_session(
+                    ctx, "order_invoice", intent_label="invoice", ai_route=ai_route
+                )
+                return
+            if olk == "refund_status" or rh == "refund_status_api":
+                lock_order_id_ask_session(
+                    ctx, "refund_status", intent_label="refund", ai_route=ai_route
+                )
+                return
+            if olk in ("details", "order_details") and ff and ff != "invoice":
+                lock_order_id_ask_session(
+                    ctx, "order_details", intent_label="order", ai_route=ai_route
+                )
+                return
+        lock_order_id_ask_from_intent_label(ctx, label or "order", ai_route=ai_route)
+        return
+    except ImportError:
+        pass
+    ctx["last"] = (intent_label or "order").strip().lower() or "order"
+    ctx["awaiting"] = "order_id"
+    ctx["order_id"] = None
     if track_err == "not_owned":
         return _localized_sysmsg("order_track_not_owned", original_msg, reply_lang=lang) or (
             "Sorry — this Order ID doesn't seem linked to your account. "
@@ -1595,7 +1661,7 @@ def _fast_guard_ood_template_reply(
     *,
     scope: str = "out_of_domain",
 ) -> str:
-    """AI-generated scope reply in customer's language; static template only if LLM unavailable."""
+    """AI-generated scope reply in customer's language; chitchat never uses stock greeting templates."""
     scope_l = (scope or "out_of_domain").strip().lower()
     try:
         from services.conversational_ack_flow import ai_natural_scope_reply
@@ -1610,8 +1676,23 @@ def _fast_guard_ood_template_reply(
         if body and str(body).strip():
             log_reasoning(f"Scope AI reply ({scope_l}) — no static template.")
             return str(body)
+        # One retry for chitchat — never fall through to Hello/Welfog greeting stock copy.
+        if scope_l == "general_chitchat":
+            body = ai_natural_scope_reply(
+                scope_l,
+                original_msg,
+                msg_en,
+                "",
+                reply_lang=lang,
+            )
+            if body and str(body).strip():
+                log_reasoning("Scope AI chitchat retry — no greeting template.")
+                return str(body)
+            return ""
     except ImportError:
         pass
+    if scope_l == "general_chitchat":
+        return ""
     try:
         from services.kb_service import sysmsg
         from services.translation_service import (
@@ -1621,10 +1702,7 @@ def _fast_guard_ood_template_reply(
         )
 
         rl = resolve_customer_reply_lang(original_msg, lang)
-        if scope_l == "general_chitchat":
-            key = "greeting_variant_2" if is_hinglish_message(original_msg) or rl == "hinglish" else "greeting"
-            tpl = sysmsg(key) or sysmsg("greeting") or ""
-        elif scope_l == "harm_sensitive":
+        if scope_l == "harm_sensitive":
             key = (
                 "harm_safety_hinglish"
                 if is_hinglish_message(original_msg) or rl == "hinglish"
@@ -3330,7 +3408,7 @@ def _try_instant_zero_llm_reply(
 
     try:
         from services.chitchat_resolver import _is_instant_greeting_thanks_lane
-        from utils.helpers import fast_greeting_reply_html
+        from services.conversational_ack_flow import ai_chitchat_reply
 
         if (
             _is_instant_greeting_thanks_lane(
@@ -3340,9 +3418,15 @@ def _try_instant_zero_llm_reply(
                 original_msg, msg_en, conv_for_llm
             )
         ):
-            greet_body = fast_greeting_reply_html(original_msg, reply_lang=lang)
+            greet_body = ai_chitchat_reply(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang=lang,
+                ctx=ctx,
+            )
             if greet_body:
-                log_reasoning("Instant lane — greeting/chitchat (zero LLM).")
+                log_reasoning("Instant lane — greeting/chitchat (AI, user language).")
                 gr = {
                     **route_stub,
                     "intent": "general",
@@ -3597,6 +3681,27 @@ def _try_early_ai_brain_reply(
                 return _finish_early_brain(
                     handoff, (ctx.get("data") or {}).get("ai_route")
                 )
+            try:
+                from services.order_turn_sot import try_force_order_id_handoff_reply
+
+                forced = try_force_order_id_handoff_reply(
+                    original_msg,
+                    msg_en,
+                    conv,
+                    user_id,
+                    lang,
+                    ctx,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                )
+                if forced:
+                    log_reasoning(
+                        "Early brain — forced Order ID handoff (block product rescue)."
+                    )
+                    return _finish_early_brain(
+                        forced, (ctx.get("data") or {}).get("ai_route")
+                    )
+            except ImportError:
+                pass
         except ImportError:
             pass
         return _finish_early_brain(None, (ctx.get("data") or {}).get("ai_route"))
@@ -3623,11 +3728,6 @@ def _try_early_ai_brain_reply(
             return None, None
     try:
         from services.ai_first_router import early_universal_brain_route
-
-        t_route = time.perf_counter()
-        brain_route_data = early_universal_brain_route(
-            original_msg, conv, lang, msg_en=msg_en, ctx=ctx
-        )
         from services.brain_direct_dispatch import (
             _try_brain_account_list_live_api_reply,
             _try_brain_immediate_scope_or_kb_reply,
@@ -3635,12 +3735,56 @@ def _try_early_ai_brain_reply(
             _try_brain_pincode_direct_reply,
             try_brain_direct_dispatch,
         )
+
+        t_route = time.perf_counter()
+        brain_route_data = early_universal_brain_route(
+            original_msg, conv, lang, msg_en=msg_en, ctx=ctx
+        )
         if not isinstance(brain_route_data, dict):
             return None, None
         if brain_route_data.get("llm_unavailable"):
             return _finish_early_brain(None, brain_route_data)
 
         ctx.setdefault("data", {})["ai_route"] = brain_route_data
+
+        # KB channel locked by Brain — answer immediately (no account/order detours).
+        _ch_after_brain = (brain_route_data.get("data_channel") or "").strip().lower()
+        if _ch_after_brain == "kb" and not brain_route_data.get("needs_order_id"):
+            try:
+                from services.kb_turn_sot import try_run_locked_kb_reply
+
+                log_reasoning("Brain early — KB channel → SoT immediately.")
+                _t_kb = time.perf_counter()
+                kb_body, kb_route = try_run_locked_kb_reply(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                )
+                log_reasoning(
+                    f"Brain early — KB SoT done {(time.perf_counter()-_t_kb)*1000:.0f}ms "
+                    f"body={'yes' if kb_body else 'no'}"
+                )
+                if kb_body:
+                    return _finish_early_brain(kb_body, kb_route or brain_route_data)
+                if kb_route is not None:
+                    try:
+                        from services.kb_service import format_kb_no_information_reply
+
+                        gap = format_kb_no_information_reply(
+                            original_msg, reply_lang=lang
+                        )
+                    except Exception:
+                        gap = ""
+                    if gap:
+                        return _finish_early_brain(gap, kb_route)
+            except Exception as kb_exc:
+                log_reasoning(f"Brain early — KB immediate SoT failed: {kb_exc}")
 
         acct_live = _try_brain_account_list_live_api_reply(
             brain_route_data,
@@ -3665,21 +3809,156 @@ def _try_early_ai_brain_reply(
             )
             return _finish_early_brain(order_struct_body, order_struct_route)
 
+        # OOD / chitchat / harm — Brain already classified. Answer immediately
+        # BEFORE KB SoT / product OpenSearch (was blowing 45s+ then same template).
+        try:
+            from services.conversational_ack_flow import try_immediate_brain_scope_reply
+
+            scope_now = try_immediate_brain_scope_reply(
+                brain_route_data,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv,
+                reply_lang=lang,
+                ctx=ctx,
+            )
+            if scope_now:
+                log_reasoning(
+                    "Brain early — immediate scope/OOD reply (before KB/product SoT)."
+                )
+                return _finish_early_brain(scope_now, brain_route_data)
+        except ImportError:
+            pass
+
+        # KB SoT — only when Brain did NOT already lock product catalog.
+        # Shopping turns were spending 2–25s probing KB then answering catalog.
+        try:
+            from services.kb_turn_sot import try_run_locked_kb_reply
+            from services.product_catalog_resolver import product_catalog_route_is_locked
+            from services.ai_route_semantics import brain_route_indicates_product_catalog
+
+            _skip_kb_for_product = bool(
+                product_catalog_route_is_locked(brain_route_data)
+                or (
+                    (brain_route_data.get("data_channel") or "").strip().lower()
+                    == "catalog"
+                )
+                or brain_route_indicates_product_catalog(brain_route_data)
+            )
+            if _skip_kb_for_product:
+                log_reasoning(
+                    "Brain early — skip KB SoT (product catalog already locked)."
+                )
+            else:
+                log_reasoning("Brain early — entering KB SoT…")
+                _t_kb = time.perf_counter()
+                kb_body, kb_route = try_run_locked_kb_reply(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                )
+                log_reasoning(
+                    f"Brain early — KB SoT returned in {(time.perf_counter()-_t_kb)*1000:.0f}ms "
+                    f"body={'yes' if kb_body else 'no'}"
+                )
+                if kb_body:
+                    log_reasoning("Brain early — KB SoT dispatch (before product rescue).")
+                    return _finish_early_brain(kb_body, kb_route or brain_route_data)
+                if kb_route is not None and (
+                    (kb_route.get("data_channel") or "").strip().lower() == "kb"
+                    or kb_route.get("_kb_route_locked")
+                ):
+                    # Locked KB but empty body — honest gap; do NOT fall into product/order AI.
+                    try:
+                        from services.kb_service import format_kb_no_information_reply
+
+                        gap = format_kb_no_information_reply(original_msg, reply_lang=lang)
+                    except Exception:
+                        gap = ""
+                    if gap:
+                        log_reasoning(
+                            "Brain early — KB locked with gap reply (skip product/order stack)."
+                        )
+                        return _finish_early_brain(gap, kb_route)
+                    brain_route_data = kb_route
+                    log_reasoning(
+                        "Brain early — KB locked empty; skip product SoT."
+                    )
+        except ImportError:
+            pass
+
+        # Product SoT — ONLY when Brain did not lock KB (never run rescue LLM on KB turns).
+        try:
+            from services.ai_route_semantics import brain_route_prefers_kb_answer
+            from services.product_turn_sot import try_run_locked_product_catalog
+
+            if brain_route_prefers_kb_answer(brain_route_data):
+                log_reasoning(
+                    "Brain early — skip product SoT (KB channel locked; no rescue LLM)."
+                )
+            else:
+                product_body, product_route = try_run_locked_product_catalog(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context,
+                    allow_rescue_llm=False,
+                )
+                if product_body:
+                    log_reasoning(
+                        "Brain early — product SoT dispatch (before OOD)."
+                    )
+                    return _finish_early_brain(
+                        product_body, product_route or brain_route_data
+                    )
+        except ImportError:
+            pass
+
         _ch_early = (brain_route_data.get("data_channel") or "").strip().lower()
         _intent_early = (brain_route_data.get("intent") or "").strip().lower()
         _scope_ch_early = (brain_route_data.get("conversation_scope") or "").strip().lower()
-        _kb_keys_early = [
-            str(k).strip() for k in (brain_route_data.get("kb_keys") or []) if str(k).strip()
-        ]
-        _kb_authoritative_json = (
-            _ch_early == "kb"
-            and bool(_kb_keys_early)
-            and not brain_route_data.get("needs_order_id")
-            and _intent_early not in ("out_of_domain",)
-            and brain_route_data.get("is_welfog_related", True) is not False
-        )
+        try:
+            from services.chat_flow_telemetry import brain_route_authoritative_kb_lock
 
-        # Authoritative KB route — must run before any OOD/chitchat override.
+            _kb_authoritative_json = brain_route_authoritative_kb_lock(brain_route_data)
+        except ImportError:
+            _kb_keys_early = [
+                str(k).strip()
+                for k in (brain_route_data.get("kb_keys") or [])
+                if str(k).strip()
+            ]
+            _kb_authoritative_json = (
+                _ch_early == "kb"
+                and bool(_kb_keys_early)
+                and not brain_route_data.get("needs_order_id")
+                and _intent_early not in ("out_of_domain",)
+                and brain_route_data.get("is_welfog_related", True) is not False
+            )
+
+        # Authoritative KB route — only when product SoT did not lock catalog.
+        if (
+            _kb_authoritative_json
+        ):
+            try:
+                from services.product_turn_sot import product_turn_blocks_kb_or_ood
+
+                if product_turn_blocks_kb_or_ood(brain_route_data):
+                    log_reasoning(
+                        "Brain early — skip authoritative KB (product catalog locked)."
+                    )
+                    _kb_authoritative_json = False
+            except ImportError:
+                pass
         if (
             _kb_authoritative_json
         ):
@@ -3734,6 +4013,15 @@ def _try_early_ai_brain_reply(
         except ImportError:
             _skip_ood = _ch_early == "kb"
         _skip_ood = _skip_ood or _kb_authoritative_json
+
+        if not _skip_ood:
+            try:
+                from services.product_turn_sot import product_turn_blocks_kb_or_ood
+
+                if product_turn_blocks_kb_or_ood(brain_route_data):
+                    _skip_ood = True
+            except ImportError:
+                pass
 
         if not _skip_ood:
             mis_ood = _try_guard_misclassified_general_kb_ood(
@@ -4046,6 +4334,13 @@ def _try_early_ai_brain_reply(
                 msg_en=msg_en,
                 conversation_context=conv,
             )
+            try:
+                from services.product_turn_sot import product_turn_blocks_kb_or_ood
+
+                if product_turn_blocks_kb_or_ood(brain_route_data):
+                    _info_kb = False
+            except ImportError:
+                pass
             _prod_cat = (
                 product_catalog_route_is_locked(brain_route_data)
                 or brain_route_indicates_product_catalog(brain_route_data)
@@ -5084,33 +5379,9 @@ def _chat_request_guard(fn):
             except ImportError:
                 pass
             log_busy_fallback(f"deadline>{time.perf_counter() - t0:.1f}s")
-            try:
-                from services.conversation_zero_llm_fallback import (
-                    try_zero_llm_customer_reply,
-                )
-
-                recovered = try_zero_llm_customer_reply(
-                    user_msg,
-                    user_msg.lower() if lang_hint in ("en", "hinglish") else user_msg,
-                    _conversation_snapshot_for_chat(chat_id, limit=6),
-                    reply_lang=lang_hint,
-                    ctx=_get_or_create_user_ctx(guard_user_id, chat_id),
-                )
-                if recovered:
-                    chat_log(
-                        f"deadline recovery — zero-LLM KB/chitchat ({time.perf_counter() - t0:.1f}s)"
-                    )
-                    return jsonify(
-                        {
-                            "type": "text",
-                            "data": recovered,
-                            "degraded": False,
-                            "reason": "deadline_recovered",
-                            "chat_id": chat_id,
-                        }
-                    )
-            except ImportError:
-                pass
+            # Never run long zero-LLM recovery here — that hung another 30–60s and
+            # clients aborted at 95s with "taking longer than usual" while busy
+            # never reached the browser. Return immediately.
             return (
                 jsonify(
                     {
@@ -5578,7 +5849,12 @@ def chat():
 
             rl = resolve_customer_reply_lang(original_msg, lang)
             if not is_live_api_structured_html(body):
-                body = finalize_customer_reply(body, original_msg, rl)
+                # Brain/KB/product fast paths already localized extractively — never
+                # start a second style-rewrite LLM here (was causing 14s+ hangs /
+                # llm_calls=3 / client timeouts after the answer was already ready).
+                body = finalize_customer_reply(
+                    body, original_msg, rl, allow_llm_style_rewrite=False
+                )
         except ImportError:
             pass
         try:
@@ -5628,10 +5904,10 @@ def chat():
             pass
         return jsonify({"chat_id": current_chat_id, "type": "text", "data": body})
 
-    # === INSTANT GREETING (<1s — never queue behind OpenSearch/KB) ===
+    # === INSTANT GREETING / BYE / THANKS (AI in user language — never stock Hello template) ===
     try:
         from services.chitchat_resolver import _is_instant_greeting_thanks_lane
-        from utils.helpers import fast_greeting_reply_html
+        from services.conversational_ack_flow import ai_chitchat_reply
 
         if (
             _is_instant_greeting_thanks_lane(
@@ -5641,9 +5917,15 @@ def chat():
                 original_msg, msg_en, conv_for_llm
             )
         ):
-            greet_html = fast_greeting_reply_html(original_msg, reply_lang=lang)
+            greet_html = ai_chitchat_reply(
+                original_msg,
+                msg_en,
+                conv_for_llm,
+                reply_lang=lang,
+                ctx=ctx,
+            )
             if greet_html:
-                log_reasoning("Chat — instant greeting (zero LLM/API).")
+                log_reasoning("Chat — instant greeting/chitchat (AI, user language).")
                 return _fast_path_json_reply(
                     greet_html,
                     ai_route_snapshot={
@@ -5655,6 +5937,62 @@ def chat():
                 )
     except ImportError:
         pass
+
+    # === EARLY SCOPE (before MySQL / order session / Brain) ===
+    # Short social turns — one fast scope+reply LLM. Must run BEFORE conversation
+    # snapshot load (MySQL hang was dominating chitchat latency).
+    comb_scope = f"{original_msg or ''} {msg_en or ''}".strip()
+    _skip_early_scope = False
+    try:
+        from utils.helpers import (
+            _message_looks_like_shopping_query,
+            _text_has_product_shopping_intent_core,
+        )
+
+        if _message_looks_like_shopping_query(comb_scope) or (
+            _text_has_product_shopping_intent_core(comb_scope)
+        ):
+            _skip_early_scope = True
+    except ImportError:
+        pass
+    if (
+        not _skip_early_scope
+        and comb_scope
+        and len(comb_scope) <= 96
+        and not _turn_has_structural_fast_lane_token(
+            original_msg, msg_en, "", ctx
+        )
+        and not _instant_lane_blocked_by_transactional(original_msg, msg_en, "")
+    ):
+        try:
+            from services.chat_flow_telemetry import (
+                begin_pre_brain_live_api_preflight,
+                end_pre_brain_live_api_preflight,
+            )
+            from services.chitchat_resolver import try_scope_ai_early_reply
+
+            begin_pre_brain_live_api_preflight()
+            try:
+                scope_early = try_scope_ai_early_reply(
+                    original_msg,
+                    msg_en,
+                    "",
+                    reply_lang=lang,
+                )
+            finally:
+                end_pre_brain_live_api_preflight()
+            if scope_early:
+                scope_body, scope_route = scope_early
+                if scope_body:
+                    log_reasoning(
+                        "Pre-brain — early scope AI (chitchat/OOD, before MySQL/Brain)."
+                    )
+                    return _fast_path_json_reply(
+                        scope_body,
+                        ai_route_snapshot=scope_route,
+                    )
+        except ImportError:
+            pass
 
     # === ORDER SESSION FIRST (PIN / order id — zero LLM, live API) ===
     _t_order_sess = time.perf_counter()
@@ -7283,7 +7621,19 @@ def chat():
         rl = resolve_customer_reply_lang(original_msg, lang_code or "")
         skip_finalize = isinstance(text_data, str) and is_live_api_structured_html(text_data)
         if isinstance(text_data, str):
-            final_output = text_data if skip_finalize else finalize_customer_reply(text_data, original_msg, rl)
+            if skip_finalize:
+                final_output = text_data
+            else:
+                # KB / brain answers must not pay a second rewrite LLM on the way out.
+                ar = ai_route_snapshot or (ctx.get("data") or {}).get("ai_route") or {}
+                ch = (ar.get("data_channel") or "").strip().lower()
+                allow_rewrite = ch not in ("kb", "none") and not ar.get("_kb_route_locked")
+                final_output = finalize_customer_reply(
+                    text_data,
+                    original_msg,
+                    rl,
+                    allow_llm_style_rewrite=allow_rewrite,
+                )
         else:
             final_output = text_data
         try:
@@ -9193,9 +9543,11 @@ def chat():
         )
         if od_result.handled and od_result.reply_html:
             if od_result.needs_order_id:
-                ctx["last"] = "order"
-                ctx["awaiting"] = "order_id"
-                ctx["order_id"] = None
+                _lock_awaiting_order_id_from_flow(
+                    ctx,
+                    intent_label=od_result.intent or "invoice",
+                    ai_route=ai_route_data,
+                )
             else:
                 reset_context(ctx)
             return send_reply(od_result.reply_html, lang)
@@ -9216,30 +9568,38 @@ def chat():
                 msg_en=msg_en,
                 conversation_context=conv_for_llm,
             )
-        od_redirect = (
-            message_wants_order_details_or_invoice(
-                original_msg, msg_en, conv_for_llm, ai_route=ai_route_data
-            )
-            if live_goal != "track"
-            else ""
+        # Invoice/receipt/bill can mis-route as track — always allow redirect.
+        od_redirect = message_wants_order_details_or_invoice(
+            original_msg, msg_en, conv_for_llm, ai_route=ai_route_data
         )
+        if not od_redirect and live_goal in ("order_invoice", "order_details"):
+            od_redirect = live_goal
         if od_redirect:
             log_reasoning(
                 f"Tracking handler overridden → order_details_api ({od_redirect})."
             )
+            od_ai = dict(ai_route_data or {})
+            if od_redirect == "order_invoice":
+                od_ai["order_lookup_kind"] = "invoice"
+                od_ai["field_focus"] = "invoice"
+                od_ai["route_handler"] = "order_details_api"
             od_result = run_order_details_ai_flow(
                 original_msg,
                 msg_en,
                 user_id,
                 conversation_context=conv_for_llm,
                 reply_lang=lang,
-                ai_route=ai_route_data,
+                ai_route=od_ai,
             )
             if od_result.handled and od_result.reply_html:
                 if od_result.needs_order_id:
-                    ctx["last"] = "order"
-                    ctx["awaiting"] = "order_id"
-                    ctx["order_id"] = None
+                    _lock_awaiting_order_id_from_flow(
+                        ctx,
+                        intent_label=od_result.intent or (
+                            "invoice" if od_redirect == "order_invoice" else "order"
+                        ),
+                        ai_route=od_ai,
+                    )
                 else:
                     reset_context(ctx)
                 return send_reply(od_result.reply_html, lang)
@@ -9255,9 +9615,11 @@ def chat():
         )
         if ot_result.handled and ot_result.reply_html:
             if ot_result.needs_order_id:
-                ctx["last"] = "order"
-                ctx["awaiting"] = "order_id"
-                ctx["order_id"] = None
+                _lock_awaiting_order_id_from_flow(
+                    ctx,
+                    intent_label="order",
+                    ai_route=ai_route_data,
+                )
             else:
                 reset_context(ctx)
             return send_reply(ot_result.reply_html, lang)
@@ -10285,7 +10647,12 @@ def chat():
             # after file update/delete from admin panel.
             factual_query = _looks_like_factual_identity_query(f"{original_msg} {msg_en}")
             if intent in ["general", "seller", "refund", "payment"] and factual_query:
-                kb_now_hit = best_kb_hit(retrieval_query, keys=get_customer_kb_keys(), min_score=0.31)
+                # Floor aligned with KB answer path — 0.31 was wiping valid owner hits.
+                kb_now_hit = best_kb_hit(
+                    retrieval_query,
+                    keys=get_customer_kb_keys(),
+                    min_score=0.18,
+                )
                 if not kb_now_hit:
                     ai_response_text = (
                         "I don't have confirmed official details for that Welfog question right now. "
@@ -10796,7 +11163,7 @@ def chat():
                         response_text += f"<div style='font-size: 13px; font-weight: 600; color: #333; margin-bottom: 6px; height: 34px; overflow: hidden; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;'>{name_short}</div>"
                         response_text += f"<div style='font-size: 15px; font-weight: bold; color: #ff7a00; margin-bottom: 12px; margin-top: auto;'>₹{p['price']}</div>"
                         if p["link"]:
-                            response_text += f"<a href='{p['link']}' target='_blank' rel='noopener noreferrer'>{sysmsg('view_product')}</a>"
+                            response_text += f"<a href='{p['link']}' >{sysmsg('view_product')}</a>"
                         response_text += "</div>"
                     response_text += "</div>"
                 else:
@@ -10878,7 +11245,7 @@ def chat():
                 slug = p.get("slug") or ""
                 thumb = p.get("thumbnail_img") or p.get("thumbnail_image") or p.get("image") or ""
                 image = (IMAGE_BASE_URL + str(thumb).lstrip("/")) if thumb else ""
-                link = f"https://welfog.com/product_details/{slug}" if slug else "https://welfog.com"
+                link = f"https://welfog.com/products/{slug}" if slug else "https://welfog.com"
 
                 response_text += "<div class='wf-product-card'>"
                 if image:
@@ -10895,7 +11262,7 @@ def chat():
                     response_text += "</div>"
                 else:
                     response_text += f"<div style='font-size: 15px; font-weight: bold; color: #ff7a00; margin-bottom: 12px; margin-top: auto;'>₹{new_price}</div>"
-                response_text += f"<a href='{link}' target='_blank' rel='noopener noreferrer'>{sysmsg('view_deal')}</a>"
+                response_text += f"<a href='{link}' >{sysmsg('view_deal')}</a>"
                 response_text += "</div>"
                 shown += 1
 
@@ -10943,7 +11310,7 @@ def chat():
                     link_slug = p.get("link") or p.get("slug") or ""
                     thumb = p.get("image") or p.get("thumbnail_img") or p.get("thumbnail_image") or ""
                     image = (IMAGE_BASE_URL + str(thumb).lstrip("/")) if thumb else ""
-                    link = f"https://welfog.com/product_details/{link_slug}" if link_slug else "https://welfog.com"
+                    link = f"https://welfog.com/products/{link_slug}" if link_slug else "https://welfog.com"
 
                     response_text += "<div class='wf-product-card'>"
                     if image:
@@ -10953,7 +11320,7 @@ def chat():
                     name_short = name[:38] + "..." if len(name) > 38 else name
                     response_text += f"<div style='font-size: 13px; font-weight: 600; color: #333; margin-bottom: 6px; height: 34px; overflow: hidden; line-height: 1.3; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;'>{name_short}</div>"
                     response_text += f"<div style='font-size: 15px; font-weight: bold; color: #ff7a00; margin-bottom: 12px; margin-top: auto;'>₹{price}</div>"
-                    response_text += f"<a href='{link}' target='_blank' rel='noopener noreferrer'>{sysmsg('view_product')}</a>"
+                    response_text += f"<a href='{link}' >{sysmsg('view_product')}</a>"
                     response_text += "</div>"
                     shown += 1
 

@@ -15,7 +15,8 @@ TOPIC → intent → data_channel → handler
 | How to PLACE a new order / checkout steps / order kaise karte h | general | kb | faqs + order_placement_help — needs_order_id=false, NOT tracking |
 | Show MY past orders list / which orders I placed / order list dikhao | order_history | live_api | purchase history API — NOT order tracking, do NOT ask Order ID |
 | HOW/WHERE to view order history in the app (process, steps, kaha jake dekhun, app par) — NOT list in chat | general | kb | order_history_help — NOT purchase-history API, NOT Order ID |
-| Order ID kahan milegi / mere order ids | order_id | live_api | order id API |
+| HOW/WHERE to find Order ID in app/SMS/email (kahan milegi, where can I find) — steps only, not paste-to-track | general | kb | order_id_help — needs_order_id=false, NOT live track |
+| List MY order IDs / show ids for my purchases | order_history | live_api | purchase history / order id API — NOT location howto |
 | Find / buy ANY product on Welfog (grocery, fashion, electronics, home, beauty, toys — any wording/language) | product | catalog | AI product_requests → OpenSearch + catalog API — NEVER off_topic |
 | Same as above but with colour/size/price filter in ANY language (green covers, neeli shirt, black wale, under 500) | product | catalog | AI sets color + search_terms separately — NOT KB FAQ |
 | Today’s deals / offers | deals | live_api | deals API |
@@ -25,6 +26,9 @@ TOPIC → intent → data_channel → handler
 | How to view wishlist in app (steps only) | general | kb | wishlist_howto_kb — account_list_kind=wishlist_howto |
 | Full purchase list in chat (bought/placed orders — NOT saved-only) | order_history | live_api | purchase history API — account_list_kind=purchase_history_in_chat |
 | How to view order history in app | general | kb | order_history_howto — account_list_kind=purchase_history_howto |
+| HOW/WHERE to find / download invoice in app (invoice kaha milti, where is invoice) — steps, not fetch MY bill | general | kb | invoice howto — needs_order_id=false |
+| Fetch / download MY invoice for ONE order (invoice chahiye + Order ID) | order | live_api | get_invoice — needs_order_id=true, order_help_kind=personal_live |
+| Refund / return / payment policy or my refund status | refund or payment or general | kb or live_api | knowledge files / return-request |
 
 ACCOUNT_LIST_KIND (AI — semantic, not keyword lists)
 ----------------------------------------------------
@@ -33,7 +37,6 @@ Every route JSON must set account_list_kind when user asks for THEIR saved items
 - wishlist_howto / purchase_history_howto = app navigation steps only (KB).
 - none = all other topics.
 Saved/liked/heart ≠ purchased/order history — user_meaning and account_list_kind must agree.
-| Refund / return / payment policy or my refund status | refund or payment or general | kb | knowledge files |
 | Privacy / terms / shipping policy / FAQ / company info | general | kb | knowledge files |
 | Customer care phone / email | general | kb | support contact files |
 | Amazon / Flipkart order (other company) | out_of_domain | none | polite decline |

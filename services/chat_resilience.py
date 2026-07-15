@@ -32,6 +32,39 @@ _CHAT_IN_FLIGHT_TOKEN: dict[str, str] = {}
 _USER_IN_FLIGHT: set[str] = set()
 _USER_IN_FLIGHT_AT: dict[str, float] = {}
 _TURN_ACQUIRED = threading.local()
+# Abandoned async /chat worker thread ids — visible across the deadline thread.
+_ABANDON_LOCK = threading.Lock()
+_ABANDONED_THREAD_IDS: set[int] = set()
+
+
+def mark_chat_turn_abandoned(
+    reason: str = "deadline",
+    *,
+    thread_id: int | None = None,
+) -> None:
+    """Signal a /chat worker to stop starting new LLM/embed work."""
+    tid = int(thread_id) if thread_id is not None else threading.get_ident()
+    with _ABANDON_LOCK:
+        _ABANDONED_THREAD_IDS.add(tid)
+        if len(_ABANDONED_THREAD_IDS) > 64:
+            # Drop oldest-ish by clearing; next marks re-add active zombies.
+            _ABANDONED_THREAD_IDS.clear()
+            _ABANDONED_THREAD_IDS.add(tid)
+    log_reasoning(
+        f"Chat turn abandoned — stop further LLM/embed "
+        f"(tid={tid} {(reason or 'deadline')[:60]})."
+    )
+
+
+def clear_chat_turn_abandoned(*, thread_id: int | None = None) -> None:
+    tid = int(thread_id) if thread_id is not None else threading.get_ident()
+    with _ABANDON_LOCK:
+        _ABANDONED_THREAD_IDS.discard(tid)
+
+
+def chat_turn_abandoned() -> bool:
+    with _ABANDON_LOCK:
+        return threading.get_ident() in _ABANDONED_THREAD_IDS
 
 
 def _in_flight_age(key: str, bucket: set[str], times: dict[str, float]) -> float:
@@ -370,6 +403,7 @@ def run_with_chat_deadline(
         "on",
     )
 
+    clear_chat_turn_abandoned()
     if not use_async:
         t0 = time.perf_counter()
         try:
@@ -384,6 +418,7 @@ def run_with_chat_deadline(
                 record_timeout_point("chat_deadline_exceeded")
             except ImportError:
                 pass
+            mark_chat_turn_abandoned("sync_deadline")
             log_reasoning(
                 f"Chat hard deadline ({limit:.0f}s) sync — no usable reply."
             )
@@ -403,9 +438,12 @@ def run_with_chat_deadline(
     @copy_current_request_context
     def _runner() -> None:
         try:
+            clear_chat_turn_abandoned()
             result_box["result"] = fn(*args, **kwargs)
         except BaseException as exc:
             exc_box["exc"] = exc
+        finally:
+            clear_chat_turn_abandoned()
 
     t0 = time.perf_counter()
     worker = threading.Thread(target=_runner, name="chat-turn", daemon=True)
@@ -419,6 +457,9 @@ def run_with_chat_deadline(
             record_timeout_point("chat_deadline_exceeded")
         except ImportError:
             pass
+        # Daemon worker may keep running — block further LLM/embed on that thread.
+        if worker.ident is not None:
+            mark_chat_turn_abandoned("async_deadline", thread_id=int(worker.ident))
         log_reasoning(
             f"Chat hard deadline ({limit:.0f}s) — client gets busy; in-flight unlocked."
         )

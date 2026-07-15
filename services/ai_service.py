@@ -182,9 +182,17 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "run_catalog_search": true/false,
   "meta_kind": "none" | "hostile" | "bot_latency" | "topic_denial" | "wrong_search_complaint" | "conversational" | "assistant_intro",
   "kb_keys": ["keys for KB answers only — empty if live_api/catalog handles it"],
-  "search_query": "English searchable product noun (2-6 words) when run_catalog_search=true — jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama. Include brand/device WHEN user named it with the product. NEVER color/price/time/filler verbs. Must match product_entities.product_name. Empty when not shopping.",
+  "search_query": "English searchable product noun (2-6 words) when ONE product — jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama. Include brand/device WHEN user named it with the product. NEVER color/price/time/filler verbs. Must match product_entities.product_name. Empty when not shopping OR when product_requests has 2+ items.",
+  "product_requests": [
+    {{
+      "search_terms": "English catalog noun for ONE item only",
+      "brand": "brand if this item named one else empty",
+      "color": "color if this item named one else empty",
+      "product_type": "short type else empty"
+    }}
+  ],
   "product_entities": {{
-    "product_name": "English searchable noun (iphone cover, samsung cover, nike shoes, jeans, flip flops) — include brand/device when user named it; no color/price/filler",
+    "product_name": "English searchable noun for the PRIMARY item when single product (iphone cover, samsung cover, nike shoes, jeans, flip flops) — include brand/device when user named it; no color/price/filler. When product_requests has 2+ items, leave product_name as the first item only.",
     "brand": "Brand if mentioned (Redmi, Nike, Apple, Samsung) else empty",
     "color": "Color if mentioned (black, blue) else empty",
     "size": "Size if mentioned (S, M, L, kids) else empty",
@@ -198,7 +206,8 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
     "allow_related_fallback": true,
     "related_search_terms": "English fallback product type if device absent, else empty string",
     "exclude_title_tokens": ["optional English title words to exclude for this query"],
-    "mandatory_match_tokens": ["optional English title tokens required for this query"]
+    "mandatory_match_tokens": ["optional English title tokens required for this query"],
+    "product_requests": "OPTIONAL mirror of top-level product_requests when user asked for 2+ products in one message"
   }},
   "category_browse": "English Welfog department name when user browses a whole category (electronics, men fashion, women fashion, beauty, home kitchen) — empty if not category browse",
   "category_id": "numeric Welfog top-level category id when known, else empty",
@@ -211,35 +220,42 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "reuse_user_value_from_chat": "pincode" | "order_id" | "",
   "answer_strategy": "live_api_only" | "kb_only" | "kb_then_ai" | "api_then_ai" | "api_kb_ai" | "catalog_only" | "structured_handler",
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain" | "harm_sensitive",
-  "scope_reply": "For general_chitchat/out_of_domain/harm_sensitive: 2-5 sentences in customer language (harm=empathetic safety, no KB/legal). Empty when welfog_support.",
+  "scope_reply": "MANDATORY non-empty for general_chitchat/out_of_domain/harm_sensitive: 1-3 short sentences in the customer's EXACT language/script/tone (topic-aware decline or warm chitchat; harm=empathetic safety). Empty ONLY when conversation_scope=welfog_support.",
   "account_list_kind": "none" | "wishlist_in_chat" | "wishlist_howto" | "purchase_history_in_chat" | "purchase_history_howto",
+  "order_help_kind": "none" | "nav_howto" | "personal_live",
   "order_lookup_kind": "none" | "track" | "details" | "invoice" | "refund_status",
   "field_focus": "timeline" | "summary" | "payment" | "product" | "delivery" | "status" | "invoice" | "",
-  "route_handler": "order_tracking_api" | "order_details_api" | "refund_status_api" | "order_history_api" | "wishlist_api" | "pincode_delivery_api" | "" 
+  "route_handler": "order_tracking_api" | "order_details_api" | "refund_status_api" | "order_history_api" | "wishlist_api" | "pincode_delivery_api" | "order_id_help_kb" | "" 
 }}
 
 OUTPUT SIZE (critical for speed): Return MINIMAL JSON only — omit empty strings, null fields, and empty arrays; reasoning max one short sentence; include product_entities ONLY when intent=product.
 
 CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Any Indian language / Hinglish / typos / slang — YOU understand meaning. Write user_meaning as one clear English sentence. NEVER echo the customer message word-for-word.
-- Backend routes ONLY from your JSON (intent, data_channel, order_lookup_kind, route_handler, field_focus, kb_keys) — there is NO keyword fallback on customer text. If a field is wrong or missing, the wrong API runs.
+- Backend routes ONLY from your JSON (intent, data_channel, order_lookup_kind, route_handler, field_focus, kb_keys, order_help_kind) — there is NO keyword fallback on customer text. If a field is wrong or missing, the wrong API runs.
+- ORDER HELP MODE (critical — any language):
+  * order_help_kind=nav_howto → HOW/WHERE to FIND Order ID, invoice location in app, or track-steps navigation (steps/FAQ). data_channel=kb, needs_order_id=false, order_lookup_kind=none, run_catalog_search=false. route_handler=order_id_help_kb for Order-ID location; otherwise kb with faqs/order keys. NEVER ask the customer to paste an Order ID for nav_howto.
+  * order_help_kind=personal_live → fetch THIS customer's one-order track/invoice/details/refund after they provide/have Order ID. data_channel=live_api, needs_order_id=true, set order_lookup_kind.
+  * order_help_kind=none → not an order sub-topic.
+  Examples (same meaning → same kind — any script): "Where can I find my Order ID", "order id kahan milegi", "are to yeh order id milegi kaha pe" → nav_howto + kb. "track my order" / "order kab aayega" → personal_live + track. "invoice kaha pe milti h" / "where do I download invoice" (location steps) → nav_howto + kb. "mere order ki invoice de do" / "invoice chahiye for 2607131" → personal_live + invoice.
 - ORDER SUB-INTENT (critical — customer ANY language/style; YOU decide; backend trusts your JSON only):
   * details → order_lookup_kind=details, route_handler=order_details_api
   * track → order_lookup_kind=track, route_handler=order_tracking_api
   * invoice → order_lookup_kind=invoice, route_handler=order_details_api
   * refund_status → order_lookup_kind=refund_status, route_handler=refund_status_api
+  ONLY when order_help_kind=personal_live (or clearly fetching THEIR order data). NEVER set track/invoice live when the user only asks WHERE/HOW to find Order ID or invoice in the app.
   ALWAYS set BOTH order_lookup_kind AND route_handler when needs_order_id=true for one order.
   MANDATORY: when intent=order and needs_order_id=true you MUST set order_lookup_kind (never leave none). data_channel MUST be live_api (never "order"). Put sub-intent in order_lookup_kind — NOT in conversation_scope (never conversation_scope=order_details).
   details = full order info (items/payment/address/amount). track = shipment/ETA/courier only. Never confuse them.
   field_focus when order_lookup_kind=details: delivery (shipping address on order), payment, product, summary, status. field_focus=timeline only for track.
-  Typos / Hinglish / voice-to-text: involve/invoce/invois/bill/chalan/maang rha + order id → invoice (NOT track).
+  Typos / Hinglish / voice-to-text: involve/invoce/invois/bill/chalan/maang rha + order id → invoice personal_live (NOT track, NOT product search).
 - Full purchase list IN CHAT ("show me my order history", "you show orders", any language) → intent=order_history, account_list_kind=purchase_history_in_chat, data_channel=live_api, needs_order_id=false. NOT faqs.txt how-to steps.
 - HOW/WHERE to open order history in the app only (steps, navigation) → account_list_kind=purchase_history_howto, data_channel=kb, route order_history_howto — NOT purchase-history API.
-- ONE order: set order_lookup_kind — track (ETA/shipment/courier), details (payment/product/summary), invoice (bill/receipt download), refund_status (MY refund/return status for one order). Match intent=order/refund/payment, needs_order_id=true, numeric_context=order_id.
+- ONE order: set order_lookup_kind — track (ETA/shipment/courier), details (payment/product/summary), invoice (bill/receipt download), refund_status (MY refund/return status for one order). Match intent=order/refund/payment, needs_order_id=true, numeric_context=order_id, order_help_kind=personal_live.
 - Personal refund/return status for ONE order (any language, any wording) → intent=refund, order_lookup_kind=refund_status, data_channel=live_api, needs_order_id=true. NOT general refund policy KB.
 - General refund policy / how to return / refund time / process (no personal order status) → intent=refund or general, data_channel=kb, kb_keys include refund — NOT return-request API.
 - Infer personal refund status vs policy from user_meaning — do NOT match fixed Hindi/English keyword lists in the customer message.
-- ONE order track/shipment timeline → order_lookup_kind=track, field_focus=timeline. Invoice/bill/receipt/GST → invoice (NOT track). Payment/amount/total/product on ONE order → order_lookup_kind=details with matching field_focus (NOT order_history list, NOT track).
+- ONE order track/shipment timeline → order_lookup_kind=track, field_focus=timeline. Invoice/bill/receipt/GST fetch for MY order → invoice personal_live (NOT track, NOT catalog). Payment/amount/total/product on ONE order → order_lookup_kind=details with matching field_focus (NOT order_history list, NOT track).
 - Shipping/delivery ADDRESS already saved on an existing order (any language: address kya laga / konsa address / pata kya tha / which address on order) → order_lookup_kind=details, field_focus=delivery, route_handler=order_details_api, needs_order_id=true. NOT order_lookup_kind=track, NOT pincode_check (pincode_check is only for whether Welfog delivers to an area before ordering).
 - "Order ID: 12345 invoice/refund/address/amount" → set order_lookup_kind from what they asked (invoice/refund_status/details), NOT track, NOT purchase_history_in_chat.
 - Saved/liked products IN CHAT ("meri wishlist dikhao", "meri pasand ki cheezein", "saved items", any language) → intent=wishlist, account_list_kind=wishlist_in_chat, data_channel=live_api, run_catalog_search=false. user_meaning MUST be English like "show the customer's saved or liked products" — NOT a product search query. NOT product catalog search.
@@ -247,10 +263,13 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Saved/liked products → intent=wishlist (NOT order_history). Amazon/Flipkart etc. → out_of_domain.
 - PIN / delivery area / "can you deliver to X" / city name (Jaipur, Kota) / friend lives in an area (ANY language) → pincode_check, data_channel=live_api, needs_order_id=false, order_lookup_kind=none, run_catalog_search=false. This is NOT order tracking — never set intent=order or needs_order_id=true for hypothetical delivery to a place. Clear city → live geocode+API; vague place → ask for 6-digit PIN. Extract PIN when present.
 - Product availability ON Welfog ("welfog pe chawal milega", "do you sell rice on welfog", "kya milta hai welfog par") → intent=product, data_channel=catalog, run_catalog_search=true — NOT pincode_check unless they ask delivery to a named city/PIN/address.
-- Existing order timeline (shipment/courier/status/not received) → order + order_lookup_kind=track, needs_order_id=true. Do not confuse with pincode_check.
-- Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style/typo) → intent=product, data_channel=catalog, run_catalog_search=true. Fill product_entities with ALL filters; search_query = product_entities.product_name (searchable English noun — include brand/device when user named it with the product).
+- Existing order timeline (shipment/courier/status/not received) → order + order_lookup_kind=track, needs_order_id=true, order_help_kind=personal_live. Do not confuse with pincode_check OR Order-ID location howto.
+- Product browse/buy (ANY product, brand, color, price, SKU, product id — ANY language/style/typo) → intent=product, data_channel=catalog, run_catalog_search=true, kb_keys=[]. Fill product_entities with ALL filters; search_query = product_entities.product_name (searchable English noun — include brand/device when user named it with the product).
+- MULTIPLE PRODUCTS IN ONE MESSAGE (critical): sneakers AND iphone cover, shirt aur jeans, samsung cover + sneakers — set product_requests[] with ONE object per distinct item (English search_terms each). Do NOT collapse to a single product_name. Still intent=product, data_channel=catalog, run_catalog_search=true, kb_keys=[].
+- Apparel / accessory browse ask ("show me X", "X dikhana", "X chahiye", "X milta hai") in ANY language → ALWAYS intent=product + catalog — NEVER kb, NEVER order tracking, NEVER empty kb_keys stealing the turn.
+- SHORT AVAILABILITY (critical — any product, any spelling): "X h kya", "X hai kya", "X milega", "tumhare pas X", "Do you have X?", "X dikhana", one-word+availability — ALWAYS intent=product, data_channel=catalog, run_catalog_search=true, kb_keys=[], conversation_scope=welfog_support. user_meaning = clear English shopping sentence naming the SPECIFIC product type; product_name/search_query = SINGULAR English catalog title noun (cap not caps). Romanized/vernacular nouns → English title form from meaning — NEVER echo raw romanization; NEVER collapse a named item to clothes/fashion/apparel. NEVER route these to general/KB/order/chitchat. NEVER treat "invoice kaha milti" / "order id kahan" as product availability.
 - PRODUCT ENTITIES (critical — backend uses these for OpenSearch filters, not raw customer text):
-  * product_name = searchable catalog noun (jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama) — INCLUDE brand/device when user named it WITH the product. NEVER color/price/time/filler verbs (dikhao, h kya).
+  * product_name = searchable catalog noun (jeans, iphone cover, samsung cover, nike shoes, flip flops, pajama) — INCLUDE brand/device when user named it WITH the product. NEVER color/price/time/filler verbs (dikhao, h kya). ALWAYS English catalog title form from meaning — NEVER echo vernacular/romanized customer nouns into product_name/search_query (user_meaning stays the English sentence that explains the ask). NEVER set product_name/search_query to clothes/clothing/fashion/apparel/garment when the user named a specific item in ANY language.
   * brand = manufacturer/company ONLY (Redmi, Infinix, Nike, BoAt, Samsung) — NEVER product type alone.
   * NEVER set brand to product_name or product type (mobile cover, shirt are NOT brands; "iphone cover" is a product_name, not a brand).
   * If user did not name a brand, leave brand="" — search by product_name/title only.
@@ -259,7 +278,8 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
   * "above 500" → price_min=500.
   * product_intent + allow_related_fallback + related_search_terms: REQUIRED on every product_entities — backend has no fixed product keyword lists.
   * device (phone/handset/laptop device): product_intent=device, allow_related_fallback=true, related_search_terms=closest related Welfog catalog type in English, exclude_title_tokens=accessory words that would pollute THIS device search (you choose per product).
-  * exact accessory/part (cover, charger, cable, jeans, shirt, bottle…): product_intent=accessory or general, allow_related_fallback=false, related_search_terms="".
+  * vernacular / romanized / typo / slang product names (any language): product_intent=general, allow_related_fallback=true, related_search_terms=1–2 alternate English catalog title nouns (never empty when primary might miss). NEVER clothes/fashion.
+  * exact accessory/part already spoken as English catalog words (cover, charger, cable, jeans, shirt, bottle…): product_intent=accessory or general, allow_related_fallback=false, related_search_terms="".
   * "redmi mobile cover" / "redmi ke covers" → product_name=redmi cover (or mobile cover), brand=Redmi — NEVER drop brand to only "mobile cover" without setting brand.
   * "sam sung ka cover" / spaced brand typos → brand=Samsung, product_name=samsung cover.
   * "nike shoes h kya" / availability ("hai kya", "h kya", "milega") → still product shopping: product_name=nike shoes, brand=Nike.
@@ -277,13 +297,15 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
   * product_entities is REQUIRED when run_catalog_search=true — never empty product_name AND empty brand on a named-product browse.
 - Today's deals / offers / discounts / flash sale (ANY language) → intent=deals, data_channel=live_api, run_catalog_search=false, needs_order_id=false. NOT a product named "deals".
 - Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
-- Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="" unless user also named a product type.
+- Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) with NO specific product type named → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="". If the user ALSO named a product type (any language/vernacular), set category_only_browse=false and fill product_name/search_query with the English catalog title noun — never bury a named item in category-only browse.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
-- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to, OR any topic covered by an Admin knowledge document in the catalog above) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new document is added — if the catalog lists it, it is IN SCOPE (welfog_support), never out_of_domain. Seller → intent=seller. Grievance → company+privacy KB when those keys exist. Wrong/damaged item policy → refund KB when present (NOT order_history). Truly off-platform topics with NO matching catalog document → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help — those are KB only.
-- Personal life, marriage, dating, jokes, homework, sports scores, other apps — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain — UNLESS the user is asking about Welfog platform rules/policies that appear in the Admin knowledge catalog (e.g. allowed/prohibited content on Welfog Reels/shorts). Catalog-covered platform policy questions → data_channel=kb, conversation_scope=welfog_support, is_welfog_related=true. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys when catalog keys exist; empty kb_keys is OK when unsure — retrieval will pick semantically.
-- General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
-- Who is THIS bot → meta_kind=assistant_intro. What is Welfog company → kb company (NOT assistant_intro).
+- Read-only questions (policy, FAQ, company, seller, fees, contact, how-to, Order ID location, invoice location, OR any topic covered by an Admin knowledge document in the catalog above) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above + order_help_kind=nav_howto when about finding Order ID/invoice/track steps. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new document is added — if the catalog lists it, it is IN SCOPE (welfog_support), never out_of_domain. Seller → intent=seller. Grievance → company+privacy KB when those keys exist. Wrong/damaged item policy → refund KB when present (NOT order_history). Truly off-platform topics with NO matching catalog document → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help/nav_howto — those are KB only.
+- Personal life, marriage, dating, jokes, homework, sports scores, weather, travel plans, hangouts, other apps/companies, general advice unrelated to buying on Welfog — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain, run_catalog_search=false, search_query="", product_entities empty, AND scope_reply=1-2 short sentences acknowledging THEIR topic then redirecting to Welfog shopping/orders/delivery (never answer the off-topic ask). UNLESS the user is asking about Welfog platform rules/policies that appear in the Admin knowledge catalog (e.g. allowed/prohibited content on Welfog Reels/shorts). Catalog-covered platform policy questions → data_channel=kb, conversation_scope=welfog_support, is_welfog_related=true. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys when catalog keys exist; empty kb_keys is OK when unsure — retrieval will pick semantically.
+- CRITICAL — do NOT misroute personal/leisure as product search: invitations to go somewhere, travel, nature trips, hanging out, "can you come with me…", medical/home/life advice with no Welfog purchase ask → out_of_domain (never fill search_query with the full sentence, never intent=product).
+- Self-harm / suicide distress → conversation_scope=harm_sensitive, intent=out_of_domain or general, data_channel=none, run_catalog_search=false, scope_reply=empathetic safety in their language (helplines), NEVER product/catalog/KB.
 - Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=2-3 sentences mirroring the user's EXACT language, script, and slang (Hinglish stays Hinglish — never default to stiff English "Hi there I'm the Welfog assistant"), run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
+- General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
+- Who is THIS bot → meta_kind=assistant_intro. What is Welfog company / owner / customer care → kb company/support (NOT assistant_intro, NOT product catalog).
 - MIXED messages (hello/bhai/bro/darling/yaar/thanks/jokes PLUS a real request): classify by the REAL goal — ecommerce action beats Welfog KB beats casual chitchat. Ignore conversational filler when shopping/order/KB/support intent is present.
 - run_catalog_search=false for meta_kind other than none.
 - {language_reply_instruction(reply_lang)}
@@ -315,16 +337,23 @@ Return JSON only."""
             {"role": "user", "content": user_payload},
         ]
         log_reasoning(f"Calling LLM routing ({len(system_prompt)} char system prompt)...")
-        route_timeout = max(8, min(14, int(os.getenv("AI_ROUTE_TIMEOUT", "12") or 12)))
+        route_timeout = max(6, min(10, int(os.getenv("AI_ROUTE_TIMEOUT", "8") or 8)))
         import time as _time
 
         _t_route = _time.perf_counter()
+        # Prefer providers not on TPD/RPM cooldown (e.g. skip Groq after daily limit).
+        try:
+            from services.llm_providers import filter_providers_not_on_cooldown
+
+            providers = filter_providers_not_on_cooldown(providers)
+        except ImportError:
+            pass
         out = _llm_json_with_provider_fallback(
             providers,
             messages,
             max_tokens=max(720, int(os.getenv("AI_ROUTE_MAX_TOKENS", "960") or 960)),
             timeout_sec=route_timeout,
-            max_attempts=max(1, min(3, int(os.getenv("AI_ROUTE_MAX_ATTEMPTS", "2") or 2))),
+            max_attempts=max(1, min(2, int(os.getenv("AI_ROUTE_MAX_ATTEMPTS", "1") or 1))),
         )
         _route_ms = (_time.perf_counter() - _t_route) * 1000.0
         prov_names = "→".join((p.get("name") or "?") for p in providers)
@@ -431,7 +460,7 @@ JSON SCHEMA:
 
 RULES:
 - SCOPE: You ONLY help with Welfog — products, deals, categories, orders (tracking/history steps), delivery/PIN, refunds/payments, seller topics, and facts present in the knowledge base. If the message is unrelated (weather, jokes, recipes, cricket, personal stories, other apps/companies, etc.): set intent="out_of_domain", is_welfog_related=false, and set "response" to 1-3 short sentences in the user's language: briefly acknowledge their topic in one phrase, say you are the Welfog shopping assistant and cannot help with that, invite Welfog product/order/delivery help — do NOT give facts/advice/forecast for the off-topic question. EXCEPTION: cultural / Indian greetings (Ram Ram, Radhe Radhe, Namaste, Adaab), casual wellbeing ("sab badhiya", "kaise ho"), Hinglish openers ("sun na", "hi hello") — keep is_welfog_related=true, intent="general", and reply warmly in 1-2 human sentences; on a pure greeting do NOT paste deals URLs or long "I can only help with..." disclaimers.
-- Answer ONLY what the user asked when it is in-scope; keep the "response" concise (no extra sections, no unrelated marketing). Match answer length to question — one-line question → 1-3 sentences, not a full policy essay.
+- Answer ONLY what the user asked when it is in-scope (no extra sections, no unrelated marketing). Be COMPLETE for that ask: policy questions need the full relevant policy facts; how-to needs full steps from context. Never return only a title/heading. Do NOT dump unrelated FAQ paragraphs from other chunks.
 - SELLER LOGIN: If user reports seller login/OTP/panel error, give login troubleshooting bullets from seller knowledge — NOT "how to become seller" registration steps. After failed attempts, add customer care contact from KB.
 - SERVICE CHARGES: If user asks about fees/charges on Welfog, answer only from payment knowledge (checkout display, COD/premium return fees) in 2-4 sentences — no order-tracking or greeting text.
 - SHORT VIDEO / SHORTS / REELS: Answer only from Admin knowledge excerpts provided for this turn (any Admin document may contain the rules). intent=general, data_channel=kb. Leave kb_keys empty or use catalog keys that match — never invent file names. NEVER say "no restrictions" if KB lists prohibited content. NEVER invent quality/timing/brand-image rules not in KB.
@@ -470,7 +499,8 @@ RULES:
             {"role": "user", "content": user_payload},
         ]
         out = _llm_json_with_provider_fallback(
-            providers, messages, max_tokens=240, timeout_sec=10, max_attempts=2
+            # Enough tokens for full policy / multi-step how-to answers (not stubs).
+            providers, messages, max_tokens=520, timeout_sec=14, max_attempts=2
         )
         if out:
             log_reasoning(out.get("reasoning") or "Answer generation completed.")

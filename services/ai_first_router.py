@@ -2389,9 +2389,25 @@ def _brain_user_meaning_indicates_welfog_topic(um: str) -> bool:
 
 
 def _brain_user_meaning_indicates_chitchat(um: str) -> bool:
-    """Brain English user_meaning — casual opener / thanks / bye (not customer keywords)."""
+    """Brain English user_meaning — casual opener / thanks / bye / affection (not customer keywords)."""
     u = (um or "").strip().lower()
     if not u:
+        return False
+    # If Brain already framed an informational ask, this is not pure chitchat.
+    if any(
+        m in u
+        for m in (
+            "wants to know",
+            "asking about",
+            "asking for",
+            "how to",
+            "wants information",
+            "needs help with",
+            "wants to track",
+            "wants to order",
+            "looking for a product",
+        )
+    ):
         return False
     return any(
         m in u
@@ -2416,8 +2432,37 @@ def _brain_user_meaning_indicates_chitchat(um: str) -> bool:
             "who are you",
             "what can you do",
             "introduce yourself",
+            "expressing affection",
+            "friendly talk",
+            "without any specific request",
+            "no specific request",
+            "not asking for anything",
+            "just being friendly",
+            "social pleasantry",
+            "love you",
+            "saying love",
         )
     )
+
+
+def _lock_route_as_general_chitchat(route: dict, *, reason: str = "") -> dict:
+    """Force warm chitchat — never KB/order/catalog after Brain said casual talk."""
+    out = dict(route or {})
+    out["intent"] = "general"
+    out["conversation_scope"] = "general_chitchat"
+    out["data_channel"] = "none"
+    out["is_welfog_related"] = True
+    out["kb_keys"] = []
+    out["run_catalog_search"] = False
+    out["continue_previous_topic"] = False
+    out["needs_order_id"] = False
+    out["search_query"] = ""
+    out.pop("_product_catalog_locked", None)
+    out.pop("_semantic_kb_rescue", None)
+    out["_turn_promotions_done"] = True
+    if reason:
+        log_reasoning(reason)
+    return out
 
 
 def _brain_um_names_external_marketplace(um: str, reasoning: str = "") -> bool:
@@ -2492,6 +2537,14 @@ def _reconcile_off_topic_brain_misroute(
             return out
 
     if _brain_reasoning_indicates_ood(reasoning):
+        um_early = (out.get("user_meaning") or "").strip()
+        if _brain_user_meaning_indicates_chitchat(um_early) or _brain_user_meaning_indicates_chitchat(
+            f"{um_early} {reasoning}"
+        ):
+            return _lock_route_as_general_chitchat(
+                out,
+                reason="Brain OOD reconcile — chitchat meaning; skip KB semantic rescue.",
+            )
         try:
             from services.kb_service import promote_route_from_semantic_kb_match
 
@@ -2518,6 +2571,12 @@ def _reconcile_off_topic_brain_misroute(
         return out
 
     if intent == "out_of_domain" or scope == "out_of_domain":
+        um_early = (out.get("user_meaning") or "").strip()
+        if _brain_user_meaning_indicates_chitchat(um_early):
+            return _lock_route_as_general_chitchat(
+                out,
+                reason="Brain OOD reconcile — chitchat over OOD label; skip KB rescue.",
+            )
         # Admin knowledge is SoT: strong indexed match rescues Brain OOD misroutes
         # (e.g. reels/short-video policy classified as "not shopping").
         try:
@@ -2540,6 +2599,17 @@ def _reconcile_off_topic_brain_misroute(
         return out
 
     if related is False:
+        um_early = (out.get("user_meaning") or "").strip()
+        if _brain_user_meaning_indicates_chitchat(um_early) or _brain_user_meaning_indicates_chitchat(
+            f"{um_early} {reasoning}"
+        ):
+            return _lock_route_as_general_chitchat(
+                out,
+                reason=(
+                    "Brain OOD reconcile — chitchat from user_meaning "
+                    "(skip KB rescue over is_welfog_related=false)."
+                ),
+            )
         try:
             from services.kb_service import promote_route_from_semantic_kb_match
 
@@ -2829,7 +2899,6 @@ def _reconcile_semantic_kb_route(
         build_kb_retrieval_query,
         get_support_contact_kb_keys,
         retrieve_best_kb_chunk,
-        resolve_brain_kb_keys,
     )
 
     out = dict(route or {})
@@ -2845,8 +2914,10 @@ def _reconcile_semantic_kb_route(
 
     if (
         intent == "pincode_check"
+        or intent == "product"
         or out.get("_pincode_delivery_fast")
         or out.get("_pincode_delivery_locked")
+        or out.get("_product_catalog_locked")
         or rh in ("pincode_delivery_api", "pincode_delivery_fast")
         or channel == "live_api"
         or channel == "catalog"
@@ -2854,6 +2925,7 @@ def _reconcile_semantic_kb_route(
         or out.get("category_only_browse")
         or (out.get("category_browse") or "").strip()
         or intent in ("deals", "categories", "order", "order_history", "wishlist")
+        or _brain_route_has_shopping_entities(out, original_msg=original_msg, msg_en=msg_en)
     ):
         return out
 
@@ -2913,10 +2985,21 @@ def _reconcile_semantic_kb_route(
 
     intent_now = (out.get("intent") or "").strip().lower()
     scope_now = (out.get("conversation_scope") or "").strip().lower()
-    # OOD / chitchat: still allow Admin semantic rescue; true OOD has no strong hit.
+    # Pure chitchat must stay chitchat — Admin semantic rescue was stealing
+    # affection / "hyee" into invoice/return-policy FAQ hits.
+    um_now = f"{out.get('user_meaning') or ''} {out.get('reasoning') or ''}"
+    if scope_now == "general_chitchat" or _brain_user_meaning_indicates_chitchat(um_now):
+        out["conversation_scope"] = "general_chitchat"
+        out["data_channel"] = "none"
+        out["kb_keys"] = []
+        out["continue_previous_topic"] = False
+        out["run_catalog_search"] = False
+        out.pop("_product_catalog_locked", None)
+        out.pop("_semantic_kb_rescue", None)
+        return out
     if (
         intent_now == "out_of_domain"
-        or scope_now in ("out_of_domain", "general_chitchat", "harm_sensitive")
+        or scope_now in ("out_of_domain", "harm_sensitive")
         or out.get("is_welfog_related") is False
     ):
         try:
@@ -2927,7 +3010,7 @@ def _reconcile_semantic_kb_route(
             )
             if promoted:
                 log_reasoning(
-                    "Brain KB reconcile — Admin semantic rescue from OOD/chitchat scope."
+                    "Brain KB reconcile — Admin semantic rescue from OOD scope."
                 )
                 return promoted
         except ImportError:
@@ -2950,9 +3033,11 @@ def _reconcile_semantic_kb_route(
     if has_shopping and chunk_score < 0.72:
         return out
 
-    keys = resolve_brain_kb_keys(out, original_msg, msg_en)
+    keys = [k for k in (out.get("kb_keys") or []) if str(k).strip()]
     if best and best.get("source"):
         keys = list(dict.fromkeys((keys or []) + [str(best["source"])]))[:4]
+    # Do NOT call resolve_brain_kb_keys here — that re-embeds / re-ranks and
+    # doubled OpenAI cost after retrieve_best_kb_chunk already ran.
 
     out["data_channel"] = "kb"
     out["conversation_scope"] = "welfog_support"
@@ -3453,27 +3538,101 @@ def guard_fast_brain_classify(
 
 
 def _brain_route_needs_product_rescue(out: dict) -> bool:
-    """True only when brain misrouted clear shopping as OOD — not KB/chitchat locks."""
+    """
+    True when Brain may have mislabeled shopping — OOD, support KB, or general.
+    Product AI classifier decides; no product-name keyword lists.
+    Never steals live order/wishlist/pincode/deals turns.
+    """
     if not isinstance(out, dict):
+        return False
+    if out.get("_product_catalog_locked") or out.get("run_catalog_search"):
         return False
     intent = (out.get("intent") or "").strip().lower()
     scope = (out.get("conversation_scope") or "").strip().lower()
     channel = (out.get("data_channel") or "").strip().lower()
-    if channel in ("kb", "live_api"):
+    meta = (out.get("meta_kind") or "").strip().lower()
+    if intent in ("product", "product_search") and channel in ("catalog", ""):
         return False
-    if scope in ("general_chitchat",) or (out.get("meta_kind") or "").strip().lower() in (
-        "conversational",
-        "assistant_intro",
+    if channel == "live_api" or intent in (
+        "order",
+        "refund",
+        "payment",
+        "order_history",
+        "wishlist",
+        "pincode_check",
+        "deals",
+        "categories",
+        "category_feed",
     ):
         return False
+    if out.get("needs_order_id") and (
+        out.get("order_help_kind") or ""
+    ).strip().lower() != "nav_howto":
+        return False
     try:
-        from services.ai_route_semantics import brain_route_prefers_kb_answer
+        from services.ai_route_semantics import brain_route_is_order_nav_howto
 
-        if brain_route_prefers_kb_answer(out):
+        if brain_route_is_order_nav_howto(out):
             return False
     except ImportError:
         pass
-    return intent in ("out_of_domain",) or scope == "out_of_domain"
+    try:
+        from services.kb_turn_sot import kb_turn_blocks_product_rescue
+
+        if kb_turn_blocks_product_rescue(out):
+            return False
+    except ImportError:
+        pass
+    try:
+        from services.chat_flow_telemetry import brain_route_authoritative_kb_lock
+
+        if brain_route_authoritative_kb_lock(out):
+            return False
+    except ImportError:
+        pass
+    # Pure greeting/assistant meta — leave to chitchat (rescue skip handles hard blocks).
+    if meta in ("assistant_intro",) and channel != "kb":
+        return False
+    # Trust Brain conversational lock with no shopping signals — skip extra product LLM
+    # (rescue was the 40–180s hang on "hello mere bhai" / casual Hinglish).
+    if scope in ("general_chitchat", "harm_sensitive") and channel in ("none", ""):
+        try:
+            from services.ai_route_semantics import (
+                _brain_route_has_shopping_entities,
+                brain_route_indicates_product_catalog,
+            )
+
+            if not (
+                brain_route_indicates_product_catalog(out)
+                or _brain_route_has_shopping_entities(out)
+            ):
+                return False
+        except ImportError:
+            return False
+    if intent in ("out_of_domain",) or scope in ("out_of_domain", "harm_sensitive"):
+        return True
+    # KB channel alone is authoritative — rescue only when Brain left shopping signals.
+    if channel == "kb":
+        try:
+            from services.ai_route_semantics import (
+                _brain_route_has_shopping_entities,
+                brain_route_indicates_product_catalog,
+            )
+
+            if brain_route_indicates_product_catalog(out) or _brain_route_has_shopping_entities(
+                out
+            ):
+                return True
+        except ImportError:
+            pass
+        return False
+    if intent in ("general", "") or scope in (
+        "welfog_support",
+        "general_chitchat",
+        "",
+    ):
+        return True
+    return False
 
 
 def _turn_should_skip_product_rescue(
@@ -3483,9 +3642,12 @@ def _turn_should_skip_product_rescue(
     *,
     conversation_context: str = "",
 ) -> bool:
-    """Hard blocks — chitchat, thanks, social links, KB policy; never product rescue."""
+    """Hard blocks — thanks, social links; never product rescue. NOT brain chitchat scope."""
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     if not comb:
+        return True
+    meta = (out.get("meta_kind") or "").strip().lower()
+    if meta in ("assistant_intro", "conversational"):
         return True
     try:
         from utils.helpers import (
@@ -3507,21 +3669,10 @@ def _turn_should_skip_product_rescue(
     except ImportError:
         pass
     try:
-        from services.chitchat_resolver import (
-            _chitchat_lane_skips_transactional_guards,
-            turn_is_chitchat_not_shopping,
-        )
+        from services.chitchat_resolver import _chitchat_lane_skips_transactional_guards
 
         if _chitchat_lane_skips_transactional_guards(
             original_msg, msg_en, conversation_context
-        ):
-            return True
-        if turn_is_chitchat_not_shopping(
-            original_msg,
-            msg_en,
-            conversation_context,
-            out,
-            allow_llm=False,
         ):
             return True
     except ImportError:
@@ -3563,45 +3714,48 @@ def _try_brain_misroute_product_rescue_via_ai(
     conversation_context: str = "",
 ) -> dict | None:
     """
-    AI product extract rescue — any language/typo, no hardcoded product lists.
-    Runs before micro-classifier defer so OOD misroutes still reach catalog search.
+    AI product agent rescue — any language/typo/product, no hardcoded product lists.
+    Overrides Brain KB/general/OOD misroutes when the product classifier says shopping.
     """
     if not _brain_route_needs_product_rescue(out):
         return None
+    if out.get("_product_catalog_locked") and (out.get("data_channel") or "").strip().lower() == "catalog":
+        return out
+    if out.get("_product_rescue_attempted"):
+        return None
+    # Mark early so KB + reconcile paths don't re-fire the product LLM this turn.
+    out["_product_rescue_attempted"] = True
     if _turn_should_skip_product_rescue(
         out,
         original_msg,
         msg_en,
         conversation_context=conversation_context,
     ):
-        log_reasoning("Product rescue skipped — chitchat/social/KB/thanks turn.")
+        log_reasoning("Product rescue skipped — chitchat/social/thanks turn.")
         return None
-    try:
-        from services.chitchat_resolver import turn_is_chitchat_not_shopping
-
-        if turn_is_chitchat_not_shopping(
-            original_msg,
-            msg_en,
-            conversation_context,
-            out,
-            allow_llm=False,
-        ):
-            return None
-    except ImportError:
-        pass
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+    channel = (out.get("data_channel") or "").strip().lower()
+    intent = (out.get("intent") or "").strip().lower()
     try:
         from services.chat_flow_telemetry import ensure_product_rescue_llm_slot
         from services.product_catalog_resolver import (
+            KIND_NONE,
+            KIND_POLICY_KB,
             KIND_PRODUCT_SEARCH,
             ai_classify_product_search_turn,
         )
 
         ensure_product_rescue_llm_slot()
+        # Neutralize Brain's wrong KB lock so the product LLM is not steered away.
         clean_route = dict(out)
         clean_route.pop("user_meaning", None)
         clean_route.pop("scope_reply", None)
+        clean_route.pop("kb_keys", None)
         clean_route["intent"] = "out_of_domain"
         clean_route["data_channel"] = "none"
+        clean_route["conversation_scope"] = "out_of_domain"
         classified = ai_classify_product_search_turn(
             original_msg,
             msg_en,
@@ -3611,10 +3765,20 @@ def _try_brain_misroute_product_rescue_via_ai(
         )
         sq = ""
         conf = 0.0
+        entities: dict = {}
+        kind = ""
+        um = ""
         if classified:
             kind = (classified.get("turn_kind") or "").strip().lower()
             conf = float(classified.get("confidence") or 0.0)
-            if kind == KIND_PRODUCT_SEARCH and conf >= 0.62:
+            um = (classified.get("user_meaning") or "").strip()
+            if kind in (KIND_POLICY_KB, "order_support"):
+                log_reasoning(
+                    f"Product rescue — classifier kept non-shopping kind={kind!r} "
+                    f"conf={conf:.2f}."
+                )
+                return None
+            if kind == KIND_PRODUCT_SEARCH and conf >= 0.55:
                 entities = (
                     classified.get("entities")
                     if isinstance(classified.get("entities"), dict)
@@ -3624,33 +3788,90 @@ def _try_brain_misroute_product_rescue_via_ai(
                     (classified.get("search_query") or "").strip()
                     or str(entities.get("product_name") or "").strip()
                 )
-        if not sq:
+            elif kind in (KIND_NONE, ""):
+                # Classifier said NOT product search — never salvage scraps into catalog
+                # (was turning casual chitchat into OpenSearch for minutes).
+                log_reasoning(
+                    f"Product rescue — kind=none conf={conf:.2f} — skip (not shopping)."
+                )
+                return None
+            elif kind == KIND_PRODUCT_SEARCH:
+                # Low-confidence product_search — only promote when meaning clearly shops.
+                entities = (
+                    classified.get("entities")
+                    if isinstance(classified.get("entities"), dict)
+                    else {}
+                )
+                meaning_route = {
+                    "user_meaning": um,
+                    "reasoning": um,
+                    "intent": "product",
+                }
+                try:
+                    from services.product_browse_semantics import (
+                        llm_meaning_is_not_product_browse,
+                        llm_meaning_is_product_browse,
+                    )
+                except ImportError:
+                    llm_meaning_is_not_product_browse = lambda _r: False  # type: ignore
+                    llm_meaning_is_product_browse = lambda _r: True  # type: ignore
+                if llm_meaning_is_not_product_browse(meaning_route):
+                    log_reasoning(
+                        f"Product rescue — classifier kind={kind!r} blocked by meaning."
+                    )
+                    return None
+                ent_name = str((entities or {}).get("product_name") or "").strip()
+                if ent_name and llm_meaning_is_product_browse(meaning_route):
+                    sq = ent_name
+                    conf = max(conf, 0.68)
+                elif um and len(um) >= 4 and llm_meaning_is_product_browse(meaning_route):
+                    log_reasoning(
+                        f"Product rescue — salvage shopping meaning={um[:80]!r} "
+                        f"(classifier kind={kind!r} low-conf)."
+                    )
+                    conf = max(conf, 0.70)
+                    # sq filled below via extract if empty
+                else:
+                    log_reasoning(
+                        f"Product rescue — classifier kind={kind!r} "
+                        f"conf={conf:.2f} no salvage signal."
+                    )
+                    return None
+        # ONE AI pass: classifier entities are SoT — skip second extract LLM when sq ready.
+        need_extract = not sq or len(sq) < 2
+        if need_extract:
             try:
                 from services.product_query_understanding import (
                     resolve_catalog_search_terms_for_message,
                 )
 
+                extract_route = dict(clean_route)
+                if um:
+                    extract_route["user_meaning"] = um
                 sq = resolve_catalog_search_terms_for_message(
                     original_msg,
                     msg_en,
-                    ai_route=clean_route,
+                    ai_route=extract_route,
                     conversation_context=conversation_context,
                     force_llm=True,
                 )
                 if sq:
-                    conf = 0.68
+                    conf = max(conf, 0.68)
             except ImportError:
                 pass
         if not sq or len(sq) < 2:
             if classified:
                 log_reasoning(
-                    f"Product rescue skipped — classifier kind={(classified.get('turn_kind') or '')!r} "
+                    f"Product rescue skipped — classifier kind="
+                    f"{(classified.get('turn_kind') or '')!r} "
                     f"conf={float(classified.get('confidence') or 0):.2f}."
                 )
             return None
-        if not _shopping_extract_plausible(original_msg, msg_en, sq):
+        # High-confidence Product Agent output is SoT — do not re-gate on noun lists.
+        if conf < 0.72 and not _shopping_extract_plausible(original_msg, msg_en, sq):
             log_reasoning(
-                f"Product rescue skipped — sq={sq!r} not shopping-plausible."
+                f"Product rescue skipped — sq={sq!r} not shopping-plausible "
+                f"(conf={conf:.2f})."
             )
             return None
         promoted = dict(out)
@@ -3663,11 +3884,30 @@ def _try_brain_misroute_product_rescue_via_ai(
         promoted["meta_kind"] = "none"
         promoted["conversation_scope"] = "welfog_support"
         promoted["search_query"] = sq
+        promoted["kb_keys"] = []
         promoted["_product_catalog_locked"] = True
-        promoted.setdefault("_product_entities", {})["product_name"] = sq
+        promoted["_product_rescue_attempted"] = True
+        promoted["_needs_product_nlu_llm"] = False
+        promoted["_product_nlu_from_ai"] = True
+        promoted["_ai_single_pass"] = True
+        promoted["_product_understanding_confidence"] = conf
+        pe = dict(promoted.get("_product_entities") or {})
+        if entities:
+            pe.update({k: v for k, v in entities.items() if v not in (None, "", [], {})})
+        pe.setdefault("product_name", sq)
+        promoted["_product_entities"] = pe
+        if um:
+            promoted["user_meaning"] = um
+        # Named product beats empty department browse (fashion with no SKUs).
+        if sq:
+            promoted.pop("category_only_browse", None)
+            if not (entities.get("category") or "").strip():
+                promoted.pop("category_browse", None)
         promoted.pop("scope_reply", None)
+        promoted.pop("route_handler", None)
         log_reasoning(
-            f"Product rescue (classifier): sq={sq!r} conf={conf:.2f} over brain misroute."
+            f"Product rescue (AI agent): sq={sq!r} conf={conf:.2f} over brain "
+            f"channel={channel!r} intent={intent!r}."
         )
         return promoted
     except ImportError:
@@ -3890,12 +4130,147 @@ def _try_fast_finalize_brain_route_after_ai(
     olk = (out.get("order_lookup_kind") or "").strip().lower()
     meta = (out.get("meta_kind") or "none").strip().lower()
     kb_keys = [str(k).strip() for k in (out.get("kb_keys") or []) if str(k).strip()]
-    authoritative_kb_json = (
+
+    # Production hot path: Brain already locked channel=kb → finalize immediately.
+    # Zero imports / probes — avoid lockups under concurrent /chat threads.
+    if (
         channel == "kb"
-        and bool(kb_keys)
         and not out.get("needs_order_id")
         and out.get("is_welfog_related", True) is not False
+        and intent
+        not in (
+            "order",
+            "order_history",
+            "wishlist",
+            "product",
+            "pincode_check",
+            "deals",
+            "categories",
+        )
+    ):
+        out["data_channel"] = "kb"
+        out["run_catalog_search"] = False
+        out["needs_order_id"] = False
+        out["conversation_scope"] = "welfog_support"
+        out["is_welfog_related"] = True
+        out["scope_reply"] = ""
+        out["meta_kind"] = "none"
+        out["_turn_promotions_done"] = True
+        out["_universal_brain_route"] = True
+        out["_kb_route_locked"] = True
+        out.pop("_product_catalog_locked", None)
+        out.pop("search_query", None)
+        if intent not in ("seller", "refund", "payment"):
+            out["intent"] = intent or "general"
+        log_reasoning(
+            "Universal brain — KB channel lock → extractive fast finalize."
+        )
+        return out
+
+    try:
+        from services.chat_flow_telemetry import brain_route_authoritative_kb_lock
+
+        authoritative_kb_json = brain_route_authoritative_kb_lock(out)
+    except ImportError:
+        authoritative_kb_json = (
+            channel == "kb"
+            and bool(kb_keys)
+            and not out.get("needs_order_id")
+            and out.get("is_welfog_related", True) is not False
+        )
+
+    catalog_fast = _fast_finalize_promote_catalog_menu(
+        out,
+        original_msg,
+        msg_en,
+        conversation_context=conversation_context,
     )
+    if isinstance(catalog_fast, dict):
+        log_reasoning(
+            "Universal brain — catalog menu fast finalize (deals/categories over misroute)."
+        )
+        return catalog_fast
+
+    # KB / order-nav howto BEFORE personal-live and product rescue.
+    try:
+        from services.ai_route_semantics import (
+            brain_route_is_order_nav_howto,
+            reconcile_order_nav_howto_from_brain_meaning,
+            reconcile_welfog_kb_from_brain_meaning,
+            brain_route_indicates_informational_kb,
+            brain_route_prefers_kb_answer,
+        )
+
+        howto = reconcile_order_nav_howto_from_brain_meaning(
+            out,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conversation_context,
+        )
+        if brain_route_is_order_nav_howto(howto):
+            howto["_turn_promotions_done"] = True
+            howto["_universal_brain_route"] = True
+            log_reasoning(
+                "Universal brain — order nav howto KB fast finalize (before live/product)."
+            )
+            return howto
+        if brain_route_indicates_informational_kb(
+            out,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conversation_context,
+        ) or brain_route_prefers_kb_answer(out):
+            kb_out = reconcile_welfog_kb_from_brain_meaning(
+                out,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conversation_context,
+            )
+            kb_out["_turn_promotions_done"] = True
+            kb_out["_universal_brain_route"] = True
+            kb_out["is_welfog_related"] = True
+            kb_out["conversation_scope"] = "welfog_support"
+            kb_out.pop("scope_reply", None)
+            log_reasoning(
+                "Universal brain — KB fast finalize before product/order live."
+            )
+            return kb_out
+    except ImportError:
+        pass
+
+    try:
+        from services.order_turn_sot import fast_finalize_personal_order_live
+
+        order_fast = fast_finalize_personal_order_live(
+            out,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            conversation_context=conversation_context,
+            ctx=ctx,
+        )
+        if isinstance(order_fast, dict):
+            log_reasoning(
+                "Universal brain — personal order live fast finalize (before product)."
+            )
+            return order_fast
+    except ImportError:
+        pass
+
+    # PRODUCT before OOD — shopping must never lose to chitchat misroute.
+    # allow_product_llm=False: never start a second product NLU during Brain finalize
+    # (routing LLM already ran; rescue belongs to product SoT only when not KB).
+    product_fast = _fast_finalize_promote_product_catalog(
+        out,
+        original_msg,
+        msg_en,
+        conversation_context=conversation_context,
+        allow_product_llm=False,
+    )
+    if isinstance(product_fast, dict):
+        log_reasoning(
+            "Universal brain — product catalog fast finalize (shopping over misroute)."
+        )
+        return product_fast
 
     if (
         not authoritative_kb_json
@@ -3918,18 +4293,6 @@ def _try_fast_finalize_brain_route_after_ai(
             out["is_welfog_related"] = True
         log_reasoning("Universal brain — scope/OOD fast finalize (skip KB/catalog).")
         return out
-
-    catalog_fast = _fast_finalize_promote_catalog_menu(
-        out,
-        original_msg,
-        msg_en,
-        conversation_context=conversation_context,
-    )
-    if isinstance(catalog_fast, dict):
-        log_reasoning(
-            "Universal brain — catalog menu fast finalize (deals/categories over misroute)."
-        )
-        return catalog_fast
 
     try:
         from services.ai_route_semantics import (
@@ -3960,19 +4323,6 @@ def _try_fast_finalize_brain_route_after_ai(
             return out
     except ImportError:
         pass
-
-    product_fast = _fast_finalize_promote_product_catalog(
-        out,
-        original_msg,
-        msg_en,
-        conversation_context=conversation_context,
-        allow_product_llm=False,
-    )
-    if isinstance(product_fast, dict):
-        log_reasoning(
-            "Universal brain — product catalog fast finalize (shopping over misroute)."
-        )
-        return product_fast
 
     try:
         from services.ai_route_semantics import (
@@ -4047,36 +4397,55 @@ def _try_fast_finalize_brain_route_after_ai(
         and meta in ("conversational", "none", "")
         and not (out.get("kb_keys") or [])
     ):
-        catalog_over_chitchat = _fast_finalize_promote_catalog_menu(
-            out,
-            original_msg,
-            msg_en,
-            conversation_context=conversation_context,
-            rescue_misroute=True,
-        )
-        if isinstance(catalog_over_chitchat, dict):
-            log_reasoning(
-                "Universal brain — catalog menu promoted over chitchat misroute."
+        # Brain already locked chitchat — do NOT run catalog-menu / product rescue LLMs
+        # (those were the multi-minute hang on "hello mere bhai" / casual talk).
+        _allow_shop_rescue = False
+        if scope != "general_chitchat":
+            _allow_shop_rescue = True
+        else:
+            try:
+                from services.ai_route_semantics import (
+                    _brain_route_has_shopping_entities,
+                    brain_route_indicates_product_catalog,
+                )
+
+                _allow_shop_rescue = bool(
+                    brain_route_indicates_product_catalog(out)
+                    or _brain_route_has_shopping_entities(out)
+                )
+            except ImportError:
+                _allow_shop_rescue = False
+        if _allow_shop_rescue:
+            catalog_over_chitchat = _fast_finalize_promote_catalog_menu(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context=conversation_context,
+                rescue_misroute=True,
             )
-            return catalog_over_chitchat
-        product_over_chitchat = _fast_finalize_promote_product_catalog(
-            out,
-            original_msg,
-            msg_en,
-            conversation_context=conversation_context,
-            allow_product_llm=True,
-        )
-        if isinstance(product_over_chitchat, dict):
-            log_reasoning(
-                "Universal brain — product promoted over chitchat misroute."
+            if isinstance(catalog_over_chitchat, dict):
+                log_reasoning(
+                    "Universal brain — catalog menu promoted over chitchat misroute."
+                )
+                return catalog_over_chitchat
+            product_over_chitchat = _fast_finalize_promote_product_catalog(
+                out,
+                original_msg,
+                msg_en,
+                conversation_context=conversation_context,
+                allow_product_llm=False,
             )
-            return product_over_chitchat
+            if isinstance(product_over_chitchat, dict):
+                log_reasoning(
+                    "Universal brain — product promoted over chitchat misroute."
+                )
+                return product_over_chitchat
         out["_turn_promotions_done"] = True
         out["data_channel"] = "none"
         out["run_catalog_search"] = False
         out["is_welfog_related"] = True
         out.setdefault("conversation_scope", "general_chitchat")
-        out["scope_reply"] = ""
+        # Keep Brain-authored scope_reply when present (second chitchat LLM not required).
         log_reasoning("Universal brain — general chitchat fast finalize.")
         return out
 
@@ -4166,7 +4535,7 @@ def _try_fast_finalize_brain_route_after_ai(
             original_msg,
             msg_en,
             conversation_context=conversation_context,
-            allow_product_llm=True,
+            allow_product_llm=False,
         )
         if isinstance(product_over_ood, dict):
             log_reasoning(

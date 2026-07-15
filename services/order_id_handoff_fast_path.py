@@ -16,11 +16,16 @@ def _combined(original_msg: str, msg_en: str = "") -> str:
 
 
 def _is_bare_id_token(text: str) -> bool:
+    """Bare pasted token — must look like a real Order ID, not random chat ('ehat', 'bye')."""
     comb = (text or "").strip()
-    return bool(
-        re.fullmatch(r"[0-9]{4,20}", comb)
-        or re.fullmatch(r"[A-Za-z0-9]{4,20}", comb)
-    )
+    if not comb or not re.fullmatch(r"[A-Za-z0-9]{4,20}", comb):
+        return False
+    try:
+        from utils.helpers import _is_plausible_order_id
+
+        return _is_plausible_order_id(comb, shallow=True)
+    except ImportError:
+        return bool(re.fullmatch(r"[0-9]{4,20}", comb))
 
 
 def _message_is_bare_order_id_submission(original_msg: str, msg_en: str = "") -> bool:
@@ -30,14 +35,6 @@ def _message_is_bare_order_id_submission(original_msg: str, msg_en: str = "") ->
         return True
     comb = _combined(original_msg, msg_en)
     return _is_bare_id_token(comb)
-
-
-def _last_assistant_line(conversation_context: str) -> str:
-    for line in reversed((conversation_context or "").splitlines()):
-        low = line.strip().lower()
-        if low.startswith("assistant:"):
-            return line.split(":", 1)[-1].strip().lower()
-    return ""
 
 
 _INTENT_LABEL_TO_GOAL = {
@@ -170,6 +167,35 @@ def resolve_bare_order_id_handoff_goal(
     return _normalize_live_goal(locked)
 
 
+def _prefer_live_handoff_goal(*goals: str) -> str:
+    """
+    Bare Order-ID follow-up: keep track/invoice/details/refund distinct.
+    Refund wins over a mistaken track lock when any signal says refund.
+    """
+    cleaned = []
+    for g in goals:
+        g = _normalize_live_goal(g or "")
+        if g in (
+            "track",
+            "order_invoice",
+            "order_details",
+            "refund_status",
+            "payment",
+        ):
+            cleaned.append(g)
+    if not cleaned:
+        return ""
+    if "refund_status" in cleaned:
+        return "refund_status"
+    if "order_invoice" in cleaned:
+        return "order_invoice"
+    if "payment" in cleaned:
+        return "payment"
+    if "order_details" in cleaned:
+        return "order_details"
+    return cleaned[0]
+
+
 def _infer_handoff_goal_zero_llm(
     conversation_context: str,
     ctx: dict | None,
@@ -191,6 +217,7 @@ def _infer_handoff_goal_zero_llm(
         awaiting = ctx.get("awaiting")
         topic_mode = ((ctx.get("data") or {}).get("topic_mode") or "").strip().lower()
 
+    session_goal = ""
     if pending_action in (
         "track",
         "order_invoice",
@@ -198,9 +225,9 @@ def _infer_handoff_goal_zero_llm(
         "refund_status",
         "payment",
     ):
+        session_goal = pending_action
         log_reasoning(f"Handoff goal from pending_action: {pending_action}")
-        return pending_action
-    if awaiting == "order_id" and topic_mode.startswith("order_"):
+    elif awaiting == "order_id" and topic_mode.startswith("order_"):
         topic_goal = topic_mode.replace("order_", "", 1)
         if topic_goal in (
             "track",
@@ -209,9 +236,10 @@ def _infer_handoff_goal_zero_llm(
             "refund_status",
             "payment",
         ):
+            session_goal = topic_goal
             log_reasoning(f"Handoff goal from topic_mode: {topic_goal}")
-            return topic_goal
 
+    route_goal = ""
     if isinstance(ctx, dict) and awaiting == "order_id":
         ai_route = (ctx.get("data") or {}).get("ai_route") or {}
         if isinstance(ai_route, dict):
@@ -220,20 +248,129 @@ def _infer_handoff_goal_zero_llm(
 
                 live = brain_route_to_live_goal(ai_route)
                 if live:
+                    route_goal = live
                     log_reasoning(f"Handoff goal from ctx ai_route (awaiting): {live}")
-                    return live
             except ImportError:
                 pass
-            olk = (ai_route.get("order_lookup_kind") or "").strip().lower()
-            rh = (ai_route.get("route_handler") or "").strip().lower()
-            if olk == "refund_status" or rh == "refund_status_api":
-                return "refund_status"
-            if olk == "invoice":
-                return "order_invoice"
-            if olk in ("details", "order_details") or rh == "order_details_api":
-                return "order_details"
-            if olk in ("track", "tracking") or rh == "order_tracking_api":
-                return "track"
+            if not route_goal:
+                olk = (ai_route.get("order_lookup_kind") or "").strip().lower()
+                rh = (ai_route.get("route_handler") or "").strip().lower()
+                if olk == "refund_status" or rh == "refund_status_api":
+                    route_goal = "refund_status"
+                elif olk == "invoice":
+                    route_goal = "order_invoice"
+                elif olk in ("details", "order_details") or rh == "order_details_api":
+                    route_goal = "order_details"
+                elif olk in ("track", "tracking") or rh == "order_tracking_api":
+                    route_goal = "track"
+
+    if ctx_last == "refund":
+        session_goal = session_goal or "refund_status"
+    elif ctx_last == "payment":
+        session_goal = session_goal or "payment"
+    elif ctx_last == "invoice":
+        session_goal = session_goal or "order_invoice"
+    elif ctx_last == "track":
+        session_goal = session_goal or "track"
+
+    thread_goal = ""
+    if conversation_context:
+        try:
+            from services.conversation_thread_semantics import infer_order_thread_goal
+
+            # When session already locked (invoice ask → OID), skip slow LLM.
+            # Otherwise AI classifies thread meaning (any language) — no phrase lists.
+            ai_route_ctx = (
+                ((ctx.get("data") or {}).get("ai_route") or {})
+                if isinstance(ctx, dict)
+                else {}
+            )
+            thread_goal = infer_order_thread_goal(
+                conversation_context,
+                comb or " ",
+                ctx_last=ctx_last,
+                ai_route=ai_route_ctx if isinstance(ai_route_ctx, dict) else None,
+                allow_llm=not bool(session_goal or route_goal),
+            ) or ""
+            if thread_goal in (
+                "refund_status",
+                "order_invoice",
+                "order_details",
+                "track",
+                "payment",
+            ):
+                log_reasoning(f"Handoff goal from conversation thread: {thread_goal}")
+        except ImportError:
+            pass
+
+    # Structured session label only — never scrape assistant HTML with keyword lists.
+    # Ask paths must call lock_order_id_ask_session so last/pending_action are SoT.
+    label_goal = ""
+    if ctx_last == "invoice":
+        label_goal = "order_invoice"
+    elif ctx_last == "refund":
+        label_goal = "refund_status"
+    elif ctx_last == "payment":
+        label_goal = "payment"
+    elif ctx_last == "track":
+        label_goal = "track"
+
+    preferred = _prefer_live_handoff_goal(
+        session_goal, route_goal, label_goal, thread_goal
+    )
+
+    # Current-turn AI/explicit meaning beats a stale track lock (any language/style).
+    # Bare Order-ID-only lines leave this empty → session/route wins.
+    current_turn_goal = ""
+    if comb and not re.fullmatch(
+        r"(?:order\s*id\s*[:\-]?\s*)?[A-Za-z0-9]{4,20}",
+        comb,
+        flags=re.I,
+    ):
+        try:
+            from services.conversation_thread_semantics import (
+                resolve_explicit_turn_goal_from_message,
+            )
+
+            ai_route_ctx = (
+                ((ctx.get("data") or {}).get("ai_route") or {})
+                if isinstance(ctx, dict)
+                else {}
+            )
+            # Prefer LLM meaning when structural cache is empty — industry path.
+            current_turn_goal = resolve_explicit_turn_goal_from_message(
+                original_msg,
+                msg_en,
+                conversation_context,
+                ai_route_ctx if isinstance(ai_route_ctx, dict) else None,
+                allow_llm=True,
+            ) or ""
+            if current_turn_goal not in (
+                "refund_status",
+                "order_invoice",
+                "order_details",
+                "track",
+                "payment",
+            ):
+                current_turn_goal = ""
+            if current_turn_goal:
+                log_reasoning(
+                    f"Handoff goal from current-turn AI/explicit: {current_turn_goal}"
+                )
+        except ImportError:
+            current_turn_goal = ""
+
+    if current_turn_goal:
+        preferred = _prefer_live_handoff_goal(current_turn_goal, preferred)
+
+    if preferred:
+        log_reasoning(
+            f"Handoff goal preferred={preferred} "
+            f"(session={session_goal or '-'} route={route_goal or '-'} "
+            f"label={label_goal or '-'} thread={thread_goal or '-'} "
+            f"current={current_turn_goal or '-'})"
+        )
+        return preferred
 
     if comb:
         try:
@@ -251,11 +388,26 @@ def _infer_handoff_goal_zero_llm(
             except ImportError:
                 pass
             try:
-                from services.order_details_flow import _lightweight_details_or_invoice_signal
+                from services.conversation_thread_semantics import (
+                    resolve_explicit_turn_goal_from_message,
+                )
 
-                light = _lightweight_details_or_invoice_signal(comb)
-                if light in ("order_invoice", "order_details"):
-                    return light
+                # Second chance with LLM when preferred was empty.
+                explicit = resolve_explicit_turn_goal_from_message(
+                    original_msg,
+                    msg_en,
+                    conversation_context,
+                    None,
+                    allow_llm=True,
+                )
+                if explicit in (
+                    "refund_status",
+                    "order_invoice",
+                    "order_details",
+                    "track",
+                    "payment",
+                ):
+                    return explicit
             except ImportError:
                 pass
             try:
@@ -265,89 +417,6 @@ def _infer_handoff_goal_zero_llm(
                     return "refund_status"
             except ImportError:
                 pass
-
-    if ctx_last == "refund":
-        return "refund_status"
-    if ctx_last == "payment":
-        return "payment"
-
-    if conversation_context:
-        try:
-            from services.semantic_intent import zero_llm_intent_guess_allowed
-
-            allow_thread = zero_llm_intent_guess_allowed()
-        except ImportError:
-            allow_thread = True
-        if allow_thread:
-            try:
-                from services.conversation_thread_semantics import infer_order_thread_goal
-
-                thread = infer_order_thread_goal(
-                    conversation_context,
-                    comb or " ",
-                    ctx_last=ctx_last,
-                    allow_llm=False,
-                )
-                if thread in (
-                    "refund_status",
-                    "order_invoice",
-                    "order_details",
-                    "track",
-                    "payment",
-                ):
-                    log_reasoning(f"Handoff goal from conversation thread: {thread}")
-                    return thread
-            except ImportError:
-                pass
-
-    bot = _last_assistant_line(conversation_context)
-    if bot:
-        if any(
-            x in bot
-            for x in (
-                "refund status",
-                "return status",
-                "refund record",
-                "return request",
-                "paise wapas",
-                "money back",
-                "refund status check",
-            )
-        ) or (
-            "refund" in bot
-            and "status" in bot
-            and "order status" not in bot
-        ):
-            return "refund_status"
-        if any(x in bot for x in ("download invoice", "invoice for", "your invoice")):
-            return "order_invoice"
-        if any(x in bot for x in ("invoice", "bill", "receipt", "gst")) and "order status" not in bot:
-            return "order_invoice"
-        if any(
-            x in bot
-            for x in (
-                "order details",
-                "order ki details",
-                "payment mode",
-                "delivery address",
-                "order summary",
-            )
-        ):
-            return "order_details"
-        if any(
-            x in bot
-            for x in (
-                "track",
-                "tracking",
-                "live status",
-                "shipment",
-                "delivery status",
-                "courier",
-                "order status",
-                "status check",
-            )
-        ):
-            return "track"
 
     if ctx_last in ("order", "track", "order_history", "invoice"):
         if isinstance(ctx, dict) and awaiting != "order_id":
@@ -495,12 +564,26 @@ def _is_order_id_handoff_turn(
     if not comb:
         return False
 
+    try:
+        from services.chitchat_resolver import _is_instant_greeting_thanks_lane
+
+        if _is_instant_greeting_thanks_lane(
+            original_msg, msg_en, conversation_context
+        ):
+            return False
+    except ImportError:
+        pass
+
     # Session lock / pending_action wins — order IDs often embed 6-digit PIN substrings.
     if _bot_awaiting_order_id(conversation_context, ctx):
         if re.search(r"\b[0-9]{4,20}\b", comb):
             return True
         return False
     if isinstance(ctx, dict):
+        last = (ctx.get("last") or "").strip().lower()
+        if last in ("refund", "order", "invoice", "payment", "track"):
+            if re.search(r"\b[0-9]{4,20}\b", comb):
+                return True
         pending = (
             (ctx.get("data") or {}).get("pending_action") or ""
         ).strip().lower()
@@ -576,12 +659,7 @@ def _resolve_handoff_order_id(
     raw = (original_msg or "").strip()
     for candidate in (raw, comb):
         if _is_bare_id_token(candidate):
-            m = re.fullmatch(r"([0-9]{4,20})", candidate.strip())
-            if m:
-                return m.group(1)
-            m = re.fullmatch(r"([A-Za-z0-9]{4,20})", candidate.strip())
-            if m:
-                return m.group(1)
+            return candidate.strip()
 
     bot_awaiting = _bot_awaiting_order_id(conversation_context, ctx)
     if bot_awaiting or (
@@ -874,6 +952,8 @@ def try_order_id_handoff_reply(
         ctx["awaiting"] = None
         if goal == "refund_status":
             ctx["last"] = "refund"
+        elif goal == "order_invoice":
+            ctx["last"] = "invoice"
         elif goal == "payment":
             ctx["last"] = "payment"
         else:

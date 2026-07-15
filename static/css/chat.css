@@ -97,8 +97,22 @@ html, body {
 }
 
 .sidebar-brand {
-    padding: 18px 16px 14px;
+    padding: 0 10px 0 14px;
+    min-height: 52px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
     border-bottom: 1px solid var(--wf-border);
+}
+
+.sidebar-close-mobile {
+    flex-shrink: 0;
+    color: var(--wf-text-muted);
+}
+
+.sidebar-close-mobile:hover {
+    color: var(--wf-text);
 }
 
 .sidebar-brand__text {
@@ -149,7 +163,6 @@ html, body {
 .history-header {
     padding: 10px 14px;
     display: flex;
-    justify-content: space-between;
     align-items: center;
     font-size: 0.72rem;
     font-weight: 700;
@@ -157,10 +170,6 @@ html, body {
     letter-spacing: 0.06em;
     color: var(--wf-secondary);
     background: rgba(0, 150, 136, 0.06);
-}
-
-.history-close-mobile {
-    display: flex;
 }
 
 .history-list {
@@ -810,7 +819,7 @@ html, body {
         border-right: 1px solid var(--wf-border);
     }
 
-    .history-close-mobile {
+    .sidebar-close-mobile {
         display: none;
     }
 
@@ -828,6 +837,21 @@ html, body {
 
     .bot {
         max-width: min(78%, 100%);
+    }
+}
+
+@media (max-width: 767px) {
+    html {
+        touch-action: manipulation;
+    }
+
+    .app-body {
+        touch-action: manipulation;
+    }
+
+    /* iOS zooms inputs below 16px on focus — keep chat at fixed scale */
+    .composer__input {
+        font-size: 16px;
     }
 }
 

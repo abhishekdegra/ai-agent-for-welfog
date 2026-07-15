@@ -24,15 +24,10 @@ def _env_bool(name: str, default: str = "0") -> bool:
 
 
 def _ensure_project_dotenv_loaded() -> None:
-    if os.getenv("QDRANT_URL", "").strip() or _env_bool("QDRANT_ENABLED", "0"):
-        return
     try:
-        from dotenv import load_dotenv
+        from services.env_loader import ensure_dotenv_loaded
 
-        from support_paths import ENV_FILE
-
-        if os.path.isfile(ENV_FILE):
-            load_dotenv(ENV_FILE)
+        ensure_dotenv_loaded()
     except Exception:
         pass
 
@@ -102,33 +97,56 @@ def get_qdrant_client():
         return _client
 
 
-def qdrant_health_check() -> dict[str, Any]:
+_QDRANT_HEALTH_CACHE: dict[str, Any] = {"ts": 0.0, "result": None}
+_QDRANT_HEALTH_TTL_SEC = float(os.getenv("QDRANT_HEALTH_TTL_SEC") or "30")
+
+
+def qdrant_health_check(*, force: bool = False) -> dict[str, Any]:
     """
     Lightweight health probe.
     Returns: {ok, configured, reachable, collection, detail}
+
+    Cached briefly so every KB retrieval does not pay get_collections() round-trip.
     """
+    import time
+
+    now = time.monotonic()
+    cached = _QDRANT_HEALTH_CACHE.get("result")
+    if (
+        not force
+        and cached is not None
+        and (now - float(_QDRANT_HEALTH_CACHE.get("ts") or 0.0)) < _QDRANT_HEALTH_TTL_SEC
+    ):
+        return dict(cached)
+
     cfg = qdrant_config()
     if not cfg:
-        return {
+        result = {
             "ok": True,
             "configured": False,
             "reachable": False,
             "collection": None,
             "detail": "Qdrant disabled or QDRANT_URL missing",
         }
+        _QDRANT_HEALTH_CACHE["ts"] = now
+        _QDRANT_HEALTH_CACHE["result"] = result
+        return dict(result)
     client = get_qdrant_client()
     if client is None:
-        return {
+        result = {
             "ok": False,
             "configured": True,
             "reachable": False,
             "collection": cfg["collection"],
             "detail": "client_init_failed",
         }
+        _QDRANT_HEALTH_CACHE["ts"] = now
+        _QDRANT_HEALTH_CACHE["result"] = result
+        return dict(result)
     try:
         collections = client.get_collections()
         names = [c.name for c in (collections.collections or [])]
-        return {
+        result = {
             "ok": True,
             "configured": True,
             "reachable": True,
@@ -137,13 +155,16 @@ def qdrant_health_check() -> dict[str, Any]:
             "detail": "connected",
         }
     except Exception as exc:
-        return {
+        result = {
             "ok": False,
             "configured": True,
             "reachable": False,
             "collection": cfg["collection"],
             "detail": str(exc),
         }
+    _QDRANT_HEALTH_CACHE["ts"] = now
+    _QDRANT_HEALTH_CACHE["result"] = result
+    return dict(result)
 
 
 def ensure_qdrant_collection() -> dict[str, Any]:

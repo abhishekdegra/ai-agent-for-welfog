@@ -1266,7 +1266,7 @@ def _expand_title_query_variants(title: str) -> list[str]:
     if not base:
         return []
     collapsed = _soft_collapse_repeated_letters(base)
-    # Collapsed first when it differs — matching quality, not keyword maps.
+    # Prefer soft-collapsed form first — matching quality, not keyword maps.
     variants: list[str] = []
     if collapsed:
         variants.append(collapsed)
@@ -1277,6 +1277,26 @@ def _expand_title_query_variants(title: str) -> list[str]:
         alt = re.sub(r"\s+", " ", (alt or "").strip().lower())
         if alt and alt not in variants:
             variants.append(alt)
+
+    def _simple_singular_token(tok: str) -> str:
+        """Structural English plural soft-form (caps→cap). Not a product dictionary."""
+        t = (tok or "").lower()
+        if len(t) <= 3 or not t.endswith("s"):
+            return t
+        if t.endswith(("ss", "us", "is", "oes", "xes", "ches", "shes")):
+            return t
+        if t.endswith("ies") and len(t) > 4:
+            return t[:-3] + "y"
+        return t[:-1]
+
+    # caps / sneakers → also query singular catalog titles
+    for source in list(variants[:2]):
+        toks = source.split()
+        if not toks:
+            continue
+        sing = " ".join(_simple_singular_token(t) for t in toks)
+        if sing != source:
+            _add(sing)
 
     # Prefer balanced spaced splits early (flipflops → flip flops).
     for source in list(variants[:2]):
@@ -1300,7 +1320,7 @@ def _expand_title_query_variants(title: str) -> list[str]:
             )
             for split in ranked[:3]:
                 _add(split)
-    return variants[:6]
+    return variants[:8]
 
 
 def _build_title_match_clause(title: str) -> dict[str, Any]:
@@ -2485,15 +2505,10 @@ def filter_products_by_relevance_score_gap(
 
 def _ensure_project_dotenv_loaded() -> None:
     """Load parent .env when modules run outside app.py (tests, scripts)."""
-    if os.getenv("OPENSEARCH_URL", "").strip():
-        return
     try:
-        from dotenv import load_dotenv
+        from services.env_loader import ensure_dotenv_loaded
 
-        from support_paths import ENV_FILE
-
-        if os.path.isfile(ENV_FILE):
-            load_dotenv(ENV_FILE)
+        ensure_dotenv_loaded()
     except Exception:
         pass
 
@@ -2505,6 +2520,7 @@ def _env_opensearch_config():
     password = (os.getenv("OPENSEARCH_PASS") or "").strip()
     if not url:
         return None
+    # Auth only from .env — never hardcode OpenSearch user/password in source.
     return {"url": url, "auth": (user, password) if user else None}
 
 
@@ -3458,10 +3474,18 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
 
     sysmsg = _kb.sysmsg
     cards = []
+    seen: set[str] = set()
     for hit in hits or []:
         src = hit.get("_source") if isinstance(hit, dict) else {}
         if not isinstance(src, dict):
             continue
+        pro_id = src.get("pro_id")
+        slug = (src.get("slug") or "").strip()
+        dedupe_key = str(pro_id or "").strip() or slug or ""
+        if dedupe_key:
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
         name = src.get("name") or sysmsg("default_product_card_title")
         from services.welfog_api import format_customer_price_display
 
@@ -3469,9 +3493,8 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
         purchase_price = src.get("purchase_price")
         shipping_cost = src.get("shipping_cost")
         thumb = (src.get("thumbnail_img") or "").lstrip("/")
-        slug = (src.get("slug") or "").strip()
         link = (
-            f"https://welfog.com/product_details/{slug}"
+            f"https://welfog.com/products/{slug}"
             if slug
             else "https://welfog.com"
         )
@@ -3483,7 +3506,7 @@ def opensearch_hits_to_product_cards(hits: list) -> list[dict]:
                 "shipping_cost": shipping_cost,
                 "image": f"{IMAGE_BASE_URL}{thumb}" if thumb else "",
                 "link": link,
-                "pro_id": src.get("pro_id"),
+                "pro_id": pro_id,
                 "sku": src.get("sku") or "",
                 "size": src.get("size") or "",
                 "rating": src.get("rating"),
@@ -3765,7 +3788,51 @@ def search_opensearch_catalog(
                     f"OpenSearch AI single-pass brand-relax: {n} product(s) "
                     f"(title search without brand field filter)."
                 )
-        elif cards:
+        # Multi-token AI titles / Brain gloss ("chunri" + related "scarf") that
+        # catalog names omit — retry each token alone before slow REST fallback.
+        if not cards:
+            tq = (spec.get("title_query") or "").strip().lower()
+            toks = [
+                t
+                for t in re.findall(r"[a-z0-9]{3,}", tq)
+                if t not in ("the", "and", "for", "with")
+            ]
+            related_blob = " ".join(
+                str(x)
+                for x in (
+                    spec.get("related_search_terms"),
+                    spec.get("_related_search_terms"),
+                )
+                if x
+            )
+            for t in re.findall(r"[a-z0-9]{3,}", related_blob.lower()):
+                if t not in toks and t not in ("the", "and", "for", "with"):
+                    toks.append(t)
+            seen_tok: set[str] = set()
+            for tok in toks[:4]:
+                if tok in seen_tok or tok == tq:
+                    continue
+                seen_tok.add(tok)
+                soft = dict(spec)
+                soft["title_query"] = tok
+                soft["title_match_strict"] = False
+                soft.pop("mandatory_match_tokens", None)
+                soft_cards, soft_n, soft_more = _search_opensearch_page(
+                    soft,
+                    page=page,
+                    page_size=page_size,
+                    post_filter_mode="light",
+                    skip_price_sync=True,
+                )
+                if soft_cards:
+                    cards, n, more = soft_cards, soft_n, soft_more
+                    spec = soft
+                    log_reasoning(
+                        f"OpenSearch AI single-pass token-soft {tok!r}: "
+                        f"{n} product(s) (multi-token miss recovery)."
+                    )
+                    break
+        if cards:
             log_reasoning(
                 f"OpenSearch AI single-pass: {n} product(s) "
                 f"(no tiered relax — filters from AI only)."
@@ -4187,7 +4254,8 @@ def catalog_search_live(
     if products:
         return products, spec, total, has_more
 
-    if spec.get("_ai_single_pass"):
+    single_pass_miss = bool(spec.get("_ai_single_pass"))
+    if single_pass_miss:
         if _is_category_only_browse_spec(spec):
             cat_rest = _category_browse_rest_fallback(
                 spec, page=page, page_size=page_size, ctx=ctx
@@ -4195,7 +4263,7 @@ def catalog_search_live(
             if cat_rest[0]:
                 return cat_rest
         # OpenSearch index can lag the live catalog (vest/baniyan found on REST,
-        # zero on OS). Locked path must still try title REST — not silent not-found.
+        # zero on OS). Locked path still tries ONE fast REST — not 4×12s hangs.
         tq = (spec.get("title_query") or "").strip()
         if tq or spec.get("brand") or spec.get("sku") or spec.get("pro_id"):
             log_reasoning(
@@ -4244,20 +4312,50 @@ def catalog_search_live(
 
         cat_id = resolve_search_category_id(str(cat_id), ctx)
     # Try typo-soft + compound-space name variants (REST is often exact/prefix).
+    # Locked AI single-pass: at most 2 short attempts (primary + first token) —
+    # never 4×12s sequential hangs that blow chat deadline on Hinglish misses.
     rest_queries: list[str] = []
-    for cand in _expand_title_query_variants(q) or [q]:
-        if cand and cand not in rest_queries:
-            rest_queries.append(cand)
-    if q and q not in rest_queries:
-        rest_queries.insert(0, q)
+    if single_pass_miss:
+        rest_queries.append(q)
+        first_tok = ""
+        for tok in re.findall(r"[a-z0-9]{3,}", q.lower()):
+            first_tok = tok
+            break
+        if first_tok and first_tok != q.lower():
+            rest_queries.append(first_tok)
+    else:
+        for cand in _expand_title_query_variants(q) or [q]:
+            if cand and cand not in rest_queries:
+                rest_queries.append(cand)
+        if q and q not in rest_queries:
+            rest_queries.insert(0, q)
     rest: list = []
-    for rq in rest_queries[:4]:
-        rest = fetch_products_from_api(
-            rq,
-            category_id=cat_id,
-            color=spec.get("color"),
-            page=page,
-        )
+    rest_cap = 2 if single_pass_miss else 4
+    for rq in rest_queries[:rest_cap]:
+        if single_pass_miss:
+            # Short timeout — empty catalog should fail fast, not stall 60s.
+            # Never fall back to the default 12s fetch_products_from_api here
+            # (Timeout → except → 12s retry was doubling hangs).
+            try:
+                from services.welfog_api import _catalog_search_get
+
+                params = {"page": page or 1, "name": rq}
+                if cat_id:
+                    rows = _catalog_search_get(
+                        {**params, "categories": cat_id}, timeout=4
+                    ) or _catalog_search_get(params, timeout=4)
+                else:
+                    rows = _catalog_search_get(params, timeout=4)
+                rest = rows if isinstance(rows, list) else []
+            except Exception:
+                rest = []
+        else:
+            rest = fetch_products_from_api(
+                rq,
+                category_id=cat_id,
+                color=spec.get("color"),
+                page=page,
+            )
         if rest:
             if rq != q:
                 log_reasoning(f"Catalog: REST hit via typo-soft name={rq!r} (was {q!r})")
@@ -4332,7 +4430,7 @@ def build_product_cards_html(products: list[dict], sysmsg) -> str:
         )
         if p.get("link"):
             html.append(
-                f"<a href='{p['link']}' target='_blank' rel='noopener noreferrer'>"
+                f"<a href='{p['link']}'>"
                 f"{sysmsg('view_product')}</a>"
             )
         html.append("</div>")
@@ -4354,7 +4452,7 @@ def _build_product_view_more_tail(
         safe_url = html_escape(browse_more_url, quote=True)
         return (
             "<div class='wf-product-tail' style='margin-top:12px;text-align:center;'>"
-            f"<a href='{safe_url}' target='_blank' rel='noopener noreferrer' "
+            f"<a href='{safe_url}'  "
             f"class='wf-ph-more wf-product-more wf-product-more-link'>"
             f"<span class='wf-ph-more__label'>{label}</span></a></div>"
         )

@@ -35,6 +35,42 @@ _DEFAULT_MODELS = {
 
 _DEFAULT_ORDER = ("groq", "openai", "gemini", "deepseek")
 
+# After tokens-per-day / hard rate limits, skip that provider briefly so every
+# turn does not pay a failing Groq round-trip before OpenAI (~1–3s wasted each call).
+_PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
+_PROVIDER_TPD_COOLDOWN_SEC = float(os.getenv("LLM_PROVIDER_TPD_COOLDOWN_SEC") or "180")
+
+
+def _mark_provider_cooldown(provider_name: str, *, seconds: float | None = None) -> None:
+    name = (provider_name or "").strip().lower()
+    if not name:
+        return
+    wait = float(seconds) if seconds is not None else _PROVIDER_TPD_COOLDOWN_SEC
+    until = time.monotonic() + max(15.0, wait)
+    prev = float(_PROVIDER_COOLDOWN_UNTIL.get(name) or 0.0)
+    if until > prev:
+        _PROVIDER_COOLDOWN_UNTIL[name] = until
+        log_reasoning(f"LLM provider {name} cooldown {wait:.0f}s (rate/TPD).")
+
+
+def _provider_on_cooldown(provider_name: str) -> bool:
+    name = (provider_name or "").strip().lower()
+    until = float(_PROVIDER_COOLDOWN_UNTIL.get(name) or 0.0)
+    if until <= 0:
+        return False
+    if time.monotonic() >= until:
+        _PROVIDER_COOLDOWN_UNTIL.pop(name, None)
+        return False
+    return True
+
+
+def filter_providers_not_on_cooldown(providers: list[dict]) -> list[dict]:
+    """Drop cooled-down providers; if all cooled, return original chain."""
+    if not providers:
+        return providers
+    alive = [p for p in providers if not _provider_on_cooldown(str(p.get("name") or ""))]
+    return alive if alive else list(providers)
+
 
 def _env(name: str) -> str:
     return (os.getenv(name) or "").strip()
@@ -199,6 +235,22 @@ def get_standard_fallback_chain(*, max_providers: int | None = None) -> list[dic
     return chain[:cap]
 
 
+def get_fast_chitchat_provider_chain(*, max_providers: int = 1) -> list[dict[str, Any]]:
+    """
+    Prefer Groq Instant for greeting/chitchat/OOD replies (~sub-2s) when configured,
+    then rest of admin/env chain. Does not change product/Brain routing providers.
+    """
+    chain = get_llm_provider_chain()
+    if not chain:
+        return []
+    prefer = (os.getenv("CHITCHAT_AI_PREFER_PROVIDER") or "groq").strip().lower()
+    preferred = [p for p in chain if (p.get("name") or "").strip().lower() == prefer]
+    rest = [p for p in chain if (p.get("name") or "").strip().lower() != prefer]
+    ordered = preferred + rest if preferred else list(chain)
+    cap = max(1, min(2, int(max_providers or 1)))
+    return ordered[:cap]
+
+
 def provider_chain_label(chain: list[dict[str, Any]] | None = None) -> str:
     """Human-readable chain for logs, e.g. groq→openai→gemini→deepseek."""
     specs = chain if chain is not None else get_standard_fallback_chain()
@@ -270,6 +322,14 @@ def llm_json_with_retry(
     for attempt in range(1, max_attempts + 1):
         try:
             try:
+                from services.chat_resilience import chat_turn_abandoned
+
+                if chat_turn_abandoned():
+                    set_last_llm_failure("deadline_abandoned")
+                    return None
+            except ImportError:
+                pass
+            try:
                 from services.chat_flow_telemetry import (
                     increment_llm_call,
                     llm_budget_exceeded,
@@ -286,9 +346,46 @@ def llm_json_with_retry(
                 pass
             session = requests.Session()
             session.trust_env = False
-            res = session.post(
-                url, headers=headers, json=req, timeout=(4, timeout_sec)
-            )
+            try:
+                read_to = float(timeout_sec)
+            except (TypeError, ValueError):
+                read_to = 12.0
+            # Chitchat/scope pass small timeouts (<=5s) — enforce them strictly.
+            # Brain/product keep their larger budgets (cap at 45s only as safety).
+            if read_to <= 5.0:
+                read_to = max(1.0, min(5.0, read_to))
+            else:
+                read_to = max(5.0, min(45.0, read_to))
+
+            def _do_post():
+                return session.post(
+                    url, headers=headers, json=req, timeout=(3.0, read_to)
+                )
+
+            # Wall-clock hard stop: some hosts ignore short socket timeouts.
+            # IMPORTANT: on timeout, shut down wait=False — otherwise context-manager
+            # shutdown(wait=True) blocks until the stuck HTTP finally returns (20–60s).
+            if read_to <= 5.0:
+                import concurrent.futures
+
+                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                try:
+                    fut = pool.submit(_do_post)
+                    try:
+                        res = fut.result(timeout=read_to + 0.75)
+                    except concurrent.futures.TimeoutError:
+                        set_last_llm_failure("timeout")
+                        log_reasoning(
+                            f"{provider_name} hard timeout ({read_to}s) — next provider."
+                        )
+                        return None
+                finally:
+                    try:
+                        pool.shutdown(wait=False, cancel_futures=True)
+                    except TypeError:
+                        pool.shutdown(wait=False)
+            else:
+                res = _do_post()
             if res.status_code == 200:
                 body = res.json()
                 content = (
@@ -322,6 +419,7 @@ def llm_json_with_retry(
                 if "tokens per day" in low or "tpd" in low or "token limit" in low:
                     log_reasoning(f"{provider_name} daily token limit exceeded — skip retries.")
                     _safe_print(f"{provider_name} API Error: {text[:400]}")
+                    _mark_provider_cooldown(provider_name)
                     return None
                 if attempt < max_attempts and attempt == 1:
                     wait_sec = min(2.0, _extract_retry_wait_seconds(text))
@@ -330,6 +428,8 @@ def llm_json_with_retry(
                     )
                     time.sleep(wait_sec)
                     continue
+                # Short RPM cooldown so the next call in the chain / turn skips this provider.
+                _mark_provider_cooldown(provider_name, seconds=min(45.0, _extract_retry_wait_seconds(text) + 5.0))
                 return None
             if is_json_fail and attempt < max_attempts:
                 prev = int(req.get("max_tokens", 300) or 300)
@@ -381,6 +481,7 @@ def llm_json_with_provider_fallback(
             "GEMINI_API_KEY, and/or DEEPSEEK_API_KEY."
         )
         return None
+    providers = filter_providers_not_on_cooldown(providers)
     if len(providers) > 1:
         log_reasoning(
             f"LLM fallback chain: {' → '.join(p.get('name') or '?' for p in providers)}"

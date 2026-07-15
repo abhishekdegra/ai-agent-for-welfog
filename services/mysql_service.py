@@ -7,7 +7,16 @@ from secrets import token_hex
 
 import pymysql
 
+from services.env_loader import (
+    ensure_dotenv_loaded,
+    mysql_connect_kwargs,
+    mysql_database_name,
+)
+
+ensure_dotenv_loaded()
+
 # One collation everywhere — avoids MySQL 8 (utf8mb4_0900_ai_ci) vs XAMPP/legacy (general_ci) mix errors.
+# Not a secret — UTF8 collation name only (override via MYSQL_COLLATION in .env).
 MYSQL_COLLATION = (os.getenv("MYSQL_COLLATION") or "utf8mb4_unicode_ci").strip()
 
 
@@ -17,25 +26,18 @@ def sql_collate(expr: str) -> str:
 
 
 def get_mysql_connection():
-    """Public chat history MySQL (XAMPP). Override via .env: MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE."""
+    """
+    Public chat history MySQL — credentials only from support/.env
+    (MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE).
+    """
     try:
-        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT", "10") or "10")
-        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT", "30") or "30")
-        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT", "30") or "30")
+        kwargs = mysql_connect_kwargs(with_database=True)
+        if not kwargs:
+            return None
         return pymysql.connect(
-            host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-            port=int(os.getenv("MYSQL_PORT", "3306")),
-            user=os.getenv("MYSQL_USER", "root"),
-            password=os.getenv("MYSQL_PASSWORD", ""),
-            database=os.getenv("MYSQL_DATABASE", "welfog_ai"),
-            charset="utf8mb4",
-            collation=MYSQL_COLLATION,
-            init_command=f"SET NAMES utf8mb4 COLLATE {MYSQL_COLLATION}",
+            **kwargs,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-            write_timeout=write_timeout,
         )
     except Exception as e:
         # Avoid emoji in logs (Windows console encoding can crash on unicode)
@@ -44,26 +46,19 @@ def get_mysql_connection():
 
 
 def _ensure_mysql_database_exists() -> bool:
-    """Create welfog_ai (or MYSQL_DATABASE) if missing — common fresh XAMPP setup."""
-    db_name = (os.getenv("MYSQL_DATABASE") or "welfog_ai").strip()
+    """Create MYSQL_DATABASE if missing — common fresh XAMPP setup."""
+    db_name = mysql_database_name()
     if not db_name:
+        print("MySQL: MYSQL_DATABASE missing in support/.env")
         return False
     try:
-        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT", "10") or "10")
-        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT", "30") or "30")
-        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT", "30") or "30")
+        kwargs = mysql_connect_kwargs(with_database=False)
+        if not kwargs:
+            return False
         conn = pymysql.connect(
-            host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-            port=int(os.getenv("MYSQL_PORT", "3306")),
-            user=os.getenv("MYSQL_USER", "root"),
-            password=os.getenv("MYSQL_PASSWORD", ""),
-            charset="utf8mb4",
-            collation=MYSQL_COLLATION,
+            **kwargs,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=True,
-            connect_timeout=connect_timeout,
-            read_timeout=read_timeout,
-            write_timeout=write_timeout,
         )
         try:
             with conn.cursor() as cur:
@@ -156,7 +151,9 @@ def _create_chat_tables(cur) -> None:
 
 def _align_chat_collations(cur) -> None:
     """Normalize existing tables so JOIN/CAST comparisons do not mix collations."""
-    db_name = os.getenv("MYSQL_DATABASE", "welfog_ai")
+    db_name = mysql_database_name()
+    if not db_name:
+        return
     try:
         cur.execute(
             f"ALTER DATABASE `{db_name}` CHARACTER SET utf8mb4 COLLATE {MYSQL_COLLATION}"
@@ -177,11 +174,13 @@ def _align_chat_collations(cur) -> None:
 def _remove_orphan_innodb_files() -> bool:
     """
     XAMPP #1813: .ibd files left on disk without valid table metadata.
-    Safe only for chat tables in welfog_ai (no other tables in that folder).
+    Safe only for chat tables in MYSQL_DATABASE (no other tables in that folder).
     """
-    db_name = os.getenv("MYSQL_DATABASE", "welfog_ai")
+    db_name = mysql_database_name()
+    if not db_name:
+        return False
     data_dirs = [
-        Path(os.getenv("MYSQL_DATA_DIR", "")),
+        Path(os.getenv("MYSQL_DATA_DIR") or ""),
         Path(f"C:/xampp/mysql/data/{db_name}"),
         Path(f"C:/XAMPP/mysql/data/{db_name}"),
     ]
@@ -209,15 +208,13 @@ def _remove_orphan_innodb_files() -> bool:
 
 def _recreate_welfog_ai_database() -> None:
     """Drop + recreate DB when InnoDB tablespace files are orphaned (XAMPP #1813 / #1932)."""
-    db_name = os.getenv("MYSQL_DATABASE", "welfog_ai")
+    db_name = mysql_database_name()
+    kwargs = mysql_connect_kwargs(with_database=False)
+    if not db_name or not kwargs:
+        print("MySQL: cannot recreate database — check support/.env MYSQL_* keys.")
+        return
     conn = pymysql.connect(
-        host=os.getenv("MYSQL_HOST", "127.0.0.1"),
-        port=int(os.getenv("MYSQL_PORT", "3306")),
-        user=os.getenv("MYSQL_USER", "root"),
-        password=os.getenv("MYSQL_PASSWORD", ""),
-        charset="utf8mb4",
-        collation=MYSQL_COLLATION,
-        init_command=f"SET NAMES utf8mb4 COLLATE {MYSQL_COLLATION}",
+        **kwargs,
         cursorclass=pymysql.cursors.DictCursor,
         autocommit=True,
     )

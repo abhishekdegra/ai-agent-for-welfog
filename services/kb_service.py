@@ -232,6 +232,9 @@ def _looks_like_faq_question_line(line: str) -> bool:
     )
     if not s:
         return False
+    # Section headings ("How to return…:") are not FAQ question echoes.
+    if s.endswith(":") and not s.endswith("?:") and "?" not in s:
+        return False
     if s.endswith("?:") or (s.endswith("?") and 10 <= len(s) <= 240):
         return True
     if 12 <= len(s) <= 120 and re.match(
@@ -267,8 +270,12 @@ def _chunk_is_agent_instruction_blob(chunk: str) -> bool:
     low = plain.lower()
     if "support rules" in low or "social media links — support rules" in low:
         return True
+    if "social media links" in low and ("support rule" in low or "never invent" in low):
+        return True
     if re.search(
-        r"\bnever invent\b|\bonly share welfog\b|\bpolitely decline\b|\brouting rule\b",
+        r"\bnever invent\b|\bonly share welfog\b|\bpolitely decline\b|\brouting rule\b|"
+        r"\bnever guess handles\b|\bgive only the requested platform\b|"
+        r"\bif user asks for welfog social\b|\bfor other brands\b.*\bdecline\b",
         low,
     ):
         return True
@@ -276,10 +283,15 @@ def _chunk_is_agent_instruction_blob(chunk: str) -> bool:
     agent_bullets = sum(
         1
         for ln in lines
-        if re.match(r"^-\s+if user", ln, re.I) or re.match(r"^-\s+follow-up", ln, re.I)
+        if re.match(r"^-\s+if user", ln, re.I)
+        or re.match(r"^-\s+follow-up", ln, re.I)
+        or re.match(r"^—\s+only share", ln, re.I)
+        or re.match(r"^-\s+only share", ln, re.I)
     )
     if agent_bullets >= 2:
         return True
+    # Do NOT drop real customer policy (content rules use never/must).
+    # Only agent playbooks with explicit routing shape.
     return False
 
 
@@ -347,6 +359,27 @@ def _split_faq_qa_chunks(text: str) -> list[str]:
     return out
 
 
+def _kb_block_has_identity_markers(text: str) -> bool:
+    """Owner/about markers — used during chunk split (must stay above load index)."""
+    low = re.sub(r"<br\s*/?>", " ", (text or "").lower())
+    return bool(
+        re.search(
+            r"\b(owner|founder|co-?founder|ceo|about welfog|our story)\b",
+            low,
+        )
+    )
+
+
+def _kb_block_has_address_markers(text: str) -> bool:
+    """Postal address markers without identity facts."""
+    if _kb_block_has_identity_markers(text):
+        return False
+    low = re.sub(r"<br\s*/?>", " ", (text or "").lower())
+    return any(
+        x in low for x in ("address", "plot", "pin code", "pincode", "street", "colony")
+    )
+
+
 def _split_kb_chunks(text: str, file_key: str = ""):
     """
     Split knowledge files into embedding chunks. Short title-only blocks are merged
@@ -372,8 +405,20 @@ def _split_kb_chunks(text: str, file_key: str = ""):
     merged = []
     acc = parts[0]
     for p in parts[1:]:
+        # Never glue identity/owner facts onto a postal address block —
+        # that made "who is the owner" miss after address demotion.
         if len(acc) < 160:
-            acc = acc + "<br><br>" + p
+            if (
+                _kb_block_has_identity_markers(acc)
+                and _kb_block_has_address_markers(p)
+            ) or (
+                _kb_block_has_address_markers(acc)
+                and _kb_block_has_identity_markers(p)
+            ):
+                merged.append(acc)
+                acc = p
+            else:
+                acc = acc + "<br><br>" + p
         else:
             merged.append(acc)
             acc = p
@@ -805,10 +850,20 @@ def _extract_kb_sections_from_blob(blob: str) -> list[tuple[str, str]]:
             continue
         if stripped == ":":
             continue
+        # Numbered how-to steps (1) Log in…) are BODY, not section titles.
+        # Only treat numbered lines as headings when they are short titles ending with ':'.
+        numbered_title = bool(
+            re.match(r"^\d+[.)]\s+.+:\s*$", stripped) and len(stripped) < 90
+        )
         is_heading = bool(
             re.match(r"^[A-Z0-9][^:\n]{2,100}:\s*$", stripped)
-            or re.match(r"^\d+\)\s+", stripped)
-            or (stripped.endswith(":") and len(stripped) < 90 and not stripped.startswith("-"))
+            or numbered_title
+            or (
+                stripped.endswith(":")
+                and len(stripped) < 90
+                and not stripped.startswith("-")
+                and not re.match(r"^\d+[.)]\s+", stripped)
+            )
             or (stripped.endswith("?") and 12 <= len(stripped) <= 220)
         )
         if is_heading:
@@ -851,14 +906,174 @@ def _question_phrase_hints(question: str) -> list[str]:
     return hints
 
 
-def _infer_kb_answer_budget(question: str) -> tuple[int, int, int]:
-    """Short question → short answer. Returns (max_chars, max_lines, max_sections)."""
-    word_count = len(re.findall(r"\w+", question or ""))
-    if word_count <= 8:
-        return 480, 3, 1
-    if word_count <= 14:
-        return 620, 4, 2
-    return 780, 5, 3
+def _brain_focus_text(question: str, ai_route: dict | None = None) -> str:
+    """English focus string from Brain meaning (preferred) or retrieval query."""
+    if isinstance(ai_route, dict):
+        meaning = (ai_route.get("user_meaning") or "").strip()
+        if meaning:
+            return meaning
+    return (question or "").strip()
+
+
+def _brain_english_meaning_is_narrow_fact(ai_route: dict | None) -> bool:
+    """
+    Single-fact asks only (owner / contact / social).
+
+    Never treat short policy/how-to meanings as "narrow" — that caused
+    "Refund Policy:" stubs and half-step replies. Word-count heuristics are
+    forbidden; Brain intent + meaning helpers decide.
+    """
+    if not isinstance(ai_route, dict):
+        return False
+    intent = (ai_route.get("intent") or "").strip().lower()
+    if intent in ("owner", "contact", "social", "social_media"):
+        return True
+    if _brain_meaning_asks_contact(ai_route) or _brain_meaning_asks_social(ai_route):
+        return True
+    if _brain_meaning_asks_owner_name(ai_route):
+        return True
+    return False
+
+
+def _infer_kb_answer_budget(
+    question: str, *, ai_route: dict | None = None
+) -> tuple[int, int, int]:
+    """Narrow identity facts → short. Policy/how-to → full section room."""
+    if _brain_english_meaning_is_narrow_fact(ai_route):
+        return 420, 4, 1
+    # Default room for complete FAQ/policy bodies (admin docs may be long).
+    return 1100, 14, 2
+
+
+def _is_kb_heading_only_line(line: str) -> bool:
+    """True for bare titles like 'Refund Policy:' with no answer prose."""
+    s = (line or "").strip()
+    if not s:
+        return True
+    if _looks_like_kb_metadata_label(s) or _looks_like_faq_question_line(s):
+        return True
+    if s.endswith(":") and len(s) <= 90:
+        return True
+    # Short title-like line without sentence punctuation.
+    if len(s) <= 48 and not re.search(r"[.!?。]", s) and not re.match(r"^\d+[.)]\s+", s):
+        words = re.findall(r"[A-Za-z]+", s)
+        if words and sum(1 for w in words if w[:1].isupper()) >= max(1, len(words) - 1):
+            return True
+    return False
+
+
+def _looks_like_kb_gap_reply(text: str) -> bool:
+    """True for honest 'not in KB' fallbacks — must not short-circuit better paths."""
+    plain = re.sub(r"<[^>]+>", " ", text or "")
+    plain = re.sub(r"\s+", " ", plain).strip().lower()
+    if not plain:
+        return True
+    markers = (
+        "don't have that specific detail",
+        "do not have that specific detail",
+        "couldn't find this in welfog",
+        "could not find this in welfog",
+        "not in the available knowledge",
+        "not in welfog's current knowledge",
+        "current knowledge base right now",
+    )
+    return any(m in plain for m in markers)
+
+
+def _kb_answer_body_is_usable(text: str, *, min_chars: int = 28) -> bool:
+    """Reject heading-only / empty extractive slices before they reach the customer."""
+    plain = re.sub(r"<[^>]+>", " ", text or "")
+    plain = re.sub(r"\s+", " ", plain).strip()
+    if not plain or len(plain) < min_chars:
+        return False
+    if _looks_like_kb_gap_reply(plain):
+        return False
+    if _is_kb_heading_only_line(plain):
+        return False
+    # Title + almost nothing ("Refund Policy: yes") is still useless.
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    body_lines = [ln for ln in lines if not _is_kb_heading_only_line(ln)]
+    if not body_lines:
+        return False
+    body = " ".join(body_lines).strip()
+    return len(body) >= min_chars
+
+
+def _looks_like_step_list(text: str) -> bool:
+    """Numbered / bullet how-to blocks — keep contiguous steps in document order."""
+    lines = [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
+    numbered = sum(1 for ln in lines if re.match(r"^\d+[.)]\s+\S", ln))
+    bullets = sum(1 for ln in lines if re.match(r"^[-•]\s+\S", ln))
+    return numbered >= 2 or bullets >= 2
+
+
+def _excerpt_preserving_structure(text: str, max_chars: int, max_lines: int) -> str:
+    """
+    Truncate by budget but never leave a heading-only answer, and never scramble
+    step order (1) then later 3) without 2).
+    """
+    plain = (text or "").strip()
+    if not plain:
+        return ""
+    lines = [ln.rstrip() for ln in plain.splitlines() if ln.strip()]
+    if not lines:
+        return ""
+    # Drop leading bare headings with no following body in the kept window.
+    while lines and _is_kb_heading_only_line(lines[0]) and len(lines) > 1:
+        # Keep heading if next line is body; only drop if heading is alone later.
+        break
+    if _looks_like_step_list(plain):
+        kept: list[str] = []
+        total = 0
+        started = False
+        for ln in lines:
+            is_step = bool(
+                re.match(r"^\d+[.)]\s+\S", ln) or re.match(r"^[-•]\s+\S", ln)
+            )
+            if _is_kb_heading_only_line(ln) and not is_step:
+                # Skip leading bare titles; stop at the next section once we have body.
+                if kept and started:
+                    break
+                if not kept:
+                    continue
+                # Mid-block title with no body yet — skip.
+                continue
+            if total + len(ln) > max_chars and kept:
+                break
+            kept.append(ln)
+            total += len(ln) + 1
+            started = True
+            if len(kept) >= max_lines:
+                break
+        out = "\n".join(kept).strip()
+        if out and not _is_kb_heading_only_line(out):
+            return out
+    # Prose / FAQ answer: keep document order, skip orphan titles / next sections.
+    kept = []
+    total = 0
+    started = False
+    for i, ln in enumerate(lines):
+        if _is_kb_heading_only_line(ln):
+            if started and kept:
+                # Next FAQ/policy heading — stop (avoid gluing unrelated sections).
+                break
+            nxt = lines[i + 1] if i + 1 < len(lines) else ""
+            if not kept and nxt and not _is_kb_heading_only_line(nxt):
+                kept.append(ln)
+                total += len(ln) + 1
+            continue
+        if total + len(ln) > max_chars and kept:
+            break
+        kept.append(ln)
+        total += len(ln) + 1
+        started = True
+        if len(kept) >= max_lines:
+            break
+    out = "\n".join(kept).strip()
+    # Never ship a heading-only reply.
+    if out and _is_kb_heading_only_line(out):
+        return ""
+    return out
 
 
 def _score_kb_section_relevance(question: str, title: str, body: str) -> float:
@@ -886,17 +1101,9 @@ def _strip_leading_faq_question(text: str) -> str:
     if not raw:
         return ""
 
-    # Inline: "Question?<br>Answer" (common in FAQ chunks)
+    # Never use DOTALL across paragraphs — glued FAQ pairs would lose the first answer
+    # (cancel answer eaten because a later "?" begins the next FAQ).
     inline = re.sub(r"<br\s*/?>", "\n", raw, flags=re.I).strip()
-    for pat in (
-        r"^(.{10,240}\?)\s*:\s*(.+)$",
-        r"^(.{10,240}\?)\s*\n+\s*(.+)$",
-        r"^(.{10,240}\?)\s+(.{15,})$",
-    ):
-        m = re.match(pat, inline, re.DOTALL)
-        if m:
-            return m.group(2).strip()
-
     lines = [ln.strip() for ln in inline.splitlines() if ln.strip()]
     if not lines:
         return inline
@@ -905,6 +1112,11 @@ def _strip_leading_faq_question(text: str) -> str:
         rest = "\n".join(lines[1:]).strip()
         if rest:
             return rest
+    # Single-line "Question? Answer" on the same line only.
+    if "?" in first and "\n" not in first:
+        m = re.match(r"^(.{10,240}\?)\s*:?\s+(.{15,})$", first)
+        if m and _looks_like_faq_question_line(m.group(1).strip()):
+            return m.group(2).strip()
     return inline
 
 
@@ -932,8 +1144,12 @@ def _strip_kb_policy_heading_prefix(text: str) -> str:
                 continue
         if _looks_like_faq_question_line(s) and not re.match(r"^\d+\)", s) and not s.startswith(("-", "•")):
             continue
+        # Only drop seller/vendor label lines — never drop real how-to section titles
+        # like "How to return on Welfog (app or website):".
         if has_steps and len(s) < 100 and not re.match(r"^\d+\)", s) and not s.startswith(("-", "•")):
-            if re.search(r"\b(supplier|vendor|seller account)\b", s, re.I) or s.endswith(")"):
+            if re.search(r"\b(supplier|vendor|seller account)\b", s, re.I):
+                continue
+            if s.endswith(")") and not s.endswith(":"):
                 continue
         out.append(ln)
     return "\n".join(out).strip() if out else (text or "").strip()
@@ -956,21 +1172,20 @@ def _strip_trailing_faq_questions(text: str) -> str:
 
 
 def _format_kb_section_block(title: str, body: str) -> str:
-    """Join admin KB section — never prefix FAQ questions as 'Question?: answer'."""
+    """Join admin KB section — never emit a bare heading with empty body."""
     t = (title or "").strip()
     b = (body or "").strip()
     if _looks_like_kb_metadata_label(t):
         t = ""
     if not b:
-        if _looks_like_faq_question_line(t):
-            return ""
-        return t
+        # Heading-only is not a customer answer.
+        return ""
     if not t or _looks_like_faq_question_line(t):
         return b
     if b.lower().startswith(t.lower()):
         return b
     if len(t) < 80 and not t.endswith("?"):
-        return f"{t}: {b}"
+        return f"{t}:\n{b}"
     return b
 
 
@@ -1105,33 +1320,37 @@ def _kb_excerpt_is_english_for_customer(plain: str, reply_lang: str) -> bool:
     return _looks_english_only_latin(text)
 
 
-def _finalize_kb_customer_reply(body: str, original_msg: str, lang: str) -> str:
-    """KB-sourced reply — localize to customer's language/script when KB text is English."""
+def _finalize_kb_customer_reply(
+    body: str, original_msg: str, lang: str, *, ai_route: dict | None = None
+) -> str:
+    """KB-sourced reply — match customer language via AI polish (no language keyword maps)."""
     from services.translation_service import (
-        _looks_english_only_latin,
         finalize_customer_reply,
         resolve_customer_reply_lang,
+        _reply_needs_style_rewrite,
     )
 
     if not (body or "").strip():
         return ""
-    rl = resolve_customer_reply_lang(original_msg, lang)
-    plain = re.sub(r"<[^>]+>", " ", body or "")
-    plain = re.sub(r"\s+", " ", plain).strip()
-    if (
-        _kb_multilingual_answer_enabled()
-        and _customer_needs_kb_localization(original_msg, rl)
-        and plain
-        and _kb_excerpt_is_english_for_customer(plain, rl)
-    ):
-        grounded = _ground_kb_excerpt_for_customer(
-            original_msg,
-            plain,
-            reply_lang=rl,
+    brain_lang = ""
+    if isinstance(ai_route, dict):
+        brain_lang = str(ai_route.get("reply_lang") or "").strip()
+    rl = resolve_customer_reply_lang(original_msg, brain_lang or lang)
+    # Bounded rewrite when English KB ≠ customer style. LLM reads CUSTOMER WROTE
+    # and matches language — no Hinglish/English phrase hardcoding here.
+    allow_rewrite = False
+    try:
+        allow_rewrite = bool(_reply_needs_style_rewrite(body, rl, original_msg))
+    except Exception:
+        allow_rewrite = False
+    out = finalize_customer_reply(
+        body, original_msg, rl, allow_llm_style_rewrite=allow_rewrite
+    )
+    if allow_rewrite and out and not _rewrite_preserves_kb_facts(body, out):
+        return finalize_customer_reply(
+            body, original_msg, rl, allow_llm_style_rewrite=False
         )
-        if grounded and grounded.strip():
-            return finalize_customer_reply(grounded, original_msg, rl)
-    return finalize_customer_reply(body, original_msg, rl)
+    return out
 
 
 def _title_from_filtered_kb_text(filtered: str) -> str:
@@ -1148,159 +1367,301 @@ def _title_from_filtered_kb_text(filtered: str) -> str:
     return ""
 
 
-def _kb_focus_profile(question: str) -> tuple[set[str], set[str], int]:
+def _kb_focus_profile(
+    question: str, *, ai_route: dict | None = None
+) -> tuple[set[str], set[str], int]:
     """
-    Generic intent disambiguation only (place order vs return vs track).
-    No hardcoded file/topic names — admin KB headings drive content selection.
+    Section budget only — no topic include/exclude keyword maps.
+    Matching is Brain meaning + embeddings over live admin KB text.
     """
-    q = f" {(question or '').lower()} "
-    include: set[str] = set()
-    exclude: set[str] = set()
-    _, _, max_sections = _infer_kb_answer_budget(question)
+    _, _, max_sections = _infer_kb_answer_budget(question, ai_route=ai_route)
+    return set(), set(), max_sections
 
-    asks_place_order = any(
-        x in q
-        for x in (
-            "how to place order", "place order", "order kaise", "order kese", "checkout",
-            "add to cart", "new order", "order karu", "order karna",
-        )
+
+def _filter_kb_blob_fast(
+    blob: str,
+    question: str,
+    *,
+    max_chars: int | None = None,
+    ai_route: dict | None = None,
+) -> str:
+    """
+    Fast extractive slice after Qdrant ranked the chunk.
+
+    Prefer best section by Brain meaning; keep step lists / policy bodies intact.
+    Never return a bare heading. Aggressive sentence trim only for true narrow facts.
+    """
+    if _chunk_is_agent_instruction_blob(blob):
+        return ""
+    display = _strip_kb_blob_for_display(blob)
+    if not display.strip() or _chunk_is_agent_instruction_blob(display):
+        return ""
+    budget_chars, budget_lines, budget_sections = _infer_kb_answer_budget(
+        question, ai_route=ai_route
     )
-    asks_return = any(x in q for x in ("return", "refund", "replacement", "wrong item", "damaged"))
-    asks_track = any(x in q for x in ("track", "tracking", "order status", "where is my order"))
-    asks_history = any(x in q for x in ("order history", "past order", "my orders", "purane order"))
-    asks_refund_timeline = any(
-        x in q
-        for x in (
-            "money back", "get my money", "when will i get", "how many days", "how long",
-            "kitne din", "kab milega", "kab aayega", "kab milenge", "timeline", "processing time",
-            "business days", "vapasi", "paise wapas", "paise kab",
+    if max_chars is None:
+        max_chars = budget_chars
+
+    plain = _strip_leading_faq_question(display)
+    plain = _strip_kb_policy_heading_prefix(plain)
+    identity = _brain_meaning_asks_company_identity(ai_route)
+    focus = _brain_focus_text(question, ai_route)
+    narrow = _brain_english_meaning_is_narrow_fact(ai_route)
+
+    # Narrow facts: pick best sentence(s). How-to / policy: keep structure.
+    if narrow:
+        focused_plain = _prefer_fact_lines_for_question(
+            plain, question, ai_route=ai_route, force=True
         )
+        if focused_plain and focused_plain.strip() and not _is_kb_heading_only_line(
+            focused_plain
+        ):
+            return _kb_plain_excerpt(focused_plain, max_chars=max_chars)
+
+    sections = _extract_kb_sections_from_blob(plain)
+    if not sections:
+        if identity and _chunk_looks_like_address_block(plain):
+            return ""
+        structured = _excerpt_preserving_structure(plain, max_chars, budget_lines)
+        return structured or _kb_plain_excerpt(plain, max_chars=max_chars)
+
+    scored: list[tuple[float, str, str]] = []
+    for title, body in sections:
+        if not body and not title:
+            continue
+        # Skip empty-body headings — they produce "Refund Policy:" only replies.
+        if not (body or "").strip():
+            continue
+        hay = f"{title} {body}".lower()
+        if identity and any(
+            x in hay for x in ("plot-", "pin code", "pincode", "sirsi", "sukhijha")
+        ) and not _chunk_has_identity_fact(hay):
+            continue
+        score = _score_kb_section_relevance(focus or question, title, body)
+        # How-to meanings should prefer sections that actually contain step lists.
+        fl = (focus or question or "").lower()
+        if re.search(r"\b(how to|how do|how can|steps?|procedure)\b", fl):
+            if _looks_like_step_list(body) or _looks_like_step_list(f"{title}\n{body}"):
+                score += 2.8
+        if score > 0.05 or len(sections) == 1:
+            scored.append((score if score > 0 else 0.1, title, body))
+
+    if not scored:
+        # Fall back to whole blob with structure (e.g. FAQ Q&A without heading sections).
+        structured = _excerpt_preserving_structure(plain, max_chars, budget_lines)
+        if structured:
+            return structured
+        focused = _prefer_fact_lines_for_question(
+            plain, question, ai_route=ai_route, force=True
+        )
+        if focused and not _is_kb_heading_only_line(focused):
+            return _kb_plain_excerpt(focused, max_chars=max_chars)
+        return _kb_plain_excerpt(plain, max_chars=max_chars)
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    fl = (focus or question or "").lower()
+    howto_ask = bool(
+        re.search(r"\b(how to|how do|how can|steps?|procedure|guide)\b", fl)
     )
-
-    if asks_refund_timeline and not (asks_place_order or asks_track):
-        include |= {"refund", "processing", "business days", "money back", "returned item"}
-        exclude |= {
-            "fraud",
-            "fake caller",
-            "password",
-            "otp",
-            "cvv",
-            "prize",
-            "place order",
-            "tracking",
-            "bank account update",
-            "payment methods",
-            "payment method does",
-        }
-        max_sections = min(max_sections, 2)
-    elif asks_place_order and not (asks_return or asks_track or asks_history):
-        include |= {"place order", "checkout", "add to cart", "new order", "order kaise"}
-        exclude |= {"return", "refund", "replacement", "tracking", "track", "order history"}
-        max_sections = min(max_sections, 2)
-    elif asks_return and not (asks_place_order or asks_track):
-        include |= {"return", "refund", "replacement", "damaged", "wrong item"}
-        exclude |= {"place order", "checkout", "tracking", "order history"}
-        max_sections = min(max_sections, 2)
-    elif asks_track and not (asks_place_order or asks_return):
-        include |= {"track", "tracking", "order status", "shipment", "courier"}
-        exclude |= {"place order", "checkout", "return", "refund", "order history"}
-        max_sections = min(max_sections, 2)
-    elif asks_history and not (asks_place_order or asks_return or asks_track):
-        include |= {"order history", "my orders", "past order", "invoice"}
-        exclude |= {"place order", "checkout", "return", "refund", "tracking"}
-        max_sections = min(max_sections, 2)
-
-    asks_seller_create = any(
-        x in q
-        for x in (
-            "create seller", "seller account", "become seller", "become a seller",
-            "register", "registration", "seller bana", "seller ban", "account create",
-            "account bana", "sell on", "new seller", "how to create",
+    # How-to asks: pick the best step-list section as the answer (avoid pairing
+    # a short related policy blurb that would bury or truncate steps).
+    if howto_ask:
+        step_ranked = [
+            s
+            for s in scored
+            if _looks_like_step_list(s[2])
+            or _looks_like_step_list(f"{s[1]}\n{s[2]}")
+        ]
+        if step_ranked:
+            scored = step_ranked
+    # Prefer one clear best section. Only merge a second when scores are close
+    # and the top section is not already a full how-to / policy body.
+    take_n = 1
+    if len(scored) >= 2 and budget_sections >= 2:
+        top_sc, top_title, top_body = scored[0]
+        second_sc = scored[1][0]
+        top_block = f"{top_title}\n{top_body}"
+        top_is_complete = (
+            _looks_like_step_list(top_body)
+            or _looks_like_step_list(top_block)
+            or len((top_body or "").strip()) >= 120
         )
-    )
-    asks_grievance = any(
-        x in q
-        for x in (
-            "grievance officer",
-            "grievance email",
-            "chief compliance",
-            "formal complaint",
-            "legal grievance",
+        if (not top_is_complete) and (top_sc - second_sc) < 1.2:
+            take_n = 2
+    parts: list[str] = []
+    total = 0
+    for _, title, body in scored[:take_n]:
+        block = _format_kb_section_block(title, body)
+        if not block.strip() or _is_kb_heading_only_line(block):
+            # Body alone if title formatting failed.
+            block = (body or "").strip()
+        if not block.strip():
+            continue
+        if total + len(block) > max_chars and parts:
+            break
+        parts.append(block)
+        total += len(block)
+    out = "\n\n".join(parts).strip() or plain
+
+    # Never scramble how-to steps with line re-ranking.
+    if narrow and not _looks_like_step_list(out):
+        focused = _prefer_fact_lines_for_question(
+            out, question, ai_route=ai_route, force=True
         )
-    )
-    if asks_grievance:
-        include |= {"grievance", "compliance", "tripti", "grievance@"}
-        exclude |= {"place order", "track order", "checkout", "my orders"}
-        max_sections = min(max_sections, 2)
+        if focused and not _is_kb_heading_only_line(focused):
+            out = focused
 
-    asks_seller_login = any(
-        x in q
-        for x in (
-            "login problem", "login fail", "login nahi", "login nhi", "login error",
-            "sign in", "log in", "otp", "cannot login", "can't login",
-        )
-    ) or ("login" in q and "seller" in q and not asks_seller_create)
-    if asks_seller_create and not asks_seller_login:
-        include |= {"create", "register", "registration", "become seller", "seller account"}
-        exclude |= {"login problem", "login fail", "otp", "clear app cache", "same mobile"}
-        max_sections = min(max_sections, 2)
-    elif asks_seller_login and not asks_seller_create:
-        include |= {"login", "otp", "sign in", "login problem"}
-        exclude |= {"how to create", "register", "registration", "become seller"}
-
-    return include, exclude, max_sections
+    structured = _excerpt_preserving_structure(out, max_chars, budget_lines)
+    if structured and not _is_kb_heading_only_line(structured):
+        return structured
+    # Last resort: full best body clipped (still better than a bare title).
+    for _, title, body in scored:
+        b = (body or "").strip()
+        if b and not _is_kb_heading_only_line(b):
+            return _kb_plain_excerpt(b, max_chars=max_chars)
+    return _kb_plain_excerpt(plain, max_chars=max_chars)
 
 
-def _filter_kb_blob_for_question(blob: str, question: str, *, max_chars: int | None = None) -> str:
+def _meaning_line_score(focus: str, line: str, *, emb: float | None = None) -> float:
+    """Score a KB line against Brain meaning — embeddings + dynamic token overlap."""
+    if not (focus or "").strip() or not (line or "").strip():
+        return 0.0
+    if _looks_like_faq_question_line(line) or _looks_like_kb_metadata_label(line):
+        return -1.0
+    if emb is None:
+        emb = _embedding_similarity(focus[:400], line[:500])
+    overlap = _token_overlap_ratio(focus, line)
+    return (float(emb) * 4.0) + (overlap * 2.5)
+
+
+def _batch_meaning_line_scores(focus: str, lines: list[str]) -> list[tuple[float, str]]:
+    """Score many lines with one embed batch when possible."""
+    usable = [
+        ln
+        for ln in lines
+        if ln.strip()
+        and not _looks_like_faq_question_line(ln)
+        and not _looks_like_kb_metadata_label(ln)
+    ]
+    if not usable or not (focus or "").strip():
+        return []
+    emb_map: dict[str, float] = {}
+    try:
+        vecs = encode_texts([focus[:400]] + [ln[:500] for ln in usable])
+        if vecs is not None and len(vecs) == len(usable) + 1:
+            sims = cosine_similarity(vecs[0:1], vecs[1:])[0]
+            for ln, sim in zip(usable, sims):
+                emb_map[ln] = float(sim)
+    except Exception:
+        emb_map = {}
+    return [
+        (_meaning_line_score(focus, ln, emb=emb_map.get(ln)), ln) for ln in usable
+    ]
+
+
+def _prefer_fact_lines_for_question(
+    text: str,
+    question: str,
+    *,
+    ai_route: dict | None = None,
+    force: bool = False,
+) -> str:
+    """
+    Keep sentences that best match Brain English meaning (embedding + overlap).
+    Works for any admin-added topic — no cancel/return/shipping keyword maps.
+    """
+    plain = (text or "").strip()
+    if not plain:
+        return plain
+    focus = _brain_focus_text(question, ai_route) or (question or "").strip()
+    if not force and not _brain_english_meaning_is_narrow_fact(ai_route):
+        if not focus or len(re.split(r"(?<=[.!?])\s+|\n+", plain)) < 2:
+            return plain
+
+    lines = [ln.strip() for ln in plain.splitlines() if ln.strip()]
+    sents: list[str] = []
+    for ln in lines or [plain]:
+        parts = [s.strip() for s in re.split(r"(?<=[.!?])\s+", ln) if len(s.strip()) > 12]
+        sents.extend(parts if parts else ([ln] if ln else []))
+    if not sents:
+        return plain
+    if len(sents) == 1:
+        return sents[0]
+
+    ranked = sorted(_batch_meaning_line_scores(focus, sents), key=lambda x: x[0], reverse=True)
+    if not ranked:
+        return plain
+    # Never choose a bare heading as the "best fact".
+    ranked = [(sc, s) for sc, s in ranked if not _is_kb_heading_only_line(s)]
+    if not ranked:
+        return plain
+    best_sc, best = ranked[0]
+    if best_sc < 0.35:
+        return plain
+    margin = 0.12
+    top = [s for sc, s in ranked if sc >= best_sc - margin and sc >= 0.35][:2]
+    if _brain_meaning_asks_owner_name(ai_route):
+        id_lines = [s for s in top if _chunk_has_identity_fact(s)]
+        if id_lines:
+            top = id_lines[:1]
+    return "\n".join(top).strip() if top else plain
+
+
+def _filter_kb_blob_for_question(
+    blob: str,
+    question: str,
+    *,
+    max_chars: int | None = None,
+    ai_route: dict | None = None,
+) -> str:
     """
     Keep only KB sections/lines that match the user's question.
     Fully driven by live admin .txt content + embeddings — no topic names in code.
     """
+    if _chunk_is_agent_instruction_blob(blob):
+        return ""
     display = _strip_kb_blob_for_display(blob)
     if not display.strip():
         return ""
-    budget_chars, budget_lines, budget_sections = _infer_kb_answer_budget(question)
+    budget_chars, budget_lines, budget_sections = _infer_kb_answer_budget(
+        question, ai_route=ai_route
+    )
     if max_chars is None:
         max_chars = budget_chars
 
     sections = _extract_kb_sections_from_blob(display)
     if not sections:
-        hit = best_kb_hit(question, min_score=0.20)
+        hit = best_kb_hit(question, min_score=0.20, ai_route=ai_route)
         if hit and hit.get("chunk"):
             plain = re.sub(r"<br\s*/?>", "\n", hit["chunk"])
             return _kb_plain_excerpt(plain, max_chars=max_chars)
         return _kb_plain_excerpt(display, max_chars=max_chars)
 
-    include_terms, exclude_terms, max_sections = _kb_focus_profile(question)
+    _, _, max_sections = _kb_focus_profile(question, ai_route=ai_route)
     max_sections = min(max_sections, budget_sections)
+    focus = _brain_focus_text(question, ai_route) or question
     scored: list[tuple[float, str, str]] = []
     for title, body in sections:
         if not body and not title:
             continue
-        hay = f"{title} {body}".lower()
-        score = _score_kb_section_relevance(question, title, body)
-        if include_terms:
-            hit = sum(1 for t in include_terms if t in hay)
-            miss = sum(1 for t in exclude_terms if t in hay)
-            score += (2.5 * hit) - (1.7 * miss)
+        score = _score_kb_section_relevance(focus, title, body)
         if score > 0.05:
             scored.append((score, title, body))
 
     if not scored:
-        hit = best_kb_hit(question, min_score=0.18)
-        if hit and hit.get("chunk"):
-            plain = re.sub(r"<br\s*/?>", "\n", hit["chunk"])
-            return _kb_plain_excerpt(plain, max_chars=max_chars)
-        if len(sections) == 1:
-            t, b = sections[0]
-            block = f"{t}:\n{b}" if t else b
-            return _kb_plain_excerpt(block, max_chars=max_chars)
-        return _kb_plain_excerpt(display, max_chars=max_chars)
+        focused = _prefer_fact_lines_for_question(
+            display, question, ai_route=ai_route, force=True
+        )
+        return _kb_plain_excerpt(focused or display, max_chars=max_chars)
 
     scored.sort(key=lambda x: x[0], reverse=True)
     top_score = scored[0][0]
-    # Drop sections far below the best match — avoids dumping unrelated paragraphs.
-    scored = [(s, t, b) for s, t, b in scored if s >= top_score * 0.45]
+    # Drop sections far below the best match — avoids dumping unrelated paragraphs
+    # (discounts / social links glued onto a narrow reels/content question).
+    scored = [(s, t, b) for s, t, b in scored if s >= top_score * 0.72]
+    # Prefer a single best section for short / focused turns.
+    if max_sections > 1 and len(scored) > 1 and scored[0][0] >= (scored[1][0] + 0.8):
+        max_sections = 1
 
     parts: list[str] = []
     total = 0
@@ -1316,52 +1677,19 @@ def _filter_kb_blob_for_question(blob: str, question: str, *, max_chars: int | N
     if not out:
         return ""
 
-    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if not lines:
-        return out[:max_chars] if len(out) > max_chars else out
+    # Keep full best section for policy/how-to. Aggressive 1–2 line trim
+    # only for true narrow identity/contact facts (never for "Refund Policy").
+    if _brain_english_meaning_is_narrow_fact(ai_route) and not _looks_like_step_list(out):
+        focused = _prefer_fact_lines_for_question(
+            out, question, ai_route=ai_route, force=True
+        )
+        if focused and _kb_answer_body_is_usable(focused):
+            return _kb_plain_excerpt(focused, max_chars=max_chars)
 
-    phrase_hints = _question_phrase_hints(question)
-    short_tokens = _query_tokens_for_kb_filter(question)
-    scored_lines: list[tuple[float, str]] = []
-    for ln in lines:
-        if _looks_like_kb_metadata_label(ln):
-            continue
-        if _looks_like_faq_question_line(ln) and not any(
-            x in ln.lower()
-            for x in (" allows ", " accepts ", " offers ", " yes,", " welfog has ", " to ")
-        ):
-            continue
-        low = f" {ln.lower()} "
-        score = 0.0
-        for t in short_tokens:
-            if t in low:
-                score += 1.2
-        for phrase in phrase_hints:
-            if phrase in low:
-                score += 1.6
-        if re.search(r"\b\d{2,}\b", ln) or "@" in ln:
-            score += 0.5
-        score += _embedding_similarity(question, ln) * 1.5
-        if score > 0:
-            scored_lines.append((score, ln))
-
-    if not scored_lines:
-        return _kb_plain_excerpt(out, max_chars=max_chars)
-
-    scored_lines.sort(key=lambda x: x[0], reverse=True)
-    kept: list[str] = []
-    total = 0
-    for _, ln in scored_lines:
-        if ln in kept:
-            continue
-        if total + len(ln) > max_chars and kept:
-            break
-        kept.append(ln)
-        total += len(ln) + 1
-        if len(kept) >= budget_lines:
-            break
-    compact = "\n".join(kept).strip()
-    return compact[:max_chars] if len(compact) > max_chars else compact
+    structured = _excerpt_preserving_structure(out, max_chars, budget_lines)
+    if structured and _kb_answer_body_is_usable(structured):
+        return structured
+    return _kb_plain_excerpt(out, max_chars=max_chars)
 
 
 def build_kb_retrieval_query(
@@ -1382,6 +1710,8 @@ def build_kb_retrieval_query(
         resolve_customer_reply_lang,
         text_usable_as_english_retrieval,
         to_en_for_retrieval,
+        _latin_script_only,
+        is_hinglish_message,
     )
 
     raw = (original_msg or "").strip()
@@ -1404,13 +1734,18 @@ def build_kb_retrieval_query(
         qcache = None
 
     english_gloss = ""
-    # Prefer Brain English meaning first — never wait on Google when brain already glossed.
+    # Prefer Brain meaning first — never wait on Google when brain already glossed.
+    # Trust Latin non-Hinglish brain paraphrases even if conversational detectors miss them.
     if meaning:
         if text_usable_as_english_retrieval(meaning):
             english_gloss = meaning
+        elif (
+            _latin_script_only(meaning)
+            and not is_hinglish_message(meaning)
+            and meaning.lower() != raw.lower()
+        ):
+            english_gloss = meaning
         else:
-            # Brain sometimes returns lightly Hinglish "meaning"; still better than raw
-            # for dense match against English chunks (no topic keyword maps).
             meaning_en = to_en_for_retrieval(meaning, reply_lang)
             english_gloss = meaning_en or meaning
     elif en and text_usable_as_english_retrieval(en) and en.lower() != raw.lower():
@@ -1456,7 +1791,26 @@ def build_kb_retrieval_query(
     try:
         from services.query_understanding import _is_short_or_vague_message, _last_user_snippets
 
-        if conversation_context and _is_short_or_vague_message(original_msg or msg_en):
+        scope = (route.get("conversation_scope") or "").strip().lower()
+        intent = (route.get("intent") or "").strip().lower()
+        # Never glue prior-turn topics onto greetings / locked non-KB intents —
+        # that is what turns "hyee" into a return-policy or charger retrieval.
+        allow_prior_expand = (
+            conversation_context
+            and _is_short_or_vague_message(original_msg or msg_en)
+            and scope not in ("general_chitchat", "out_of_domain", "harm_sensitive")
+            and intent
+            not in (
+                "order_history",
+                "wishlist",
+                "pincode_check",
+                "out_of_domain",
+                "deals",
+                "categories",
+            )
+            and route.get("continue_previous_topic") is not False
+        )
+        if allow_prior_expand:
             prior_snippets = _last_user_snippets(conversation_context)
             prior = " — ".join(s for s in prior_snippets if s).strip()
             if prior and prior.lower() not in (merged or "").lower():
@@ -1546,6 +1900,81 @@ def log_kb_pipeline_complete(
     chat_log(msg)
 
 
+def _expand_hit_with_neighbor_chunks(hit: dict, *, max_chars: int = 1400) -> str:
+    """
+    Merge same-document neighbor chunks when the top hit is a heading stub or
+    mid-sentence char window (common with Qdrant char chunking).
+    Uses other same-turn hits when available — no keyword maps.
+    """
+    if not isinstance(hit, dict):
+        return ""
+    base = (hit.get("chunk") or "").strip()
+    if not base:
+        return ""
+    try:
+        from services.chat_flow_telemetry import get_kb_grounding_context
+
+        prior_hits, _ = get_kb_grounding_context()
+    except ImportError:
+        prior_hits = []
+    if not prior_hits:
+        return base
+
+    doc_id = hit.get("doc_id")
+    chunk_no = hit.get("chunk_no")
+    src = str(hit.get("source") or "").strip().lower()
+    neighbors: list[tuple[int, str]] = []
+    for h in prior_hits or []:
+        if not isinstance(h, dict):
+            continue
+        c = (h.get("chunk") or "").strip()
+        if not c:
+            continue
+        same_doc = False
+        if doc_id is not None and h.get("doc_id") is not None:
+            same_doc = int(h.get("doc_id") or -1) == int(doc_id)
+        elif src and str(h.get("source") or "").strip().lower() == src:
+            same_doc = True
+        if not same_doc:
+            continue
+        try:
+            n = int(h.get("chunk_no") if h.get("chunk_no") is not None else -1)
+        except (TypeError, ValueError):
+            n = -1
+        neighbors.append((n, c))
+    if not neighbors:
+        return base
+
+    neighbors.sort(key=lambda x: x[0] if x[0] >= 0 else 10**9)
+    # Prefer contiguous window around the winning chunk_no.
+    if chunk_no is not None:
+        try:
+            center = int(chunk_no)
+            neighbors = [
+                (n, c)
+                for n, c in neighbors
+                if n < 0 or abs(n - center) <= 2
+            ]
+        except (TypeError, ValueError):
+            pass
+
+    parts: list[str] = []
+    seen: set[str] = set()
+    total = 0
+    for _, c in neighbors:
+        key = _chunk_dedup_key(c)
+        if key and key in seen:
+            continue
+        if key:
+            seen.add(key)
+        if total + len(c) > max_chars and parts:
+            break
+        parts.append(c)
+        total += len(c) + 2
+    merged = "\n\n".join(parts).strip()
+    return merged if len(merged) > len(base) else base
+
+
 def format_direct_reply_from_kb_hit(
     hit: dict,
     original_msg: str,
@@ -1554,15 +1983,18 @@ def format_direct_reply_from_kb_hit(
     retrieval_query: str = "",
     fast_lane: bool = False,
     conversation_context: str = "",
+    ai_route: dict | None = None,
 ) -> str:
     """
-    Answer from one retrieved KB chunk — no answer-rewrite LLM.
-    Translates to customer language when needed.
+    Answer from one retrieved KB chunk (optionally expanded with neighbors).
+    Grounds via LLM when extractive is thin or customer needs localization.
     """
     if not isinstance(hit, dict):
         return ""
     chunk = (hit.get("chunk") or "").strip()
     if not chunk:
+        return ""
+    if _chunk_is_agent_instruction_blob(chunk):
         return ""
     from services.translation_service import customer_reply_language
 
@@ -1578,18 +2010,57 @@ def format_direct_reply_from_kb_hit(
             similarity_score=score,
             selected_chunks=[hit],
         )
-    excerpt = _kb_plain_excerpt(
-        _faq_answer_text_from_chunk(re.sub(r"<br\s*/?>", "\n", chunk)),
-        max_chars=_infer_kb_answer_budget(retrieval_query or original_msg)[0],
-    )
-    if not excerpt.strip():
+    q_for_budget = (retrieval_query or original_msg or "").strip()
+    budget_chars, _, _ = _infer_kb_answer_budget(q_for_budget, ai_route=ai_route)
+    # Expand heading-only / mid-window char chunks using same-doc neighbors.
+    if not _kb_answer_body_is_usable(chunk, min_chars=40):
+        chunk = _expand_hit_with_neighbor_chunks(hit, max_chars=budget_chars + 400)
+    plain_chunk = _faq_answer_text_from_chunk(re.sub(r"<br\s*/?>", "\n", chunk))
+    if not _kb_answer_body_is_usable(plain_chunk, min_chars=24):
+        # Retry expansion before polish stripped too much.
+        chunk = _expand_hit_with_neighbor_chunks(hit, max_chars=budget_chars + 400)
+        plain_chunk = _strip_leading_faq_question(
+            re.sub(r"<br\s*/?>", "\n", chunk)
+        )
+    # Fast lane: Qdrant already ranked — skip MiniLM section/line rescoring.
+    if fast_lane:
+        focused = _filter_kb_blob_fast(
+            plain_chunk, q_for_budget, max_chars=budget_chars, ai_route=ai_route
+        )
+    else:
+        focused = _filter_kb_blob_for_question(
+            plain_chunk,
+            q_for_budget,
+            max_chars=budget_chars,
+            ai_route=ai_route,
+        )
+    excerpt = _kb_plain_excerpt(focused or plain_chunk, max_chars=budget_chars)
+    if not excerpt.strip() or _chunk_is_agent_instruction_blob(excerpt):
         return ""
+    # Never ship heading-only / stub extractive replies.
+    if not _kb_answer_body_is_usable(excerpt):
+        fallback = _kb_plain_excerpt(plain_chunk, max_chars=budget_chars)
+        if _kb_answer_body_is_usable(fallback):
+            excerpt = fallback
+        else:
+            return ""
     from services.translation_service import resolve_customer_reply_lang
 
     rl_resolved = resolve_customer_reply_lang(original_msg, rl)
     src_list = [src] if src and src != "general" else None
-    # Fast lane = preflight / zero-LLM vector hit — skip extra focus LLM (latency).
-    if (not fast_lane) and _kb_ai_focus_answer_enabled() and excerpt.strip():
+    needs_ground = (
+        _kb_ai_focus_answer_enabled()
+        and excerpt.strip()
+        and (
+            (not fast_lane)
+            or _customer_needs_kb_localization(original_msg, rl_resolved)
+            or (
+                not _brain_english_meaning_is_narrow_fact(ai_route)
+                and len(excerpt) < 120
+            )
+        )
+    )
+    if needs_ground:
         grounded = _ground_kb_excerpt_for_customer(
             original_msg,
             excerpt,
@@ -1597,21 +2068,18 @@ def format_direct_reply_from_kb_hit(
             reply_lang=rl_resolved,
             kb_sources=src_list,
         )
-        if grounded and grounded.strip():
+        if grounded and _kb_answer_body_is_usable(grounded, min_chars=20):
             return grounded
     body = _plain_text_to_html_body(excerpt)
-    if not body:
+    if not body or not _kb_answer_body_is_usable(body, min_chars=20):
         return ""
-    if fast_lane:
-        # Zero extra LLM: polish + light finalize only (no localization grounding LLM).
-        body = polish_faq_reply_for_customer(body, original_msg)
-        from services.translation_service import finalize_customer_reply
-
-        return finalize_customer_reply(
-            body, original_msg, rl_resolved, allow_llm_style_rewrite=False
-        )
     body = polish_faq_reply_for_customer(body, original_msg)
-    return _finalize_kb_customer_reply(body, original_msg, rl_resolved)
+    if not _kb_answer_body_is_usable(body, min_chars=20):
+        return ""
+    # Match customer language with bounded AI polish (customer message → LLM).
+    return _finalize_kb_customer_reply(
+        body, original_msg, rl_resolved, ai_route=ai_route
+    )
 
 
 def format_kb_no_information_reply(original_msg: str, *, reply_lang: str = "") -> str:
@@ -1623,7 +2091,7 @@ def format_kb_no_information_reply(original_msg: str, *, reply_lang: str = "") -
         "I couldn't find this in Welfog's current knowledge base. "
         "Please contact customer support if you need more help."
     )
-    return finalize_customer_reply(en, original_msg, rl)
+    return finalize_customer_reply(en, original_msg, rl, allow_llm_style_rewrite=False)
 
 
 def _keyword_hit_as_semantic(kw: dict | None) -> dict | None:
@@ -1716,6 +2184,7 @@ def semantic_kb_search(
     try:
         from services.knowledge_retriever import (
             is_qdrant_kb_retrieval_enabled,
+            kb_retrieval_backend,
             retrieve_knowledge_hits,
             should_use_qdrant_retrieval,
         )
@@ -1733,6 +2202,14 @@ def semantic_kb_search(
                 kb_intent=kb_intent,
                 log_retrieval=log_retrieval,
             )
+        # Production: when Qdrant is the configured backend, never fall back to
+        # building/loading MiniLM mid-request (that caused 30–90s hangs / timeouts).
+        if kb_retrieval_backend() == "qdrant" and kb_intent:
+            log_reasoning(
+                "Qdrant KB backend configured but retrieval gate closed — "
+                "return empty (skip MiniLM fallback)."
+            )
+            return []
         if is_qdrant_kb_retrieval_enabled() and not should_use_qdrant_retrieval(
             ai_route=ai_route, kb_intent=kb_intent
         ):
@@ -1821,13 +2298,25 @@ def promote_route_from_semantic_kb_match(
     """
     Strong Admin-KB semantic match (Qdrant SoT) → lock welfog_support.
 
-    Used to rescue Brain OOD/chitchat misroutes when an active+indexed Admin
-    document already answers the question. No filename / keyword routing —
-    eligibility is embedding similarity only.
+    Used to rescue Brain OOD misroutes when an active+indexed Admin
+    document already answers an informational question. Never steals
+    pure chitchat / affection turns into random FAQ hits.
     """
     out = dict(route or {})
     if out.get("run_catalog_search") or out.get("_product_catalog_locked"):
         return None
+    scope_now = (out.get("conversation_scope") or "").strip().lower()
+    if scope_now == "general_chitchat":
+        return None
+    # Brain English meaning already said casual talk / no ask — never FAQ-hijack.
+    try:
+        from services.ai_first_router import _brain_user_meaning_indicates_chitchat
+
+        um = f"{out.get('user_meaning') or ''} {out.get('reasoning') or ''}"
+        if _brain_user_meaning_indicates_chitchat(um):
+            return None
+    except ImportError:
+        pass
     try:
         from services.ai_route_semantics import brain_route_indicates_product_catalog
 
@@ -1865,6 +2354,12 @@ def promote_route_from_semantic_kb_match(
     except ImportError:
         pass
 
+    # Stricter floor when Brain said unrelated — weak FAQ hits (0.3–0.5) were
+    # stealing affection / small-talk into invoice/grievance chunks.
+    floor = float(min_score)
+    if out.get("is_welfog_related") is False:
+        floor = max(floor, 0.58)
+
     # Probe with a temporary KB intent so Qdrant (not OOD-blocked memory probes) runs.
     probe = dict(out)
     probe["data_channel"] = "kb"
@@ -1877,11 +2372,11 @@ def promote_route_from_semantic_kb_match(
         q or combined,
         keys=get_customer_kb_keys() or None,
         ai_route=probe,
-        min_score=max(0.14, min_score - 0.12),
+        min_score=max(0.14, floor - 0.12),
         grounded=True,
     )
     score = float((best or {}).get("score") or 0)
-    if not best or score < min_score:
+    if not best or score < floor:
         return None
 
     src = str(best.get("source") or "").strip()
@@ -2019,6 +2514,7 @@ def retrieve_best_kb_chunk(
         ai_route=ai_route,
         min_rerank_score=floor,
         conflict_check=conflict_check,
+        light_rerank=bool(kb_intent),
     )
 
 
@@ -2182,14 +2678,16 @@ def _ground_kb_excerpt_for_customer(
             original_msg,
             (
                 f"AUTHORITATIVE KNOWLEDGE from live admin file(s): {src_note}\n"
-                "RULES: Answer ONLY from this text. Match the customer's language/script (Hinglish = Roman Hindi+English). "
+                "RULES: Answer ONLY from this text. Match the customer's language/script "
+                "(Hinglish = Roman Hindi+English; also Hindi/Tamil/Punjabi/Kannada/Marathi/etc.). "
                 "Do NOT repeat or restate the user's question — start directly with the answer. "
-                "Use ONLY the part of the knowledge that answers THIS specific question — never paste unrelated "
-                "sections, headings, or steps (e.g. refund timeline only when they ask when refund comes; "
-                "address update only when they ask to change address; delayed package only when they ask about delay — "
-                "not return policy). "
-                "Give ONLY what was asked — 1-4 short sentences, no extra topics, no steps they did not ask for. "
-                "Seller account steps must NOT be confused with buyer checkout account. "
+                "Use ONLY the part of the knowledge that answers THIS specific question — never paste "
+                "unrelated sections (cancel ≠ return; refund timeline ≠ return steps; shipping SLA ≠ "
+                "pincode instructions; owner ≠ office address). "
+                "Be COMPLETE for what was asked: if they ask a policy, give the full relevant policy "
+                "facts; if they ask how-to, give the full numbered steps from the text — never return "
+                "only a heading like 'Refund Policy:'. "
+                "Do not invent facts. Seller account steps must NOT be confused with buyer checkout. "
                 "Copy phone/email/addresses exactly.\n\n"
                 f"{excerpt}"
             ),
@@ -2243,209 +2741,190 @@ def _chunk_is_order_history_howto_faq(chunk: str) -> bool:
     )
 
 
-def _kb_chunk_relevance_adjustment(question: str, chunk: str) -> float:
+def _kb_chunk_relevance_adjustment(
+    question: str, chunk: str, *, ai_route: dict | None = None
+) -> float:
     """
-    Semantic rerank nudge — disambiguate similar FAQ/KB chunks (refund timeline vs return policy;
-    seller registration vs login help). Meaning-based token checks, not routing.
+    Soft semantic nudge: Brain meaning vs chunk embedding only.
+    No topic keyword lists — new admin FAQs need no code changes.
     """
-    q = f" {(question or '').lower()} "
-    c = re.sub(r"<br\s*/?>", " ", (chunk or "").lower())
-    adj = 0.0
+    focus = _brain_focus_text(question, ai_route)
+    if not focus or not (chunk or "").strip():
+        return 0.0
+    plain = re.sub(r"<br\s*/?>", " ", chunk or "")
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    sim = _embedding_similarity(focus[:400], plain[:900])
+    return max(-0.12, min(0.12, (sim - 0.35) * 0.35))
 
-    asks_refund_time = "refund" in q and any(
-        x in q
-        for x in (
-            "kitne din",
-            "kab tak",
-            "kab aayega",
-            "kab aata",
-            "how long",
-            "how many day",
-            "when will",
-            "timeline",
-            "business day",
-            "processed",
-            "aata hai",
-            "milega",
+
+def _chunk_looks_like_contact_card(chunk: str) -> bool:
+    """True when chunk is mostly phone/email contact lines (not a policy narrative)."""
+    plain = re.sub(r"<br\s*/?>", "\n", chunk or "", flags=re.I)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    phones = re.findall(r"\b\d{10}\b", plain)
+    emails = re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", plain, flags=re.I)
+    if not phones and not emails:
+        return False
+    words = re.findall(r"[A-Za-z]{3,}", plain)
+    # Short contact directory vs descriptive About/policy prose.
+    return len(words) <= 48 or (len(phones) + len(emails) >= 2 and len(words) <= 80)
+
+
+def _chunk_has_identity_fact(chunk: str) -> bool:
+    """True when chunk mentions owner/founder/about — keep even if address co-occurs."""
+    low = re.sub(r"<br\s*/?>", " ", (chunk or "").lower())
+    low = re.sub(r"<[^>]+>", " ", low)
+    return bool(
+        re.search(
+            r"\b(owner|founder|co-?founder|ceo|about welfog|our story)\b",
+            low,
         )
     )
-    if asks_refund_time:
-        if "refund" in c and ("processed" in c or "business day" in c):
-            adj += 0.14
-        if "return policy" in c or "allows returns within" in c:
-            adj -= 0.1
-        if "deliver my order" in c or "delivery times" in c:
-            adj -= 0.14
-        if "bank account" in c and "update" in c and "processed" not in c:
-            adj -= 0.16
-        if "payment methods does welfog accept" in c or "credit/debit cards" in c:
-            adj -= 0.14
 
-    asks_return_policy = "return" in q and any(
-        x in q for x in ("policy", "return policy", "returnable", "eligible for return")
-    )
-    if asks_return_policy:
-        if "return policy" in c or "allows returns within" in c:
-            adj += 0.14
-        if "refund" in c and "processed" in c and "return policy" not in c:
-            adj -= 0.08
-        if "initiate a return" in c or "click \"return\"" in c or "click return" in c:
-            adj -= 0.1
 
-    if any(x in q for x in ("mobile app", "android app", "ios app", "download app")):
-        if "mobile app" in c or "browse products" in c:
-            adj += 0.14
-        if "about welfog" in c and "mobile app" not in c:
-            adj -= 0.18
+def _chunk_looks_like_address_block(chunk: str) -> bool:
+    """True when chunk is mostly a postal/office address listing."""
+    plain = re.sub(r"<br\s*/?>", "\n", chunk or "", flags=re.I)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    low = plain.lower()
+    if not any(x in low for x in ("address", "plot", "pin code", "pincode", "street", "colony")):
+        return False
+    # Owner/about facts glued next to an address are NOT pure address blocks.
+    if _chunk_has_identity_fact(plain):
+        return False
+    words = re.findall(r"[A-Za-z]{3,}", plain)
+    # Short address block — not a long "About Welfog" narrative.
+    return len(words) <= 60 and "integrated digital platform" not in low and "ecosystem" not in low
 
-    asks_address_phone_update = any(
-        x in q
-        for x in (
-            "update my address",
-            "update address",
-            "change address",
-            "change phone",
-            "update phone",
-            "phone number",
-            "contact details",
-            "my profile",
+
+def _brain_meaning_asks_contact(ai_route: dict | None) -> bool:
+    """Use Brain English meaning — not customer keyword maps — to detect contact asks."""
+    r = ai_route or {}
+    blob = f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip()
+    if not blob:
+        return False
+    try:
+        from utils.helpers import _text_asks_customer_care_contact
+
+        return bool(_text_asks_customer_care_contact(blob))
+    except ImportError:
+        low = blob.lower()
+        return any(
+            x in low
+            for x in (
+                "customer care",
+                "support number",
+                "phone number",
+                "contact number",
+                "helpline",
+                "email",
+            )
         )
-    ) and any(x in q for x in ("address", "phone", "profile", "contact"))
-    if asks_address_phone_update:
-        if any(
-            x in c
-            for x in (
-                "update your address",
-                "update your phone",
-                "my profile",
-                "edit your saved address",
-                "contact details",
-            )
-        ):
-            adj += 0.22
-        if any(x in c for x in ("fraud", "phishing", "suspicious message", "legalsupport@")):
-            adj -= 0.28
 
-    asks_delayed_lost = any(
-        x in q for x in ("delayed", "delay", "lost", "missing", "not received", "not arrived")
-    ) and any(x in q for x in ("package", "order", "delivery", "shipment", "parcel"))
-    if asks_delayed_lost:
-        if any(
-            x in c
-            for x in (
-                "delayed or lost",
-                "package is delayed",
-                "tracking",
-                "customer support",
-            )
-        ):
-            adj += 0.22
-        if "return policy" in c or "initiate a return" in c or "click \"return\"" in c:
-            adj -= 0.2
 
-    if any(x in q for x in ("privacy", "personal data", "data safe", "data deletion")):
-        if any(x in c for x in ("privacy", "personal data", "data deletion", "personal information")):
-            adj += 0.14
-        if "refund" in c and "privacy" not in c:
-            adj -= 0.1
-
-    asks_delivery_timeline = any(
-        x in q
-        for x in (
-            "kitna time",
-            "kitne din",
-            "how long",
-            "lgta h",
-            "lagta h",
-            "lagta hai",
-            "kab aayega",
-            "kab milega",
-            "how many day",
-            "time lgta",
-            "time lagta",
+def _brain_meaning_asks_company_identity(ai_route: dict | None) -> bool:
+    """Brain meaning / intent: what is / about / owner — not address or phone."""
+    r = ai_route or {}
+    intent = (r.get("intent") or "").strip().lower()
+    if intent in ("owner", "about"):
+        return True
+    um = f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip().lower()
+    if not um:
+        return False
+    if any(x in um for x in ("address", "phone", "helpline", "customer care", "contact number")):
+        # Still allow owner asks that mention contact accidentally.
+        if not re.search(r"\b(owner|founder|who owns)\b", um):
+            return False
+    return bool(
+        re.search(
+            r"\b("
+            r"what is welfog|what welfog is|about welfog|who owns|owner of|owner name|"
+            r"founder|asking what welfog|user is asking what welfog|"
+            r"who is the owner|welfog'?s? owner|owner of welfog|name of (?:the )?owner|"
+            r"who (?:is|owns) (?:the )?owner"
+            r")\b",
+            um,
         )
-    ) and any(
-        x in q
-        for x in ("delivery", "deliver", "ship", "order aane", "order aayega", "courier")
+        or re.search(r"\b(owner|founder)\b", um)
     )
-    if asks_delivery_timeline:
-        if any(
-            x in c
-            for x in (
-                "how long",
-                "delivery time",
-                "delivery times",
-                "typically processes",
-                "3-5 days",
-                "1-3 business",
-                "ship my order",
-                "deliver my order",
-            )
-        ):
-            adj += 0.24
-        if any(
-            x in c
-            for x in (
-                "not available at the time",
-                "attempt redelivery",
-                "redelivery",
-                "leave a notification",
-                "reschedule",
-            )
-        ):
-            adj -= 0.28
 
-    if any(x in q for x in ("deliver", "delivery", "shipping", "courier")):
-        if any(x in c for x in ("deliver my order", "delivery times", "delivery time", "courier")):
-            adj += 0.14
-        if "refund" in c and "deliver" not in c:
-            adj -= 0.1
 
-    if any(x in q for x in ("customer care", "contact", "phone", "helpline", "support number", "call")):
-        if any(x in c for x in ("9828", "info@", "customer care", "helpline", "contact", "support")):
-            adj += 0.1
+def _brain_meaning_asks_owner_name(ai_route: dict | None) -> bool:
+    """Brain English meaning: who owns / owner name (narrower than general about)."""
+    r = ai_route or {}
+    intent = (r.get("intent") or "").strip().lower()
+    if intent == "owner":
+        return True
+    um = f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip().lower()
+    if not um:
+        return False
+    return bool(
+        re.search(
+            r"\b(who owns|owner of|owner name|founder|who is the owner|"
+            r"welfog'?s? owner|name of (?:the )?owner)\b",
+            um,
+        )
+        or (re.search(r"\bowner\b", um) and not re.search(r"\b(account owner|order owner)\b", um))
+    )
 
-    asks_seller_create = any(
-        x in q
-        for x in (
-            "banaye",
-            "banau",
-            "banao",
-            "create",
-            "register",
-            "registration",
-            "become seller",
-            "become a seller",
-            "seller account",
-            "seller bane",
-            "seller banna",
+
+def _brain_meaning_asks_social(ai_route: dict | None, combined: str = "") -> bool:
+    """Brain / text: official social URL ask — not Reels/content policy."""
+    r = ai_route or {}
+    rh = (r.get("route_handler") or "").strip().lower()
+    um = f"{r.get('user_meaning') or ''} {r.get('reasoning') or ''}".strip().lower()
+    # Content / reels *system* is KB policy, never a social-URL answer.
+    if re.search(
+        r"\b(reel|reels|shorts|content (?:rules?|polic)|allowed content|"
+        r"prohibited content|what content)\b",
+        um,
+    ) and not re.search(r"\b(instagram|facebook|youtube|linkedin|twitter)\b.*\b(link|url|handle)\b", um):
+        return False
+    if "social" in rh and re.search(r"\b(link|url|handle|page|profile|follow)\b", um or combined.lower()):
+        return True
+    intent = (r.get("intent") or "").strip().lower()
+    if intent in ("social", "social_media") and not re.search(r"\b(reel|reels|shorts)\b", um):
+        return True
+    blob = f"{um} {combined or ''}".strip().lower()
+    if not blob:
+        return False
+    if re.search(r"\b(reel|reels|shorts)\b", blob) and not re.search(
+        r"\b(instagram|facebook|youtube|linkedin|twitter)\b", blob
+    ):
+        return False
+    has_platform = bool(
+        re.search(
+            r"\b(?:instagram|insta|facebook|fb|youtube|linkedin|twitter|social media|"
+            r"social link|social account)\b",
+            blob,
         )
     )
-    if asks_seller_create:
-        if any(
-            x in c
-            for x in (
-                "how to create",
-                "create a seller",
-                "seller registration",
-                "become a seller",
-                "seller portal",
-            )
-        ):
-            adj += 0.14
-        if any(x in c for x in ("login problem", "login fail", "error on login", "cannot login")):
-            adj -= 0.12
-
-    asks_seller_login = "seller" in q and any(
-        x in q for x in ("login", "log in", "sign in", "otp", "login nahi", "login fail")
+    if not has_platform:
+        return False
+    return bool(
+        re.search(
+            r"\b(?:link|url|handle|page|follow|id|account|profile|de\s*do|dedo|"
+            r"chahiye|want|need|give|share|send)\b",
+            blob,
+        )
     )
-    if asks_seller_login:
-        if any(x in c for x in ("login problem", "login fail", "otp", "sign in")):
-            adj += 0.12
-        if "how to create" in c:
-            adj -= 0.08
 
-    return adj
+
+def _rewrite_preserves_kb_facts(source: str, rewritten: str) -> bool:
+    """Reject style rewrite that invents phone/email/URL not present in the KB excerpt."""
+    src = re.sub(r"<[^>]+>", " ", source or "")
+    dst = re.sub(r"<[^>]+>", " ", rewritten or "")
+    if not dst.strip():
+        return False
+    src_phones = set(re.findall(r"\b\d{10}\b", src))
+    dst_phones = set(re.findall(r"\b\d{10}\b", dst))
+    if dst_phones - src_phones:
+        return False
+    src_mails = {m.lower() for m in re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", src, flags=re.I)}
+    dst_mails = {m.lower() for m in re.findall(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", dst, flags=re.I)}
+    if dst_mails - src_mails:
+        return False
+    return True
 
 
 def _pick_best_kb_hit_for_query(
@@ -2455,33 +2934,115 @@ def _pick_best_kb_hit_for_query(
     ai_route: dict | None = None,
     conflict_check: bool = True,
     min_rerank_score: float | None = None,
+    light_rerank: bool = False,
 ) -> dict | None:
-    """Rerank embedding hits with relevance adjustments; skip conflicting chunks."""
-    best: dict | None = None
-    best_score = -1.0
-    ranked: list[tuple[float, dict]] = []
+    """
+    Rerank embedding hits; skip conflicting chunks.
+
+    Raw vector similarity is primary. FAQ-question / relevance nudges are
+    tie-breakers only — they must never let a weaker chunk leapfrog a stronger
+    semantic hit (e.g. seller howto FAQ stealing a company-owner fact).
+    Brain kb_keys act as a soft preference within a small raw-score margin.
+
+    light_rerank=True (Qdrant answer path): skip MiniLM FAQ re-embeds — Qdrant
+    + RRF already ranked; secondary nudges stay token/structure cheap.
+    """
+    hint_keys: set[str] = set()
+    try:
+        for k in (ai_route or {}).get("kb_keys") or []:
+            ck = str(k or "").strip().lower()
+            if ck:
+                hint_keys.add(ck)
+    except Exception:
+        hint_keys = set()
+
+    ranked: list[tuple[float, float, float, int, dict]] = []
+    meaning_wants_contact = _brain_meaning_asks_contact(ai_route)
+    meaning_identity = _brain_meaning_asks_company_identity(ai_route)
+    meaning_owner = _brain_meaning_asks_owner_name(ai_route)
+    meaning_blob = ""
+    if isinstance(ai_route, dict):
+        meaning_blob = (
+            f"{ai_route.get('user_meaning') or ''} {ai_route.get('reasoning') or ''}"
+        ).strip().lower()
+    focus_q = f" {meaning_blob} {(question or '').lower()} "
     for hit in hits:
         chunk = hit.get("chunk") or ""
-        if conflict_check and _faq_chunk_conflicts_with_query(question, chunk, ai_route=ai_route):
+        if _chunk_is_agent_instruction_blob(chunk):
             continue
-        sc = float(hit.get("score") or 0) + _kb_chunk_relevance_adjustment(question, chunk)
-        sc += _faq_question_similarity_boost(question, chunk)
-        ranked.append((sc, {**hit, "score": sc}))
-        if sc > best_score:
-            best_score = sc
-            best = {**hit, "score": sc}
+        if conflict_check and _faq_chunk_conflicts_with_query(
+            question, chunk, ai_route=ai_route
+        ):
+            continue
+        # Contact / address cards must not answer "what is Welfog / who owns …".
+        if not meaning_wants_contact and _chunk_looks_like_contact_card(chunk):
+            if not (meaning_owner and _chunk_has_identity_fact(chunk)):
+                continue
+        if meaning_identity and _chunk_looks_like_address_block(chunk):
+            continue
+        raw = float(hit.get("score") or 0)
+        adj = float(_kb_chunk_relevance_adjustment(question, chunk, ai_route=ai_route) or 0)
+        # Strong facet conflicts — allow larger secondary so cancel≠return etc.
+        if abs(adj) >= 0.18:
+            secondary_adj = max(-0.22, min(0.22, adj))
+        else:
+            secondary_adj = max(-0.08, min(0.10, adj))
+        faq_b = (
+            0.0
+            if light_rerank
+            else float(_faq_question_similarity_boost(question, chunk) or 0)
+        )
+        secondary = secondary_adj + max(0.0, min(0.06, faq_b))
+        src = str(hit.get("source") or "").strip().lower()
+        hint_match = 1 if (hint_keys and src in hint_keys) else 0
+        # Soft-penalize support/contact keys when Brain did not ask for contact.
+        if (
+            not meaning_wants_contact
+            and src in ("support", "customer_support", "customer_care", "contacts")
+        ):
+            raw = max(0.0, raw - 0.08)
+        if meaning_owner and _chunk_has_identity_fact(chunk):
+            secondary += 0.06
+            if src in ("company", "about", "faqs"):
+                hint_match = max(hint_match, 1)
+        # Display score keeps a light secondary signal for logging/thresholds.
+        display = raw + secondary + (0.02 if hint_match else 0.0)
+        ranked.append((raw, secondary, float(hint_match), display, {**hit, "score": display}))
+
+    if not ranked:
+        return None
+
+    # Primary: raw semantic. Secondary: brain key match, then FAQ/relevance nudge.
+    ranked.sort(key=lambda x: (x[0], x[2], x[1]), reverse=True)
+    best_raw, _, _, best_display, best = ranked[0]
+
+    # Within a tight raw margin, allow FAQ-line or key-hint preference to break ties.
     if len(ranked) >= 2:
-        ranked.sort(key=lambda x: x[0], reverse=True)
-        top_sc, top_hit = ranked[0]
-        runner_sc, runner_hit = ranked[1]
-        if runner_sc >= top_sc - 0.07:
-            top_q = _faq_question_similarity_boost(question, top_hit.get("chunk") or "")
-            run_q = _faq_question_similarity_boost(question, runner_hit.get("chunk") or "")
-            if run_q > top_q + 0.03:
-                best = runner_hit
-                best_score = runner_sc
+        runner_raw, runner_sec, runner_hint, runner_display, runner = ranked[1]
+        if runner_raw >= best_raw - 0.06:
+            if light_rerank:
+                top_faq = run_faq = 0.0
+            else:
+                top_faq = _faq_question_similarity_boost(question, best.get("chunk") or "")
+                run_faq = _faq_question_similarity_boost(question, runner.get("chunk") or "")
+            if runner_hint > (1 if str(best.get("source") or "").strip().lower() in hint_keys else 0):
+                best = runner
+                best_display = runner_display
+            elif run_faq > top_faq + 0.04 and runner_raw + 0.01 >= best_raw:
+                best = runner
+                best_display = runner_display
+
+    # If a brain-hinted source is close to the raw leader, prefer it (soft lock).
+    if hint_keys and ranked:
+        hinted = [r for r in ranked if str(r[4].get("source") or "").strip().lower() in hint_keys]
+        if hinted:
+            h_raw, _, _, h_display, h_hit = max(hinted, key=lambda x: (x[0], x[1]))
+            if h_raw >= best_raw - 0.12 and str(best.get("source") or "").strip().lower() not in hint_keys:
+                best = h_hit
+                best_display = h_display
+
     floor = float(min_rerank_score if min_rerank_score is not None else KB_ANSWER_MIN_CONFIDENCE)
-    if best and best_score < floor:
+    if best_display < floor and best_raw < floor:
         return None
     return best
 
@@ -2490,10 +3051,11 @@ def _faq_chunk_conflicts_with_query(
     question: str, chunk: str, ai_route: dict | None = None
 ) -> bool:
     """
-    Drop wrong FAQ matches (e.g. buyer account FAQ on seller questions;
-    order-history HOW-TO FAQ when user wants list in chat).
+    Drop clearly wrong channel matches using Brain meaning + embeddings.
+
+    No admin-topic keyword include/exclude maps — new KB docs need no code edits.
+    Structure/channel helpers (order-history live list vs how-to) stay AI-route based.
     """
-    q = f" {(question or '').lower()} "
     c = f" {(chunk or '').lower()} "
     try:
         from services.account_list_semantics import (
@@ -2508,55 +3070,47 @@ def _faq_chunk_conflicts_with_query(
         if ai_route_requests_order_history_howto(ai_route) and not _chunk_is_order_history_howto_faq(
             chunk
         ):
-            if "order history" in c and "track order" in c:
-                return True
+            # How-to ask vs status/track narrative — meaning gate, not keyword lists.
+            if _chunk_is_order_history_howto_faq(chunk) is False and (
+                "order history" in c or "my orders" in c
+            ):
+                # Keep; conflict only when clearly not a how-to blob for a how-to ask.
+                pass
     except ImportError:
         pass
+
+    focus = _brain_focus_text(question, ai_route)
+    if not focus or not (chunk or "").strip():
+        return False
     try:
         from utils.helpers import message_is_seller_on_welfog_request
 
         if message_is_seller_on_welfog_request(question):
-            buyer_only = (
-                "place an order",
-                "place order",
-                "track your purchase",
-                "track your order",
-                "need an account to place",
-                "create an account on welfog to place",
+            # Seller meaning vs buyer-checkout FAQ — embedding distance only.
+            buyer_probe = (
+                "create an account on Welfog to place an order and track purchases checkout"
             )
-            if any(b in c for b in buyer_only):
-                return True
-            if "seller" not in c and any(x in c for x in ("my orders", "track order", "checkout")):
+            seller_probe = (
+                "become a seller supplier registration seller portal vendor account"
+            )
+            plain = re.sub(r"<[^>]+>", " ", chunk or "")
+            sim_buyer = _embedding_similarity(buyer_probe, plain[:700])
+            sim_seller = _embedding_similarity(seller_probe, plain[:700])
+            sim_focus = _embedding_similarity(focus[:400], plain[:700])
+            if sim_buyer >= sim_seller + 0.08 and sim_focus < sim_buyer:
                 return True
     except ImportError:
         pass
-    if _user_requests_grievance_channel(question):
-        if "grievance" not in c and "compliance" not in c:
-            if any(x in c for x in ("place order", "track order", "my orders", "checkout")):
-                return True
-    if any(x in q for x in (" story", " kahani", " kahaani", "our story")):
-        if any(x in c for x in ("place order", "track order", "checkout", "add to cart")):
-            return True
-    asks_address_phone = any(
-        x in q
-        for x in (
-            "update my address",
-            "update address",
-            "change address",
-            "change phone",
-            "update phone",
-            "phone number",
-            "my profile",
-        )
-    ) and any(x in q for x in ("address", "phone", "profile"))
-    if asks_address_phone:
-        if any(x in c for x in ("fraud", "phishing", "suspicious message", "legalsupport@")):
-            return True
-    asks_delayed_lost = any(
-        x in q for x in ("delayed", "delay", "lost", "missing", "not received", "not arrived")
-    ) and any(x in q for x in ("package", "order", "delivery", "shipment"))
-    if asks_delayed_lost:
-        if "return policy" in c and "delayed" not in c and "lost" not in c:
+
+    # Soft meaning vs chunk: reject chunks far below relevance to Brain focus
+    # (handles cancel↔return / owner↔address without topic keyword lists).
+    plain = re.sub(r"<br\s*/?>", " ", chunk or "")
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    sim = _embedding_similarity(focus[:400], plain[:900])
+    if sim < 0.12:
+        return True
+    if _brain_meaning_asks_owner_name(ai_route) and not _chunk_has_identity_fact(chunk):
+        if _chunk_looks_like_address_block(chunk) or _chunk_looks_like_contact_card(chunk):
             return True
     return False
 
@@ -2627,7 +3181,9 @@ def _format_kb_brain_gap_reply(
         "I can help with orders, delivery, payments, returns, or policies — what do you need?"
     )
     body = _plain_text_to_html_body(plain) or plain
-    return finalize_customer_reply(body, original_msg or msg_en, rl) or ""
+    return finalize_customer_reply(
+        body, original_msg or msg_en, rl, allow_llm_style_rewrite=False
+    ) or ""
 
 
 def format_kb_answer_from_brain_keys(
@@ -2642,19 +3198,36 @@ def format_kb_answer_from_brain_keys(
     ai_route: dict | None = None,
 ) -> str:
     """
-    Admin KB answer after brain locks kb_keys: vector RAG first (any language),
-    then scoped section filter — grounded LLM only when needed.
+    Admin KB answer after brain locks kb_keys: vector RAG across all customer
+    docs (keys = soft hints) → grounded answer in the customer's language.
     """
+    try:
+        from services.chat_resilience import chat_turn_abandoned
+
+        if chat_turn_abandoned():
+            return ""
+    except ImportError:
+        pass
     from services.translation_service import (
-        _looks_english_only_latin,
         _normalize_language,
         customer_reply_language,
         is_hinglish_message,
     )
     from utils.helpers import _text_asks_customer_care_contact
 
-    ensure_knowledge_cache_fresh()
-    ensure_kb_vectors()
+    # Qdrant answers use chunk payload text — do NOT call ensure_knowledge_cache_fresh()
+    # here (MySQL can sit on MYSQL_READ_TIMEOUT and blank the UI until AbortError).
+    try:
+        from services.knowledge_retriever import kb_retrieval_backend
+
+        if kb_retrieval_backend() != "qdrant":
+            ensure_knowledge_cache_fresh()
+            ensure_kb_vectors()
+    except ImportError:
+        ensure_knowledge_cache_fresh()
+
+    # Direct call — never nest ThreadPoolExecutor under chat-deadline worker
+    # (that deadlocked until CHAT_MAX and clients saw AbortError / busy).
     combined = f"{original_msg or ''} {msg_en or ''}".strip()
     if not combined:
         return ""
@@ -2663,309 +3236,214 @@ def format_kb_answer_from_brain_keys(
     if lang == "hinglish" or is_hinglish_message(original_msg):
         lang = "hinglish"
 
-    if _text_asks_customer_care_contact(combined) and not _user_requests_grievance_channel(combined):
-        cc = format_customer_care_reply_from_kb(original_msg, msg_en)
-        if cc:
-            return cc
+    route = dict(ai_route or {})
+    local_keys = list(keys or [])
+    if local_keys and not route.get("kb_keys"):
+        route["kb_keys"] = list(local_keys)
+    if user_meaning_en and not (route.get("user_meaning") or "").strip():
+        route["user_meaning"] = user_meaning_en.strip()
+    meaning_for_route = (
+        (user_meaning_en or "").strip()
+        or (route.get("user_meaning") or "").strip()
+    )
+    if meaning_for_route:
+        route["user_meaning"] = meaning_for_route
 
-    try:
-        from utils.helpers import (
-            _text_mentions_social_platform,
-            _text_mentions_welfog_brand,
-            message_asks_welfog_social_media,
-        )
+    if local_keys and not _brain_meaning_asks_contact(route):
+        contactish = {
+            "support",
+            "customer_support",
+            "customer_care",
+            "contacts",
+            "contact",
+        }
+        normed = [
+            str(k or "").strip().lower() for k in local_keys if str(k or "").strip()
+        ]
+        if normed and all(k in contactish for k in normed):
+            log_reasoning(
+                "KB brain-keys — drop support-only hints; meaning is not a contact ask."
+            )
+            local_keys = []
+            route["kb_keys"] = []
 
-        if message_asks_welfog_social_media(
-            combined, conversation_context=conversation_context
-        ) or (
-            _text_mentions_social_platform(combined.lower())
-            and _text_mentions_welfog_brand(combined.lower())
-        ):
+    # Owner/founder facts often live in a dedicated admin doc (key=owner), not
+    # company About — soft-expand keys from Brain meaning (no customer keywords).
+    if _brain_meaning_asks_owner_name(route):
+        customer = list(get_customer_kb_keys() or [])
+        expanded = list(local_keys or [])
+        for k in customer:
+            kl = str(k or "").strip().lower()
+            if kl in ("owner", "about", "company", "faqs") or "owner" in kl:
+                if k not in expanded:
+                    expanded.append(k)
+        if "owner" in customer:
+            expanded = ["owner"] + [k for k in expanded if k != "owner"]
+        if expanded != local_keys:
+            log_reasoning(
+                f"KB brain-keys — owner meaning; soft keys={','.join(expanded[:5])}"
+            )
+        local_keys = expanded
+        route["kb_keys"] = list(local_keys)
+
+    if not _user_requests_grievance_channel(combined):
+        msg_wants_contact = _text_asks_customer_care_contact(combined)
+        meaning_wants_contact = _brain_meaning_asks_contact(route)
+        if msg_wants_contact and (meaning_wants_contact or not meaning_for_route):
+            cc = format_customer_care_reply_from_kb(original_msg, msg_en)
+            if cc:
+                return cc
+
+    # Social URLs before vector retrieve — never dump Support Rules / agent meta.
+    try_social = _brain_meaning_asks_social(route, combined)
+    if not try_social:
+        try:
+            from utils.helpers import (
+                message_asks_welfog_social_media,
+                _is_welfog_social_followup,
+            )
+
+            try_social = bool(
+                message_asks_welfog_social_media(
+                    combined, conversation_context=conversation_context
+                )
+                or _is_welfog_social_followup(combined, conversation_context)
+            )
+        except ImportError:
+            try_social = False
+    if try_social:
+        try:
             social = format_welfog_social_media_reply_from_kb(
                 original_msg,
                 msg_en,
                 reply_lang=lang,
                 conversation_context=conversation_context,
+                user_meaning_en=meaning_for_route,
                 ai_confirmed=True,
             )
             if social:
+                log_reasoning("KB brain-keys — official social URLs from admin KB.")
                 return social
-    except ImportError:
-        pass
+        except Exception as exc:
+            log_reasoning(f"KB social formatter skipped: {exc}")
 
-    filter_q = (
-        (user_meaning_en or "").strip()
-        or ((ai_route or {}).get("user_meaning") or "").strip()
+    filter_q = build_kb_retrieval_query(
+        original_msg,
+        msg_en,
+        conversation_context,
+        ai_route=route,
+    ) or (
+        meaning_for_route
         or (msg_en or "").strip()
         or (original_msg or "").strip()
     )
 
-    route = ai_route or {}
-
-    # Step 7: Authoritative KB pipeline (retrieve → structured facts → grounded LLM).
-    try:
-        from services.knowledge_answer_service import resolve_authoritative_kb_answer
-
-        auth_answer = resolve_authoritative_kb_answer(
-            original_msg,
-            msg_en=msg_en,
-            keys=keys,
-            reply_lang=reply_lang,
-            conversation_context=conversation_context,
-            user_meaning_en=user_meaning_en,
-            ai_route=route,
-        )
-        if auth_answer is not None and auth_answer.strip():
-            return auth_answer
-    except ImportError:
-        pass
-
-    # Legacy Step 7 fallback (kept for import safety).
+    # Soft keys only — never hard-lock to one/two files. Search full customer corpus
+    # so faqs / shipping / owner / seller docs can all match by vectors.
+    search_keys = local_keys or None
     try:
         from services.knowledge_answer_service import (
             generate_grounded_kb_answer_from_qdrant,
             should_generate_qdrant_kb_answer,
         )
 
-        q_route = dict(route)
-        if (q_route.get("data_channel") or "").strip().lower() != "kb":
-            q_route["data_channel"] = "kb"
-        if should_generate_qdrant_kb_answer(q_route):
-            qdrant_answer = generate_grounded_kb_answer_from_qdrant(
+        if (route.get("data_channel") or "").strip().lower() != "kb":
+            route["data_channel"] = "kb"
+        if should_generate_qdrant_kb_answer(route):
+            grounded = generate_grounded_kb_answer_from_qdrant(
                 original_msg,
                 msg_en=msg_en,
-                keys=keys,
-                reply_lang=reply_lang,
-                conversation_context=conversation_context,
-                user_meaning_en=user_meaning_en,
-                ai_route=q_route,
-            )
-            if qdrant_answer is not None:
-                return qdrant_answer
-    except ImportError:
-        pass
-
-    # Single retrieval SoT: when Qdrant KB backend is on, never answer from MiniLM
-    # memory index or raw MySQL blob (avoids stale / unindexed grounded answers).
-    try:
-        from services.knowledge_retriever import is_qdrant_kb_retrieval_enabled
-
-        if is_qdrant_kb_retrieval_enabled():
-            return _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang) or ""
-    except ImportError:
-        pass
-
-    if not keys:
-        keys = resolve_brain_kb_keys(
-            route,
-            original_msg,
-            msg_en,
-            conversation_context=conversation_context,
-        )
-
-    valid = [k for k in keys if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS][:4]
-    if not valid and keys:
-        files_map = get_runtime_knowledge_files()
-        valid = [
-            k for k in keys if k in files_map and k not in INTERNAL_KB_KEYS
-        ][:4]
-    if not valid:
-        keys = resolve_brain_kb_keys(
-            route,
-            original_msg,
-            msg_en,
-            conversation_context=conversation_context,
-        )
-        valid = [k for k in keys if k in kb_chunks_by_key and k not in INTERNAL_KB_KEYS][:4]
-
-    brain_raw_keys = {
-        str(k).strip().lower()
-        for k in (route.get("kb_keys") or [])
-        if str(k).strip()
-    }
-    valid_key_set = {str(k).strip().lower() for k in valid}
-    brain_locked_kb = bool(route.get("_preflight_kb")) or (
-        (route.get("data_channel") or "").strip().lower() == "kb"
-        and bool(brain_raw_keys)
-        and bool(valid_key_set)
-        and valid_key_set.issubset(brain_raw_keys)
-    )
-
-    # Brain-hinted files are soft preferred_keys only — search all customer docs.
-    semantic_hit = select_best_kb_hit_for_customer_question(
-        original_msg,
-        msg_en,
-        conversation_context=conversation_context,
-        preferred_keys=valid,
-        ai_route=route,
-        brain_locked_kb=brain_locked_kb,
-        min_score=KB_ANSWER_MIN_CONFIDENCE,
-    )
-    if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-        direct = format_direct_reply_from_kb_hit(
-            semantic_hit,
-            original_msg,
-            reply_lang=lang,
-            retrieval_query=filter_q or combined,
-            fast_lane=True,
-            conversation_context=conversation_context,
-        )
-        if direct:
-            return direct
-
-    if valid:
-        scoped_hit = retrieve_best_kb_chunk(
-            filter_q or combined,
-            keys=list(valid)[:4],
-            ai_route=route,
-            min_score=KB_ANSWER_MIN_CONFIDENCE,
-        )
-        if scoped_hit and float(scoped_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-            scoped_direct = format_direct_reply_from_kb_hit(
-                scoped_hit,
-                original_msg,
+                keys=search_keys,
                 reply_lang=lang,
-                retrieval_query=filter_q or combined,
-                fast_lane=True,
                 conversation_context=conversation_context,
+                user_meaning_en=meaning_for_route,
+                ai_route=route,
             )
-            if scoped_direct:
-                return scoped_direct
-
-    if not valid:
-        wide = retrieve_best_kb_chunk(
-            combined, keys=None, ai_route=route, min_score=KB_ANSWER_MIN_CONFIDENCE
-        )
-        if wide:
-            direct = format_direct_reply_from_kb_hit(
-                wide,
-                original_msg,
-                reply_lang=lang,
-                retrieval_query=combined,
-                fast_lane=True,
-                conversation_context=conversation_context,
-            )
-            if direct:
-                return direct
-        gap = _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang)
-        return gap or ""
-
-    budget = _infer_kb_answer_budget(combined)[0]
-    filtered = ""
-    keys_scoped = brain_locked_kb
-    # Prefer Brain soft hints when present; otherwise search all customer docs.
-    search_scope = list(valid)[:4] if valid else None
-    if not keys_scoped and not search_scope:
-        try:
-            search_scope = get_customer_kb_keys()
-        except Exception:
-            search_scope = None
-
-    semantic_hit = retrieve_best_kb_chunk(
-        filter_q or combined,
-        keys=search_scope,
-        ai_route=route,
-        min_score=KB_ANSWER_MIN_CONFIDENCE,
-    )
-    # Soft FAQ-style boost only when it does not lose to a stronger semantic hit.
-    faq_hit = resolve_best_faq_chunk_for_question(
-        original_msg,
-        msg_en,
-        conversation_context if not keys_scoped else "",
-        ai_route=route,
-    )
-    if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-        if not semantic_hit or float(faq_hit.get("score") or 0) >= float(
-            semantic_hit.get("score") or 0
-        ):
-            semantic_hit = faq_hit
-    if semantic_hit and float(semantic_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
-        direct = format_direct_reply_from_kb_hit(
-            semantic_hit,
-            original_msg,
-            reply_lang=lang,
-            retrieval_query=filter_q or combined,
-            fast_lane=True,
-            conversation_context=conversation_context,
-        )
-        if direct:
-            return direct
-
-    # Section filter within brain-scoped admin files (when vector match is weak).
-    if valid:
-        live_raw = read_concatenated_kb_file_contents(valid)
-        if live_raw:
-            blob = re.sub(r"<br\s*/?>", "\n", live_raw)
-            filtered = _filter_kb_blob_for_question(blob, filter_q, max_chars=budget)
-            if not filtered.strip():
-                filtered = _kb_plain_excerpt(
-                    _faq_answer_text_from_chunk(blob), max_chars=budget
+            if grounded and _kb_answer_body_is_usable(grounded, min_chars=20):
+                log_reasoning(
+                    "KB brain-keys — Qdrant grounded multi-chunk answer (all matching docs)."
                 )
+                return grounded
+    except Exception as exc:
+        log_reasoning(f"KB brain-keys grounded path skipped: {exc}")
 
-    if not filtered.strip():
-        wide_keys = valid if keys_scoped else None
-        wide = retrieve_best_kb_chunk(
-            combined,
-            keys=wide_keys,
-            ai_route=ai_route,
-            min_score=KB_ANSWER_MIN_CONFIDENCE,
+    gray_floor = max(float(KB_DIRECT_MIN_SCORE), 0.16)
+    try:
+        hit = retrieve_best_kb_chunk(
+            filter_q,
+            keys=search_keys,
+            min_score=gray_floor,
+            ai_route=route,
         )
-        if wide:
-            direct = format_direct_reply_from_kb_hit(
-                wide,
+        # Miss under soft keys → retry full customer corpus (admin may have added
+        # the answer under any title).
+        if (not hit) or float((hit or {}).get("score") or 0) < gray_floor:
+            hit_all = retrieve_best_kb_chunk(
+                filter_q,
+                keys=None,
+                min_score=gray_floor,
+                ai_route=route,
+            )
+            if hit_all and float(hit_all.get("score") or 0) >= gray_floor:
+                hit = hit_all
+                log_reasoning(
+                    "KB brain-keys — soft keys missed; full-corpus vector hit used."
+                )
+        # Owner asks: About narrative without owner fact is a miss — retry owner/unscoped.
+        if (
+            hit
+            and _brain_meaning_asks_owner_name(route)
+            and not _chunk_has_identity_fact(hit.get("chunk") or "")
+        ):
+            log_reasoning(
+                "KB brain-keys — About hit lacks owner fact; retry owner scope."
+            )
+            owner_keys = [
+                k
+                for k in (get_customer_kb_keys() or [])
+                if str(k).lower() == "owner" or "owner" in str(k).lower()
+            ]
+            hit2 = retrieve_best_kb_chunk(
+                filter_q,
+                keys=owner_keys or None,
+                min_score=gray_floor,
+                ai_route=route,
+            )
+            if hit2 and _chunk_has_identity_fact(hit2.get("chunk") or ""):
+                hit = hit2
+            else:
+                hit3 = retrieve_best_kb_chunk(
+                    filter_q,
+                    keys=None,
+                    min_score=gray_floor,
+                    ai_route=route,
+                )
+                if hit3 and _chunk_has_identity_fact(hit3.get("chunk") or ""):
+                    hit = hit3
+        score = float((hit or {}).get("score") or 0)
+        if hit and score >= gray_floor:
+            body = format_direct_reply_from_kb_hit(
+                hit,
                 original_msg,
                 reply_lang=lang,
-                retrieval_query=filter_q or combined,
-                fast_lane=True,
+                retrieval_query=filter_q,
+                fast_lane=False,
                 conversation_context=conversation_context,
+                ai_route=route,
             )
-            if direct:
-                return direct
+            if body and _kb_answer_body_is_usable(body, min_chars=20):
+                log_reasoning(
+                    f"KB brain-keys — vector hit score={score:.2f} "
+                    f"src={(hit.get('source') or '?')}"
+                )
+                return body
+    except Exception as exc:
+        log_reasoning(f"KB brain-keys extractive path skipped: {exc}")
 
-    if not filtered.strip():
-        gap = _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang)
-        if gap:
-            return gap
-        return ""
-
-    use_grounding_llm = (
-        _kb_multilingual_answer_enabled()
-        and _customer_needs_kb_localization(original_msg, lang)
-        and bool((filtered or "").strip())
+    log_reasoning("KB brain-keys — no usable vector answer; honest gap.")
+    return _format_kb_brain_gap_reply(original_msg, msg_en, reply_lang=lang) or (
+        format_kb_no_information_reply(original_msg, reply_lang=lang) or ""
     )
-    if use_grounding_llm:
-        plain_filtered = re.sub(r"<[^>]+>", " ", filtered)
-        plain_filtered = re.sub(r"\s+", " ", plain_filtered).strip()
-        if plain_filtered and _kb_excerpt_is_english_for_customer(plain_filtered, lang):
-            grounded = _ground_kb_excerpt_for_customer(
-                original_msg,
-                plain_filtered,
-                conversation_context=conversation_context,
-                reply_lang=reply_lang or lang,
-                kb_sources=valid,
-            )
-            if grounded:
-                return grounded
-
-    filtered = polish_faq_reply_for_customer(
-        _strip_leading_faq_question(filtered), original_msg
-    )
-    title = (title_hint or "").strip() or _title_from_filtered_kb_text(filtered)
-    intro = ""
-    if _should_show_kb_title(title, original_msg):
-        intro = (
-            f"<div style='color:#333;line-height:1.55;margin-bottom:8px;'>"
-            f"<b>{html_escape(title)}</b>"
-            f"</div>"
-        )
-
-    plain_for_body = filtered
-    core_html = _plain_text_to_html_body(plain_for_body) or _kb_html_body_from_blob(filtered)
-    body = polish_faq_reply_for_customer((intro + core_html) if core_html else "", original_msg)
-    if not body:
-        return ""
-    return _finalize_kb_customer_reply(body, original_msg, lang)
-
 
 def format_dynamic_kb_answer(
     original_msg: str,
@@ -3038,6 +3516,36 @@ def format_dynamic_kb_answer(
     if _text_asks_customer_care_contact(combined) and not _user_requests_grievance_channel(combined):
         return format_customer_care_reply_from_kb(original_msg, msg_en)
 
+    try:
+        from utils.helpers import (
+            message_asks_welfog_social_media,
+            _is_welfog_social_followup,
+        )
+
+        if (
+            _brain_meaning_asks_social(ai_route, combined)
+            or message_asks_welfog_social_media(
+                combined, conversation_context=conversation_context
+            )
+            or _is_welfog_social_followup(combined, conversation_context)
+        ):
+            social = format_welfog_social_media_reply_from_kb(
+                original_msg,
+                msg_en,
+                reply_lang=lang,
+                conversation_context=conversation_context,
+                user_meaning_en=(
+                    ((ai_route or {}).get("user_meaning") or "").strip()
+                    if isinstance(ai_route, dict)
+                    else ""
+                ),
+                ai_confirmed=True,
+            )
+            if social:
+                return social
+    except Exception:
+        pass
+
     retrieval_q = build_kb_retrieval_query(
         original_msg, msg_en, conversation_context, ai_route=ai_route
     )
@@ -3045,47 +3553,146 @@ def format_dynamic_kb_answer(
     if lang == "hinglish" or is_hinglish_message(original_msg):
         lang = "hinglish"
 
+    # Prefer full-corpus retrieval first. faqs.txt is not a privileged silo —
+    # any admin doc (faqs/shipping/owner/…) may hold the answer.
+    route_for_ans = dict(ai_route or {})
+    if (route_for_ans.get("data_channel") or "").strip().lower() != "kb":
+        route_for_ans["data_channel"] = "kb"
+    try:
+        from services.knowledge_answer_service import (
+            generate_grounded_kb_answer_from_qdrant,
+            should_generate_qdrant_kb_answer,
+        )
+
+        if should_generate_qdrant_kb_answer(route_for_ans):
+            grounded_all = generate_grounded_kb_answer_from_qdrant(
+                original_msg,
+                msg_en=msg_en,
+                keys=None if not seller_only else ["seller"],
+                reply_lang=lang,
+                conversation_context=conversation_context,
+                ai_route=route_for_ans,
+            )
+            if grounded_all and _kb_answer_body_is_usable(grounded_all, min_chars=20):
+                log_reasoning("Dynamic KB — Qdrant grounded answer across all matching docs.")
+                return grounded_all
+    except Exception as exc:
+        log_reasoning(f"Dynamic KB grounded path skipped: {exc}")
+
+    # Memory / MiniLM backend: multi-file vector retrieve → LLM ground (same idea as Qdrant).
+    try:
+        corpus_keys = ["seller"] if seller_only else None
+        multi_hits = top_kb_hits(
+            filter_q,
+            keys=corpus_keys,
+            min_score=max(0.14, float(KB_ANSWER_MIN_CONFIDENCE) - 0.08),
+            top_n=8,
+            ai_route=route_for_ans,
+            kb_intent=True,
+        )
+        if multi_hits:
+            top_sc = float(multi_hits[0].get("score") or 0)
+            band = [
+                h
+                for h in multi_hits
+                if float(h.get("score") or 0) >= max(0.14, top_sc * 0.72)
+            ][:5]
+            best = _pick_best_kb_hit_for_query(
+                filter_q, band, ai_route=route_for_ans
+            ) or band[0]
+            # Keep only chunks near the best meaning match — avoid FAQ dumps.
+            best_sc = float(best.get("score") or 0)
+            focused_hits = [
+                h
+                for h in band
+                if float(h.get("score") or 0) >= max(0.14, best_sc * 0.85)
+            ][:3]
+            ctx_parts: list[str] = []
+            srcs: list[str] = []
+            for h in focused_hits:
+                c = _filter_kb_blob_fast(
+                    re.sub(r"<br\s*/?>", "\n", h.get("chunk") or ""),
+                    filter_q,
+                    max_chars=700,
+                    ai_route=route_for_ans,
+                ) or (h.get("chunk") or "")
+                if _kb_answer_body_is_usable(c, min_chars=20):
+                    ctx_parts.append(c.strip())
+                    src = str(h.get("source") or "").strip()
+                    if src and src not in srcs:
+                        srcs.append(src)
+            if ctx_parts:
+                grounded_mem = _ground_kb_excerpt_for_customer(
+                    original_msg,
+                    "\n\n---\n\n".join(ctx_parts),
+                    conversation_context=conversation_context,
+                    reply_lang=reply_lang or lang,
+                    kb_sources=srcs or None,
+                )
+                if grounded_mem and _kb_answer_body_is_usable(grounded_mem, min_chars=20):
+                    log_reasoning(
+                        f"Dynamic KB — multi-file grounded "
+                        f"sources={','.join(srcs[:4]) or 'corpus'} "
+                        f"score={best_sc:.2f}."
+                    )
+                    return grounded_mem
+                # Extractive from best usable chunk if grounding empty.
+                direct = format_direct_reply_from_kb_hit(
+                    best,
+                    original_msg,
+                    reply_lang=lang,
+                    retrieval_query=filter_q,
+                    fast_lane=False,
+                    conversation_context=conversation_context,
+                    ai_route=route_for_ans,
+                )
+                if direct and _kb_answer_body_is_usable(direct, min_chars=20):
+                    log_reasoning(
+                        f"Dynamic KB — best corpus chunk "
+                        f"src={best.get('source')} score={best_sc:.2f}."
+                    )
+                    return direct
+    except Exception as exc:
+        log_reasoning(f"Dynamic KB multi-file path skipped: {exc}")
+
     faq_hit = None
     if not seller_only:
         faq_hit = resolve_best_faq_chunk_for_question(
             original_msg, msg_en, conversation_context, ai_route=ai_route
         )
     if faq_hit and float(faq_hit.get("score") or 0) >= KB_ANSWER_MIN_CONFIDENCE:
+        # Only short-circuit on faqs when the excerpt itself is a usable answer
+        # (not a heading stub / half line).
         excerpt = _faq_answer_text_from_chunk(
             re.sub(r"<br\s*/?>", "\n", faq_hit.get("chunk") or "")
         )
-        excerpt = _kb_plain_excerpt(excerpt, max_chars=_infer_kb_answer_budget(filter_q)[0])
-        if excerpt.strip():
-            if _kb_multilingual_answer_enabled() and _customer_needs_kb_localization(
-                original_msg, lang
-            ):
-                grounded = _ground_kb_excerpt_for_customer(
-                    original_msg,
-                    excerpt,
-                    conversation_context=conversation_context,
-                    reply_lang=reply_lang or lang,
-                    kb_sources=["faqs"],
+        excerpt = _kb_plain_excerpt(excerpt, max_chars=_infer_kb_answer_budget(filter_q, ai_route=ai_route)[0])
+        if _kb_answer_body_is_usable(excerpt):
+            grounded = _ground_kb_excerpt_for_customer(
+                original_msg,
+                excerpt,
+                conversation_context=conversation_context,
+                reply_lang=reply_lang or lang,
+                kb_sources=["faqs"],
+            )
+            if grounded and _kb_answer_body_is_usable(grounded, min_chars=20):
+                log_reasoning(
+                    f"FAQ semantic answer (faqs score={float(faq_hit.get('score') or 0):.2f})."
                 )
-                if grounded:
-                    log_reasoning(
-                        f"FAQ semantic answer (faqs.txt score={float(faq_hit.get('score') or 0):.2f})."
-                    )
-                    return grounded
-            excerpt = polish_faq_reply_for_customer(excerpt, original_msg)
-            title = _title_from_filtered_kb_text(excerpt)
-            intro = (
-                f"<div style='color:#333;line-height:1.55;margin-bottom:8px;'>"
-                f"<b>{html_escape(title)}</b></div>"
-            ) if _should_show_kb_title(title, original_msg) else ""
-            body = intro + (_plain_text_to_html_body(excerpt) or "")
-            body = polish_faq_reply_for_customer(body, original_msg)
-            return _finalize_kb_customer_reply(body, original_msg, lang)
+                return grounded
+            if not _customer_needs_kb_localization(original_msg, lang):
+                excerpt = polish_faq_reply_for_customer(excerpt, original_msg)
+                if _kb_answer_body_is_usable(excerpt):
+                    body = _plain_text_to_html_body(excerpt) or ""
+                    body = polish_faq_reply_for_customer(body, original_msg)
+                    if _kb_answer_body_is_usable(body, min_chars=20):
+                        return _finalize_kb_customer_reply(body, original_msg, lang)
 
     keys = resolve_kb_keys_for_question(
         original_msg,
         msg_en,
         suggested_keys=suggested_keys,
-        max_files=4,
+        max_files=8,
         conversation_context=conversation_context,
         ai_route=ai_route,
     )
@@ -3098,9 +3705,10 @@ def format_dynamic_kb_answer(
     except ImportError:
         _kb_cat = "general"
     filtered = ""
-    budget = _infer_kb_answer_budget(filter_q)[0]
+    budget = _infer_kb_answer_budget(filter_q, ai_route=ai_route)[0]
     seller_keys = [k for k in keys if k == "seller"] if seller_only else keys
-    search_keys = seller_keys or keys
+    # Soft file hints — fall back to full customer corpus when scoped miss.
+    search_keys = seller_keys or keys or None
 
     best_chunk = retrieve_best_kb_chunk(
         filter_q,
@@ -3108,13 +3716,29 @@ def format_dynamic_kb_answer(
         ai_route=ai_route,
         min_score=KB_ANSWER_MIN_CONFIDENCE,
     )
+    if (not best_chunk or not best_chunk.get("chunk")) and not seller_only:
+        best_chunk = retrieve_best_kb_chunk(
+            filter_q,
+            keys=None,
+            ai_route=ai_route,
+            min_score=KB_ANSWER_MIN_CONFIDENCE,
+        )
     if best_chunk and best_chunk.get("chunk"):
         raw_hit = re.sub(r"<br\s*/?>", "\n", best_chunk.get("chunk") or "")
-        cleaned_hit = polish_faq_reply_for_customer(
-            _strip_kb_policy_heading_prefix(_strip_leading_faq_question(raw_hit)),
-            original_msg,
+        # Prefer focused section filter over polish-first (polish can leave headings).
+        cleaned_hit = _filter_kb_blob_fast(
+            raw_hit, filter_q, max_chars=budget, ai_route=ai_route
+        ) or _filter_kb_blob_for_question(
+            raw_hit, filter_q, max_chars=budget, ai_route=ai_route
         )
+        if not _kb_answer_body_is_usable(cleaned_hit or ""):
+            cleaned_hit = polish_faq_reply_for_customer(
+                _strip_leading_faq_question(raw_hit),
+                original_msg,
+            )
         filtered = _kb_plain_excerpt(cleaned_hit or raw_hit, max_chars=budget)
+        if not _kb_answer_body_is_usable(filtered):
+            filtered = ""
         log_kb_retrieval(
             query_intent=_kb_cat,
             query_meaning=((ai_route or {}).get("user_meaning") or "").strip(),
@@ -3757,6 +4381,7 @@ def get_welfog_social_links_from_kb() -> list[tuple[str, str, str]]:
     """
     Parse official social URLs from ANY customer knowledge .txt file.
     Format: `Platform Name: https://...` or `Welfog Instagram: https://...`
+    Also accepts `Platform https://...` and bare platform-host URLs.
     Admin can add/change URLs or new platforms without code changes.
     Returns list of (slug, display_label, url) in file order.
     """
@@ -3765,8 +4390,24 @@ def get_welfog_social_links_from_kb() -> list[tuple[str, str, str]]:
         r"^\s*(?:Welfog\s+)?(.+?)\s*:\s*(https?://\S+)\s*$",
         re.IGNORECASE,
     )
+    url_line_loose = re.compile(
+        r"^\s*(?:Welfog\s+)?([A-Za-z][A-Za-z0-9+ ._-]{1,40}?)\s+(https?://\S+)\s*$",
+        re.IGNORECASE,
+    )
+    bare_url = re.compile(r"(https?://[^\s<>'\"]+)", re.IGNORECASE)
     found: list[tuple[str, str, str]] = []
     seen_slugs: set[str] = set()
+
+    def _add(label: str, url: str) -> None:
+        url = (url or "").strip().rstrip(").,];")
+        label = (label or "").strip()
+        slug = _social_slug_from_kb_label(label) or _social_slug_from_kb_label(url)
+        if not slug or slug in seen_slugs:
+            return
+        if not re.match(r"^https?://", url, re.I):
+            return
+        seen_slugs.add(slug)
+        found.append((slug, label or slug.title(), url))
 
     for key in get_customer_kb_keys():
         text = get_runtime_knowledge_files().get(key)
@@ -3776,15 +4417,38 @@ def get_welfog_social_links_from_kb() -> list[tuple[str, str, str]]:
             line = raw.strip()
             if not line or "http" not in line.lower():
                 continue
+            if _chunk_is_agent_instruction_blob(line):
+                continue
             m = url_line.match(line)
-            if not m:
+            if m:
+                _add(m.group(1), m.group(2))
                 continue
-            label, url = m.group(1).strip(), m.group(2).strip()
-            slug = _social_slug_from_kb_label(label)
-            if not slug or slug in seen_slugs:
+            m2 = url_line_loose.match(line)
+            if m2:
+                _add(m2.group(1), m2.group(2))
                 continue
-            seen_slugs.add(slug)
-            found.append((slug, label, url))
+            # URL on line with platform hostname → infer slug from host
+            um = bare_url.search(line)
+            if not um:
+                continue
+            url = um.group(1)
+            host = re.sub(r"^https?://(www\.)?", "", url, flags=re.I).split("/")[0].lower()
+            label_guess = ""
+            for needle, slug in (
+                ("instagram.com", "Instagram"),
+                ("facebook.com", "Facebook"),
+                ("fb.com", "Facebook"),
+                ("youtube.com", "YouTube"),
+                ("youtu.be", "YouTube"),
+                ("linkedin.com", "LinkedIn"),
+                ("twitter.com", "Twitter"),
+                ("x.com", "Twitter"),
+            ):
+                if needle in host:
+                    label_guess = slug
+                    break
+            if label_guess:
+                _add(label_guess, url)
     return found
 
 
@@ -3993,6 +4657,9 @@ def format_welfog_social_media_reply_from_kb(
         picked = _ordered_all_slugs() if vague_all else []
 
     if not picked:
+        # Not a clear platform-URL ask (e.g. Reels system) — fall through to KB.
+        if not requested and not wants_all:
+            return ""
         if lang == "hinglish" or is_hinglish_message(original_msg):
             return sysmsg("welfog_social_not_available_hinglish") or sysmsg("welfog_social_not_available") or ""
         return sysmsg("welfog_social_not_available") or ""
@@ -4013,7 +4680,7 @@ def format_welfog_social_media_reply_from_kb(
         url = all_links[slug]
         label = labels_from_kb.get(slug) or known_labels.get(slug, slug.replace("_", " ").title())
         parts.append(
-            f"<a href='{html_escape(url)}' target='_blank' rel='noopener noreferrer' "
+            f"<a href='{html_escape(url)}'  "
             f"style='{btn_style}background:#333;'>{html_escape(label)}</a>"
         )
 

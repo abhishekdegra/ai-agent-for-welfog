@@ -1,25 +1,64 @@
+# =============================================================================
+# Welfog support — what must never land on git
+# =============================================================================
+
 # Python
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *$py.class
 *.pyo
+*.pyd
 .Python
+*.egg
 *.egg-info/
+.eggs/
 dist/
 build/
-.eggs/
+pip-wheel-metadata/
+*.manifest
+*.spec
 
 # Virtual env
 venv/
 .venv/
 env/
+ENV/
+.conda/
 
-# Secrets — never commit real keys
+# Secrets / credentials — never commit real keys
 .env
+.env.*
+!.env.example
+!.env*.example
 .env.local
 .env.*.local
-!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+!**/certs/.gitkeep
+secrets/
+credentials.json
+**/credentials*.json
+**/service-account*.json
+**/google-credentials*.json
+*.secrets.json
+
+# Flask / local app runtime
+instance/
+.flaskenv
+
+# Local databases (admin SQLite + any runtime DBs)
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+*.db-wal
+*.db-shm
+welfog_history.db
+welfog_v2.db
 
 # IDE / editor
 .vscode/
@@ -28,24 +67,56 @@ env/
 .continue/
 *.swp
 *.swo
+*~
+.project
+.settings/
 
 # OS
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
 
-# Logs & debug
+# Logs & debug dumps
 *.log
+logs/
 debug-*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
 
-# Local runtime DB (legacy SQLite history — chat uses MySQL)
-welfog_history.db
-
-# Test / temp caches
+# Test / lint / type / coverage caches
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+.hypothesis/
 .coverage
+.coverage.*
+coverage.xml
 htmlcov/
+.cache/
+.pytype/
 
-# Local Qdrant backup
+# Local ML / HF caches accidentally dropped in repo
+.cache/huggingface/
+
+# Local Qdrant / vector dumps
 qdrant_backup.tar.gz
+qdrant_storage/
+qdrant_data/
+**/qdrant/storage/
+
+# Temp / backups / exports
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+*.sql.gz
+*.dump
+
+# Node (if any frontend tooling lands here)
+node_modules/
