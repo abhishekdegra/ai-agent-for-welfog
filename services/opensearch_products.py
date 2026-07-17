@@ -219,8 +219,9 @@ _NOUN_TYPO_MAP = {
     "covr": "cover", "covar": "cover", "cvr": "cover", "coverz": "cover", "coverzs": "cover",
     "moblie": "mobile", "mobail": "mobile",
     "tshrt": "tshirt", "tshirt": "tshirt", "jean": "jeans", "chargr": "charger", "botle": "bottle",
-    "shrt": "shirt", "sare": "saree", "kurtaa": "kurta",
+    "shrt": "shirt", "kurtaa": "kurta",
 }
+# NOTE: typo map is OpenSearch recall only — never use it for intent / category-browse routing.
 # Words that must NEVER be treated as warehouse SKU codes (colours, product types, brands).
 _SKU_ATTRIBUTE_STOP = _COLOR_NAME_TOKENS | _PRODUCT_NOUNS | frozenset(
     {
@@ -1230,14 +1231,15 @@ def _compound_space_variants(token: str) -> list[str]:
     No synonym dictionary — all alphabetic split points; OpenSearch BM25 ranks the useful ones.
     """
     t = re.sub(r"[^a-z0-9]", "", (token or "").lower())
-    if len(t) < 7:
+    # Short tokens (leather, samsung) produce junk splits (lea ther) that slow OS.
+    if len(t) < 9:
         return []
     out: list[str] = []
     for i in range(3, len(t) - 2):
         left, right = t[:i], t[i:]
         if left.isalpha() and right.isalpha():
             out.append(f"{left} {right}")
-        if len(out) >= 8:
+        if len(out) >= 4:
             break
     return out
 
@@ -1249,7 +1251,8 @@ def _soft_collapse_repeated_letters(text: str) -> str:
         return soft_collapse_repeated_letters(text)
     except ImportError:
         t = (text or "").lower()
-        t = re.sub(r"([aeiou])\1+", r"\1", t)
+        # Match product_query_understanding: keep normal doubles (moose, google).
+        t = re.sub(r"([aeiou])\1{2,}", r"\1", t)
         t = re.sub(r"([b-df-hj-np-tv-z])\1{2,}", r"\1", t)
         return t
 
@@ -1266,12 +1269,13 @@ def _expand_title_query_variants(title: str) -> list[str]:
     if not base:
         return []
     collapsed = _soft_collapse_repeated_letters(base)
-    # Prefer soft-collapsed form first — matching quality, not keyword maps.
+    # Prefer ORIGINAL orthography as primary — soft-collapse is only a secondary
+    # variant (moosewala must not become mosewala as the main OpenSearch query).
     variants: list[str] = []
-    if collapsed:
-        variants.append(collapsed)
-    if base and base not in variants:
+    if base:
         variants.append(base)
+    if collapsed and collapsed not in variants:
+        variants.append(collapsed)
 
     def _add(alt: str) -> None:
         alt = re.sub(r"\s+", " ", (alt or "").strip().lower())
@@ -1298,29 +1302,28 @@ def _expand_title_query_variants(title: str) -> list[str]:
         if sing != source:
             _add(sing)
 
-    # Prefer balanced spaced splits early (flipflops → flip flops).
+    # Compound splits only for glued single tokens (flipflops → flip flops).
+    # Multi-word titles like "samsung cover" already match BM25 — mid-word
+    # splits (sam sung / sams ung) blow up the should-clause and slow OpenSearch.
     for source in list(variants[:2]):
-        for tok in source.split():
+        toks = source.split()
+        for tok in toks:
             soft = _soft_collapse_repeated_letters(tok)
             if soft != tok:
                 _add(source.replace(tok, soft, 1))
-            splits = _compound_space_variants(soft if soft != tok else tok)
-            # Rank by length balance so "flip flops" beats "fliipf lops".
-            ranked = sorted(
-                splits,
-                key=lambda s: abs(len(s.split()[0]) - len(s.split()[-1])) if " " in s else 99,
-            )
-            for split in ranked[:4]:
-                _add(source.replace(tok, split, 1))
-        compact = re.sub(r"[^a-z0-9]", "", source)
-        if len(compact) >= 7:
-            ranked = sorted(
-                _compound_space_variants(compact),
-                key=lambda s: abs(len(s.split()[0]) - len(s.split()[-1])) if " " in s else 99,
-            )
-            for split in ranked[:3]:
-                _add(split)
-    return variants[:8]
+        if len(toks) >= 2:
+            continue
+        tok = toks[0] if toks else ""
+        soft = _soft_collapse_repeated_letters(tok) if tok else ""
+        splits = _compound_space_variants(soft if soft != tok else tok)
+        ranked = sorted(
+            splits,
+            key=lambda s: abs(len(s.split()[0]) - len(s.split()[-1])) if " " in s else 99,
+        )
+        for split in ranked[:2]:
+            _add(split)
+    # Cap alts — primary + singular + 1–2 compound forms is enough for BM25.
+    return variants[:4]
 
 
 def _build_title_match_clause(title: str) -> dict[str, Any]:
@@ -3531,8 +3534,33 @@ def _opensearch_request(body: dict, *, timeout_sec: float = 8) -> tuple[list, in
     except Exception:
         pass
     try:
-        limit = max(3.0, min(10.0, float(timeout_sec or 8)))
-        res = requests.post(cfg["url"], json=body, auth=cfg["auth"], timeout=limit)
+        limit = max(2.5, min(6.0, float(timeout_sec or 5)))
+        # Hard wall-clock — socket timeout alone can hang 30–60s on stuck TLS.
+        import concurrent.futures
+
+        def _do_post():
+            return requests.post(
+                cfg["url"], json=body, auth=cfg["auth"], timeout=(2.0, limit)
+            )
+
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        try:
+            fut = pool.submit(_do_post)
+            try:
+                res = fut.result(timeout=limit + 0.6)
+            except concurrent.futures.TimeoutError:
+                try:
+                    from utils.reasoning_log import log_reasoning
+
+                    log_reasoning(f"OpenSearch hard timeout ({limit}s) — empty hits.")
+                except Exception:
+                    pass
+                return [], 0
+        finally:
+            try:
+                pool.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                pool.shutdown(wait=False)
         if res.status_code != 200:
             return [], 0
         data = res.json()
@@ -3557,7 +3585,7 @@ def _search_opensearch_page(
     page_size = min(max(1, int(page_size)), MAX_PAGE_SIZE)
     offset = (page - 1) * page_size
     body = _build_opensearch_body(spec, size=page_size, offset=offset)
-    os_timeout = 5.0 if spec.get("_category_only_browse") else 8.0
+    os_timeout = 4.0 if spec.get("_category_only_browse") else 5.0
     hits, os_total = _opensearch_request(body, timeout_sec=os_timeout)
     cards = opensearch_hits_to_product_cards(hits)
     cards = apply_catalog_post_filters(cards, spec, post_filter_mode=post_filter_mode)
@@ -3809,8 +3837,14 @@ def search_opensearch_catalog(
                 if t not in toks and t not in ("the", "and", "for", "with"):
                     toks.append(t)
             seen_tok: set[str] = set()
-            for tok in toks[:4]:
+            # Prefer longer distinctive tokens first (sidhu/moosewala before frame).
+            # Never soft-recover on short generic tails when a longer subject token exists.
+            max_tok_len = max((len(t) for t in toks[:4]), default=0)
+            ordered = sorted(toks[:4], key=lambda t: (-len(t), t))
+            for tok in ordered:
                 if tok in seen_tok or tok == tq:
+                    continue
+                if len(toks) >= 2 and max_tok_len >= 6 and len(tok) < max_tok_len - 2:
                     continue
                 seen_tok.add(tok)
                 soft = dict(spec)
@@ -3831,6 +3865,8 @@ def search_opensearch_catalog(
                         f"OpenSearch AI single-pass token-soft {tok!r}: "
                         f"{n} product(s) (multi-token miss recovery)."
                     )
+                    break
+                if len(seen_tok) >= 2:
                     break
         if cards:
             log_reasoning(
@@ -4306,6 +4342,7 @@ def catalog_search_live(
         return [], spec, 0, False
 
     log_reasoning(f"Catalog: OpenSearch 0 hits — live REST API name={q!r}")
+    _rest_t0 = _time.perf_counter()
     cat_id = spec.get("category_id")
     if cat_id:
         from services.welfog_api import resolve_search_category_id
@@ -4330,7 +4367,9 @@ def catalog_search_live(
         if q and q not in rest_queries:
             rest_queries.insert(0, q)
     rest: list = []
-    rest_cap = 2 if single_pass_miss else 4
+    # Single-pass: OpenSearch already tried title variants. One short REST is enough
+    # for index-lag catch-up — a 2nd 4s miss doubled empty-catalog latency.
+    rest_cap = 1 if single_pass_miss else 4
     for rq in rest_queries[:rest_cap]:
         if single_pass_miss:
             # Short timeout — empty catalog should fail fast, not stall 60s.
@@ -4360,8 +4399,18 @@ def catalog_search_live(
             if rq != q:
                 log_reasoning(f"Catalog: REST hit via typo-soft name={rq!r} (was {q!r})")
             break
+    try:
+        from services.chat_flow_telemetry import record_api_time, record_phase
+
+        _rest_el = _time.perf_counter() - _rest_t0
+        record_api_time(_rest_el)
+        record_phase("catalog_rest", _rest_el * 1000.0)
+    except ImportError:
+        pass
     brand_key = (spec.get("brand") or "").strip()
-    if not rest and brand_key:
+    # Locked single-pass already tried title REST (2×4s). Brand page crawl via
+    # fetch_products_from_api (12s×3) was dominating empty Nike/Adidas turns.
+    if not rest and brand_key and not single_pass_miss:
         log_reasoning(f"Catalog: REST brand browse name={brand_key!r}")
         for pg in (1, 2, 3):
             rest.extend(
@@ -4384,6 +4433,10 @@ def catalog_search_live(
                 seen_rest.add(k)
             uniq_rest.append(it)
         rest = uniq_rest
+    elif not rest and brand_key and single_pass_miss:
+        log_reasoning(
+            f"Catalog: skip REST brand browse on single-pass miss (brand={brand_key!r})."
+        )
     if not rest:
         return [], spec, 0, False
     pf = _post_filter_mode_for_spec(spec)

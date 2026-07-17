@@ -724,6 +724,17 @@ def try_scope_ai_early_reply(
         return None
     if dec.scope not in (SCOPE_CHITCHAT, SCOPE_OUT):
         return None
+    # Without RECENT chat, OOD mislabels shopping typos/corrections ("fame" for frame).
+    # Require high confidence so ambiguous turns fall through to Brain product routing.
+    if dec.scope == SCOPE_OUT:
+        has_ctx = bool((conversation_context or "").strip())
+        min_ood = 0.92 if not has_ctx else 0.72
+        if dec.confidence < min_ood:
+            log_reasoning(
+                f"Early scope OOD deferred to Brain "
+                f"(conf={dec.confidence:.2f} < {min_ood:.2f}, ctx={'yes' if has_ctx else 'no'})."
+            )
+            return None
     if dec.confidence < 0.48 and not (dec.reply or "").strip():
         return None
 

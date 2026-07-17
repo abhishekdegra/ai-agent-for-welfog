@@ -1370,6 +1370,8 @@ _CATEGORY_BROWSE_FILLER = frozenset(
         "me", "in", "all", "saare", "saari", "sab", "want", "need", "give", "dena",
         "lao", "la", "de", "do", "wale", "wali", "some", "any", "bhi", "also", "too",
         "k", "pls", "yar", "yrr", "bhai", "na",
+        # Store / channel name — not a product token when stripping for leftover intent.
+        "welfog",
     }
 )
 
@@ -1435,75 +1437,64 @@ def _message_has_product_search_filters(text: str) -> bool:
     return False
 
 
-_CATEGORY_BROWSE_SIGNALS = (
-    "dikhao", "dikha", "dikhe", "dikhaa", "dikha de", "dikha do", "dikhado",
-    "dekho", "dekh", "show", "list", "display", "browse", "explore",
-    "batao", "btao", "bata", "bta", "btana", "batana", "bta de", "bata de", "bta do",
-    "bhi bta", "bhi dikha", "bhi bata", "bhi show", "k bhi", "ke bhi",
-    "chahiye", "chiye", "dena", "de do", "dede", "de de",
-    "lao", "la do", "bhejo", "send", "view", "see",
-    "puchh", "pooch", "puch", "bol", "bolo",
-    "product", "products", "item", "items", "samaan", "cheez",
-)
-
-
-def _message_has_browse_signals(text: str) -> bool:
-    tl = f" {(text or '').lower()} "
-    return any(s in tl for s in _CATEGORY_BROWSE_SIGNALS)
-
-
 def message_requests_category_browse(text: str) -> bool:
-    """True when user wants products from a named department (any language/style)."""
+    """True when user wants products from a named live-nav department (any language/style)."""
     if not (text or "").strip():
         return False
     try:
-        from utils.helpers import _looks_like_browse_all_categories_message
+        from utils.helpers import message_asks_welfog_categories_list
 
-        if _looks_like_browse_all_categories_message(text):
+        # Full menu ask ("which categories exist") — not products inside one dept.
+        if message_asks_welfog_categories_list(text):
             return False
     except ImportError:
         pass
 
-    # Explicit department ask + resolvable nav id wins over typo leftovers
-    # ("dika"≈dikha) that would otherwise look like a specific product search.
-    if _user_explicitly_browses_category(text):
-        cid = resolve_nav_category_id_fast(text)
-        if cid and not _message_has_concrete_product_intent(text):
-            return True
-
     if _message_has_product_search_filters(text):
         return False
-    if _user_explicitly_browses_category(text):
-        return True
-    if not _message_has_browse_signals(text):
+    if _message_has_concrete_product_intent(text):
         return False
+    # Live nav / fuzzy department label match — no customer-language keyword lists.
     return bool(resolve_nav_category_id_fast(text))
 
 
-def _message_has_concrete_product_intent(text: str) -> bool:
+def _product_intent_probe_text(text: str) -> str:
     """
-    True only for a real product/SKU/brand ask — not department browse with typos.
-    Unlike _message_targets_specific_product, ignores leftover filler misspellings.
+    Tokens left after removing live-nav department labels + browse filler.
+
+    Intent routing uses this leftover only — never typo/noun dictionaries —
+    so any language/style that resolves to a department still category-browses
+    when nothing product-specific remains.
     """
+    stripped = _strip_message_for_category_lookup(text) or ""
+    leftover = set(re.findall(r"[a-z0-9]{3,}", stripped.lower()))
+    try:
+        nav = _get_nav_categories_map(None) or {}
+        cat_toks: set[str] = set()
+        for name in nav.keys():
+            cat_toks.update(re.findall(r"[a-z0-9]{3,}", (name or "").lower()))
+        leftover -= cat_toks
+    except Exception:
+        pass
+    leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
+    return " ".join(sorted(leftover)).strip()
+
+
+def _message_has_structured_product_attrs(text: str) -> bool:
+    """Brand / price / color / SKU — catalog filters, not language keyword maps."""
     if not (text or "").strip():
         return False
     low = (text or "").lower()
+    words = set(re.findall(r"[a-z0-9]{3,}", low))
+    if words & PHONE_BRANDS:
+        return True
     try:
         from services.opensearch_products import (
-            _extract_product_keywords,
-            _PRODUCT_NOUNS,
             _extract_price_bounds,
             color_hue_mentioned_in_text,
             normalize_color_fuzzy,
         )
 
-        if _extract_product_keywords(low):
-            return True
-        words = set(re.findall(r"[a-z0-9]{3,}", low))
-        if words & set(_PRODUCT_NOUNS):
-            return True
-        if words & PHONE_BRANDS:
-            return True
         pmax, pmin = _extract_price_bounds(text, low)
         if pmax is not None or pmin is not None:
             return True
@@ -1512,9 +1503,22 @@ def _message_has_concrete_product_intent(text: str) -> bool:
             return True
     except ImportError:
         pass
-    if re.search(r"\bsku\b", low):
+    return bool(re.search(r"\bsku\b", low))
+
+
+def _message_has_concrete_product_intent(text: str) -> bool:
+    """
+    True when the turn asks for a specific item/filter — not bare department browse.
+
+    Production rule: live-nav labels + filler stripped; leftover empty ⇒ browse.
+    Any leftover token (any language/orthography) ⇒ product ask.
+    Typo/noun maps are intentionally not consulted here.
+    """
+    if not (text or "").strip():
+        return False
+    if _message_has_structured_product_attrs(text):
         return True
-    return False
+    return bool(_product_intent_probe_text(text))
 
 
 def resolve_nav_category_id_fast(text: str, ctx=None) -> Optional[str]:
@@ -1529,9 +1533,8 @@ def resolve_nav_category_id_fast(text: str, ctx=None) -> Optional[str]:
         return explicit
     nav_map = _get_nav_categories_map(ctx)
     main_hint = _main_category_hint_from_text(expanded, ctx)
-    if main_hint and (
-        _user_explicitly_browses_category(text) or _message_has_browse_signals(text)
-    ):
+    # Named live-nav department + not a concrete SKU ask → browse that dept.
+    if main_hint and _user_explicitly_browses_category(text):
         return str(main_hint)
     for candidate in _category_lookup_candidates(expanded):
         if not candidate:
@@ -2264,6 +2267,14 @@ def _is_category_browse_filler_token(tok: str) -> bool:
         return True
     if t in _CATEGORY_BROWSE_FILLER:
         return True
+    # Catalog product nouns are never filler (saree must not fuzzy-match saare/all).
+    try:
+        from services.opensearch_products import _PRODUCT_NOUNS
+
+        if t in _PRODUCT_NOUNS or (t.endswith("s") and t[:-1] in _PRODUCT_NOUNS):
+            return False
+    except ImportError:
+        pass
     # Morphological extensions of filler stems (≥4 chars): dekh→dekhne, dikha→dikhao.
     for f in _CATEGORY_BROWSE_FILLER:
         if len(f) >= 4 and len(t) > len(f) and t.startswith(f):
@@ -2465,106 +2476,31 @@ def _should_ignore_wrong_covers_category(text: str, category_id: str) -> bool:
     return False
 
 
-_CATEGORY_BROWSE_RE = re.compile(
-    r"(?:"
-    r"\b(?:category|subcategory|department|section)\b|"
-    r"\bke\s+(?:saare\s+)?products?\b|"
-    r"\b(?:me|mai|men)\s+(?:dikha|dikhao|dikhado|products?|items?|sab|saare)\b|"
-    r"\bbrowse\s+(?:all\s+)?categories\b|"
-    r"\b(?:saari|sari)\s+categories\b"
-    r")",
-    re.IGNORECASE,
-)
-
-
 def _user_explicitly_browses_category(text: str) -> bool:
-    """User wants a department browse, not a single SKU keyword (shirt, charger…)."""
-    low = (text or "").lower()
-    if _CATEGORY_BROWSE_RE.search(low):
-        return True
-    dept_words = (
-        "fashion", "beauty", "electronics", "grocery", "groceries", "kitchen",
-        "home", "sports", "footwear", "appliance", "appliances", "mobiles",
+    """
+    User named a live Welfog department (from nav API), not a concrete SKU ask.
+    No language/phrase keyword maps — department match is dynamic catalog labels.
+    """
+    if not (text or "").strip():
+        return False
+    expanded = _expand_category_query_text(text)
+    hint = _main_category_hint_from_text(text) or _main_category_hint_from_text(
+        expanded
     )
-    if any(d in low for d in dept_words) and re.search(
-        r"\b(?:products?|items?|sab|saare|browse|explore|dikha|dikhao)\b", low
-    ):
-        try:
-            from services.opensearch_products import _extract_product_keywords
-
-            if not _extract_product_keywords(low):
-                return True
-        except ImportError:
-            return True
-    return False
+    if not hint:
+        return False
+    return not _message_has_concrete_product_intent(text)
 
 
 def _message_targets_specific_product(text: str) -> bool:
     """
-    True when the message names a product type beyond a bare department browse.
+    True when the message names something beyond bare department browse.
 
-    Uses leftover tokens after stripping category labels / browse filler — not a
-    product synonym dictionary — so vest/baniyan/flipflops/etc. stay product search.
+    Production rule (no customer-language / typo dictionaries):
+    leftover after live-nav label + filler strip ⇒ product search.
+    Empty leftover + named department ⇒ department browse.
     """
-    low = (text or "").lower()
-    if not low.strip():
-        return False
-    try:
-        from services.opensearch_products import (
-            _GENERIC_TITLE_MODIFIERS,
-            _extract_product_keywords,
-            _PRODUCT_NOUNS,
-        )
-
-        if _extract_product_keywords(low):
-            return True
-        words = set(re.findall(r"[a-z0-9]{3,}", low))
-        if words & set(_PRODUCT_NOUNS):
-            return True
-    except ImportError:
-        _GENERIC_TITLE_MODIFIERS = frozenset()  # noqa: N806
-
-    stripped = _strip_message_for_category_lookup(text)
-    leftover = set(re.findall(r"[a-z0-9]{3,}", (stripped or "").lower()))
-    try:
-        nav = _get_nav_categories_map(None) or {}
-        cat_toks: set[str] = set()
-        for name in nav.keys():
-            cat_toks.update(re.findall(r"[a-z0-9]{3,}", (name or "").lower()))
-        leftover -= cat_toks
-    except Exception:
-        pass
-    leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
-    try:
-        leftover -= set(_GENERIC_TITLE_MODIFIERS)
-    except Exception:
-        pass
-    # Any remaining token (vest, baniyan, flipflops, innerwear, …) ⇒ product search.
-    if leftover:
-        # If message resolves to a department, only ignore leftover that is the
-        # category name / typo noise — keep real product nouns (vest, slippers…).
-        try:
-            cid = resolve_nav_category_id_fast(text) or resolve_nav_category_id_fast(
-                _expand_category_query_text(text)
-            )
-            if cid:
-                leftover -= _category_name_tokens_for_id(cid)
-                leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
-                try:
-                    leftover -= set(_GENERIC_TITLE_MODIFIERS)
-                except Exception:
-                    pass
-                if not leftover:
-                    return False
-                # Explicit department browse + only fuzzy noise left → not a SKU ask.
-                if _user_explicitly_browses_category(text) and not _message_has_concrete_product_intent(
-                    text
-                ):
-                    return False
-        except Exception:
-            pass
-        return True
-    return False
+    return _message_has_concrete_product_intent(text)
 
 
 def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]:

@@ -34,6 +34,29 @@ def _turn_cache_key(
     )
 
 
+def _account_list_loose_cache_key(
+    original_msg: str,
+    msg_en: str,
+    reply_lang: str = "",
+    *,
+    ai_route: dict | None = None,
+) -> str:
+    """
+    Context-agnostic cache key for the same user turn text.
+    Helps reuse one account-list micro-LLM result across multiple call sites that
+    pass slightly different conversation_context snapshots in the same request.
+    """
+    route_kind = ""
+    route_intent = ""
+    if isinstance(ai_route, dict):
+        route_kind = (ai_route.get("account_list_kind") or "").strip().lower()
+        route_intent = (ai_route.get("intent") or "").strip().lower()
+    return (
+        f"account_list_loose|{hash(_combined(original_msg, msg_en))}|"
+        f"{(reply_lang or '').strip().lower()}|{route_kind}|{route_intent}"
+    )
+
+
 def _is_bare_id_token(text: str) -> bool:
     comb = (text or "").strip()
     return bool(
@@ -141,6 +164,19 @@ def get_account_list_ai_classification(
         cached = getattr(_ACCOUNT_LIST_CACHE, "result", None)
         if cached is not None:
             return cached
+    loose_key = _account_list_loose_cache_key(
+        original_msg,
+        msg_en,
+        reply_lang,
+        ai_route=ai_route,
+    )
+    if getattr(_ACCOUNT_LIST_CACHE, "loose_key", None) == loose_key:
+        loose_cached = getattr(_ACCOUNT_LIST_CACHE, "loose_result", None)
+        if isinstance(loose_cached, dict) and (
+            (loose_cached.get("account_list_kind") or "").strip().lower() not in ("", "none")
+        ):
+            log_reasoning("Account-list: reused per-turn classifier result (skip duplicate reasoning).")
+            return loose_cached
 
     brain = _brain_route_for_turn(ai_route)
     if brain:
@@ -165,6 +201,8 @@ def get_account_list_ai_classification(
                 )
                 _ACCOUNT_LIST_CACHE.key = key
                 _ACCOUNT_LIST_CACHE.result = result
+                _ACCOUNT_LIST_CACHE.loose_key = loose_key
+                _ACCOUNT_LIST_CACHE.loose_result = result
                 return result
         except ImportError:
             pass
@@ -180,6 +218,11 @@ def get_account_list_ai_classification(
 
     _ACCOUNT_LIST_CACHE.key = key
     _ACCOUNT_LIST_CACHE.result = result
+    if isinstance(result, dict) and (
+        (result.get("account_list_kind") or "").strip().lower() not in ("", "none")
+    ):
+        _ACCOUNT_LIST_CACHE.loose_key = loose_key
+        _ACCOUNT_LIST_CACHE.loose_result = result
     return result
 
 

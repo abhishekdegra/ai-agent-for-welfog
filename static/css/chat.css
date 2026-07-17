@@ -1164,6 +1164,27 @@ html, body {
     border-top: 1px dashed rgba(0, 0, 0, 0.1);
 }
 
+.msg .wf-ph-card--track-open .wf-ph-track-panel {
+    animation: wfPhTrackReveal 0.34s cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+@keyframes wfPhTrackReveal {
+    from {
+        opacity: 0;
+        transform: translateY(-8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .msg .wf-ph-card--track-open .wf-ph-track-panel {
+        animation: none;
+    }
+}
+
 [data-theme="dark"] .msg .wf-ph-track-panel {
     border-top-color: rgba(255, 255, 255, 0.12);
 }

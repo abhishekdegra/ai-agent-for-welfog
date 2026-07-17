@@ -5197,48 +5197,15 @@ def extract_embedded_query_identifiers(
 
 def _text_requests_category_product_browse(t: str, ctx=None) -> bool:
     """
-    User wants products FROM a named category (e.g. beauty / electronics ke products bta).
-    Not the full 'all categories' department list.
+    Products FROM a named live-nav department — not the full category menu.
+    Delegates to catalog API label resolve (any language via Brain/nav map).
     """
     try:
-        from services.welfog_api import (
-            message_requests_category_browse,
-            resolve_nav_category_id_fast,
-            resolve_category_browse_for_catalog,
-        )
+        from services.welfog_api import message_requests_category_browse
 
-        if not message_requests_category_browse(t):
-            return False
-        if resolve_nav_category_id_fast(t, ctx=ctx):
-            return True
-        route = resolve_category_browse_for_catalog(
-            t, ctx=ctx, allow_inner_lookup=False
-        )
-        return bool(route)
+        return bool(message_requests_category_browse(t))
     except ImportError:
-        pass
-    if _looks_like_browse_all_categories_message(t):
         return False
-    try:
-        from services.welfog_api import get_category_id_from_text
-
-        named_cat_id = get_category_id_from_text(t, ctx=ctx)
-    except Exception:
-        named_cat_id = None
-    if not named_cat_id:
-        return False
-
-    tl = f" {(t or '').lower()} "
-    browse_signals = (
-        "dikhao", "dikha", "dikhe", "dikhaa", "dikha de", "dikha do", "dekho", "dekh", "show", "list", "display",
-        "batao", "btao", "bata", "bta", "btana", "batana", "bta de", "bata de", "bta do",
-        "bhi bta", "bhi dikha", "k bhi",
-        "chahiye", "chiye", "dena", "de do", "dede", "de de",
-        "lao", "la do", "bhejo", "send", "view", "see",
-        "puchh", "pooch", "puch", "puch rha", "bol", "bolo",
-        "product", "products", "item", "items", "samaan", "cheez",
-    )
-    return any(s in tl for s in browse_signals)
 
 
 def _normalize_order_history_typos(t: str) -> str:
@@ -8663,66 +8630,46 @@ def user_continues_product_browse_from_conversation(
 
 
 def _looks_like_browse_all_categories_message(t: str) -> bool:
-    t = t.lower()
-    return any(
-        x in t
-        for x in (
-            "all categor", "saari categor", "sari categor", "category list", "categories list",
-            "catagory list", "catagories list", "list of categor", "konsi categor",
-            "kaun si categor", "browse categor", "har categor",
-        )
-    )
+    """Full Welfog category menu ask — delegates to semantic list detector."""
+    return message_asks_welfog_categories_list(t)
 
 
 def _text_mentions_category_menu(t: str) -> bool:
-    """Category menu mention — typo-tolerant (catagories, catagory, categories)."""
+    """Structural domain stem (categor*/catagor*) — not a product dictionary."""
     tl = f" {(t or '').lower()} "
-    if "categor" in tl:
+    if "categor" in tl or "catagor" in tl:
         return True
     return bool(re.search(r"\bcat[ae]?g[ao]ri(?:es|e)?s?\b", tl))
 
 
-def _looks_like_category_list_request(t: str) -> bool:
-    """User wants the full Welfog category list/menu — not products inside one category."""
-    if not (t or "").strip():
-        return False
-    if _looks_like_browse_all_categories_message(t):
-        return True
-    tl = f" {(t or '').lower()} "
-    if any(
-        x in tl
-        for x in (
-            "kitni", "kitne", "how many", "total ", "count", "list", "dikhao", "dikha",
-            "dikhado", "btao", "batao", "bata de", "bta de", "bta do", "de de", "dede",
-            "dena", "show", "dekho", "saari", "sab ", "all ", "poori", "puri",
-        )
-    ):
-        return True
-    if re.search(r"\b(?:bta|btao|bata|de|dikha|show|list|batado|batade)\b", tl):
-        return True
-    if re.search(r"\bwelfog\b", tl) and _text_mentions_category_menu(t):
-        return True
-    return False
-
-
 def message_asks_welfog_categories_list(t: str) -> bool:
-    """User wants Welfog category names/count/list — not products from one category."""
+    """
+    User wants the full Welfog department menu (which categories exist), not
+    products inside one named department.
+
+    Production rule (no language/phrase keyword maps):
+    - Must mention the category domain stem (structural).
+    - Must NOT name a live-nav department (dynamic API labels) for product browse.
+    Brain / catalog-menu LLM owns phrasing in any language; this is the zero-LLM gate.
+    """
     if not (t or "").strip():
         return False
     if not _text_mentions_category_menu(t):
         return False
-    if _looks_like_category_list_request(t):
-        return True
-    if _text_requests_category_product_browse(t):
-        return False
-    from services.welfog_api import _user_explicitly_browses_category
+    try:
+        from services.welfog_api import (
+            _expand_category_query_text,
+            _main_category_hint_from_text,
+        )
 
-    if _user_explicitly_browses_category(t) and not _looks_like_browse_all_categories_message(t):
-        return False
-    tl = f" {(t or '').lower()} "
-    if re.search(r"\bwelfog\b", tl):
-        return True
-    return False
+        # Named live department in the message → products for that dept, not the menu.
+        if _main_category_hint_from_text(t) or _main_category_hint_from_text(
+            _expand_category_query_text(t)
+        ):
+            return False
+    except ImportError:
+        pass
+    return True
 
 
 def _text_has_refund_or_return_intent(t: str) -> bool:

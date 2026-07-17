@@ -468,3 +468,78 @@ def index_pending_ready_knowledge_chunks() -> dict[str, Any]:
         "failed_chunks": failed_chunks,
         "qdrant_points_count": qdrant_points,
     }
+
+
+def _qdrant_knowledge_points_count() -> int | None:
+    if not is_qdrant_configured():
+        return None
+    cfg = qdrant_config() or {}
+    collection = cfg.get("collection")
+    client = get_qdrant_client()
+    if not client or not collection:
+        return None
+    try:
+        info = client.get_collection(collection)
+        return int(getattr(info, "points_count", 0) or 0)
+    except Exception:
+        return None
+
+
+def reconcile_knowledge_vectors_after_mysql_recovery() -> dict[str, Any]:
+    """
+    After MySQL knowledge rebuild: index vectors only if the Qdrant collection is empty.
+    If vectors already exist, mark pending_ready docs as indexed (no OpenAI re-embed).
+    """
+    points = _qdrant_knowledge_points_count()
+    if points is None:
+        return {"ok": False, "action": "skipped", "detail": "qdrant_unavailable", "qdrant_points": None}
+    if points > 0:
+        conn = get_mysql_connection()
+        if not conn:
+            return {"ok": False, "action": "skipped", "detail": "mysql_unreachable", "qdrant_points": points}
+        marked = 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE knowledge_documents
+                    SET index_status = 'indexed'
+                    WHERE status = 'active'
+                      AND index_status IN ('pending_ready', 'pending', 'processing')
+                    """
+                )
+                marked = int(cur.rowcount or 0)
+            conn.commit()
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "action": "mark_indexed",
+                "detail": str(exc),
+                "qdrant_points": points,
+                "documents_marked": 0,
+            }
+        finally:
+            conn.close()
+        print(
+            f"[kb-index] Qdrant already has {points} points — marked {marked} docs indexed (no re-embed)",
+            flush=True,
+        )
+        return {
+            "ok": True,
+            "action": "mark_indexed_existing_vectors",
+            "qdrant_points": points,
+            "documents_marked": marked,
+        }
+
+    print("[kb-index] Qdrant collection empty — indexing pending_ready chunks", flush=True)
+    indexed = index_pending_ready_knowledge_chunks()
+    return {
+        "ok": bool(indexed.get("ok")),
+        "action": "index_pending_ready",
+        "qdrant_points": points,
+        "index_result": indexed,
+    }

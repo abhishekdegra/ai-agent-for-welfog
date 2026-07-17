@@ -220,7 +220,7 @@ JSON SCHEMA (LATEST USER MESSAGE ONLY):
   "reuse_user_value_from_chat": "pincode" | "order_id" | "",
   "answer_strategy": "live_api_only" | "kb_only" | "kb_then_ai" | "api_then_ai" | "api_kb_ai" | "catalog_only" | "structured_handler",
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain" | "harm_sensitive",
-  "scope_reply": "MANDATORY non-empty for general_chitchat/out_of_domain/harm_sensitive: 1-3 short sentences in the customer's EXACT language/script/tone (topic-aware decline or warm chitchat; harm=empathetic safety). Empty ONLY when conversation_scope=welfog_support.",
+  "scope_reply": "MANDATORY non-empty for general_chitchat/out_of_domain/harm_sensitive: 1-3 short sentences in the customer's EXACT language/script/tone. general_chitchat=warm ack + soft invite how you can help on Welfog (shop/orders/delivery/returns) — support assistant, not fake personal hangout history. out_of_domain=nod then Welfog-only redirect. harm=empathetic safety. Empty ONLY when conversation_scope=welfog_support.",
   "account_list_kind": "none" | "wishlist_in_chat" | "wishlist_howto" | "purchase_history_in_chat" | "purchase_history_howto",
   "order_help_kind": "none" | "nav_howto" | "personal_live",
   "order_lookup_kind": "none" | "track" | "details" | "invoice" | "refund_status",
@@ -293,17 +293,19 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
     - "redmi ke covers dikha" / "X ke cover dikhao" → product_name=redmi cover, brand=Redmi.
     - "behan ke liye iphone cover" → product_name=iphone cover, brand=iphone.
     - ANY brand user names (BoAt, Noise, Itel, Lava, etc.) → put in product_entities.brand — do not limit to famous brands.
-  * mandatory_match_tokens: when user names ANY specific model/device/brand product (any language/style), set 1-4 English title tokens that MUST appear in catalog results — you infer from meaning, not fixed lists. Examples: iphone cover → ["iphone","cover"]; philips trimmer → ["philips","trimmer"]; redmi note 10 case → ["redmi","note"]. Do NOT use generic type words alone (cover, shirt, bottle). REQUIRED when a named product/model/brand is the focus.
+  * mandatory_match_tokens: when user names ANY specific model/device/brand OR a named subject/theme WITH a product type (any language/style), set 1-4 English title tokens that MUST appear in catalog results — you infer from meaning, not fixed lists. Examples: iphone cover → ["iphone","cover"]; philips trimmer → ["philips","trimmer"]; redmi note 10 case → ["redmi","note"]; "X ka frame/poster" → keep X's name tokens + product type (never bare "frame"). Do NOT use generic type words alone (cover, shirt, bottle, frame). REQUIRED when a named product/model/brand/subject is the focus.
+  * NAMED SUBJECT + PRODUCT (critical): person/character/theme + product type ("X ka photo frame", "only X wali fame/frame") → product_name/search_query keeps BOTH subject and type; conversation_scope=welfog_support; NEVER out_of_domain for shopping corrections/typos about a product just shown.
   * product_entities is REQUIRED when run_catalog_search=true — never empty product_name AND empty brand on a named-product browse.
 - Today's deals / offers / discounts / flash sale (ANY language) → intent=deals, data_channel=live_api, run_catalog_search=false, needs_order_id=false. NOT a product named "deals".
-- Full Welfog category/department list (ANY language — what sections can I shop, show all categories) → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB.
+- Full Welfog category/department list (ANY language — what sections can I shop, show all categories, which categories, category names on Welfog, "kon kon si category", "categories ki list") → intent=categories, data_channel=live_api, run_catalog_search=false. NOT company/about KB. NEVER invent category names from memory and NEVER dump internal search-field schemas.
 - Products inside ONE named category (beauty, electronics, grocery, home kitchen, men/women fashion) with NO specific product type named → intent=product, data_channel=catalog, category_browse=English department name, category_only_browse=true, search_query="". If the user ALSO named a product type (any language/vernacular), set category_only_browse=false and fill product_name/search_query with the English catalog title noun — never bury a named item in category-only browse.
+- CRITICAL — "X category ke products/items/samaan", "Home & Kitchen category me dikha", "electronics category bta de" (ANY language/style) → still intent=product + category_only_browse=true for that named department. The word "category" alone with "which/kon/list/names" and NO named department products ask → intent=categories (full menu), NOT KB.
 - NEVER set run_catalog_search=true with search_query categories/deals/offers — those are catalog MENU APIs, not product SKUs.
 - Read-only questions (policy, FAQ, company, seller, fees, contact, how-to, Order ID location, invoice location, OR any topic covered by an Admin knowledge document in the catalog above) in ANY language → set intent + data_channel=kb + kb_keys from ADMIN KNOWLEDGE CATALOG above + order_help_kind=nav_howto when about finding Order ID/invoice/track steps. Use user_meaning in English to pick the best file key(s) — do NOT match Hindi/English keywords in the customer message. New admin topics appear automatically when a new document is added — if the catalog lists it, it is IN SCOPE (welfog_support), never out_of_domain. Seller → intent=seller. Grievance → company+privacy KB when those keys exist. Wrong/damaged item policy → refund KB when present (NOT order_history). Truly off-platform topics with NO matching catalog document → out_of_domain. Self-harm → harm_sensitive, no KB. NEVER set run_catalog_search=true or search_query for FAQ/policy/company/contact/review-policy/checkout-help/nav_howto — those are KB only.
 - Personal life, marriage, dating, jokes, homework, sports scores, weather, travel plans, hangouts, other apps/companies, general advice unrelated to buying on Welfog — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain, run_catalog_search=false, search_query="", product_entities empty, AND scope_reply=1-2 short sentences acknowledging THEIR topic then redirecting to Welfog shopping/orders/delivery (never answer the off-topic ask). UNLESS the user is asking about Welfog platform rules/policies that appear in the Admin knowledge catalog (e.g. allowed/prohibited content on Welfog Reels/shorts). Catalog-covered platform policy questions → data_channel=kb, conversation_scope=welfog_support, is_welfog_related=true. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys when catalog keys exist; empty kb_keys is OK when unsure — retrieval will pick semantically.
 - CRITICAL — do NOT misroute personal/leisure as product search: invitations to go somewhere, travel, nature trips, hanging out, "can you come with me…", medical/home/life advice with no Welfog purchase ask → out_of_domain (never fill search_query with the full sentence, never intent=product).
 - Self-harm / suicide distress → conversation_scope=harm_sensitive, intent=out_of_domain or general, data_channel=none, run_catalog_search=false, scope_reply=empathetic safety in their language (helplines), NEVER product/catalog/KB.
-- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=2-3 sentences mirroring the user's EXACT language, script, and slang (Hinglish stays Hinglish — never default to stiff English "Hi there I'm the Welfog assistant"), run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
+- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=1-2 sentences mirroring the user's EXACT language/script/slang (Hinglish stays Hinglish — never stiff English stock greeting) THEN soft invite how you can help with Welfog shopping/orders/delivery/returns; you are Welfog support, not inventing personal meetups, run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
 - General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company / owner / customer care → kb company/support (NOT assistant_intro, NOT product catalog).
 - MIXED messages (hello/bhai/bro/darling/yaar/thanks/jokes PLUS a real request): classify by the REAL goal — ecommerce action beats Welfog KB beats casual chitchat. Ignore conversational filler when shopping/order/KB/support intent is present.
@@ -337,7 +339,9 @@ Return JSON only."""
             {"role": "user", "content": user_payload},
         ]
         log_reasoning(f"Calling LLM routing ({len(system_prompt)} char system prompt)...")
-        route_timeout = max(6, min(10, int(os.getenv("AI_ROUTE_TIMEOUT", "8") or 8)))
+        # Tight routing budget: product turns need brain JSON fast; hung OpenAI
+        # used to burn 30–70s because hard timeout only applied to <=5s calls.
+        route_timeout = max(5, min(8, int(os.getenv("AI_ROUTE_TIMEOUT", "7") or 7)))
         import time as _time
 
         _t_route = _time.perf_counter()
@@ -351,7 +355,7 @@ Return JSON only."""
         out = _llm_json_with_provider_fallback(
             providers,
             messages,
-            max_tokens=max(720, int(os.getenv("AI_ROUTE_MAX_TOKENS", "960") or 960)),
+            max_tokens=max(480, min(720, int(os.getenv("AI_ROUTE_MAX_TOKENS", "640") or 640))),
             timeout_sec=route_timeout,
             max_attempts=max(1, min(2, int(os.getenv("AI_ROUTE_MAX_ATTEMPTS", "1") or 1))),
         )

@@ -319,6 +319,7 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - PRODUCT ENTITY EXTRACTION (critical): search_terms is the searchable product noun phrase ONLY. NEVER a paraphrased English sentence. NEVER "see …", "tell about …", "show me …", "user wants …". NEVER generalize a named product to broad words like clothes/clothing/fashion/apparel/garment/products/items/stuff. CATALOG ENGLISH: emit the English noun that appears in ecommerce product titles — translate any language/vernacular; correct typos/spacing/compounds from meaning (no fixed product dictionary). related_search_terms = alternate English catalog noun when vernacular/typo/primary may miss; allow_related_fallback=true when set. Price → max_price/min_price fields, not inside search_terms.
 - TYPOS / SPACES / KEYSMASH (critical): Never copy the customer's raw misspelling into search_terms. Correct to the catalog English form. Always set related_search_terms when the input looks noisy (extra letters, missing spaces, roman Hindi variants). Brand typos belong in brand + search_terms corrected.
 - BRAND + PRODUCT (critical): When user names a brand/device WITH a product type, put BOTH in search_terms AND brand field, match_mode=strict, and brand tokens in mandatory_match_tokens. NEVER collapse to a bare generic type that drops the brand.
+- NAMED SUBJECT + PRODUCT (critical): person/character/theme WITH a product type (photo frame of X, poster of Y, "sirf X ki frame/fame") → search_terms keeps subject + type; put distinctive subject tokens in mandatory_match_tokens; match_mode=strict. NEVER drop to bare "frame"/"poster". Typos about the same ask (fame→frame) are still shopping — correct from meaning + RECENT.
 - SPELLING / SPACES / MIXED LANGUAGE: Semantically normalize typos, split brands, and drop show/buy verbs from search_terms. Availability asks (any language: "do you have", "hai kya", "milega") are still shopping — extract the product noun + filters.
 - MEANING FIRST (industry): Understand the LATEST message + RECENT CONVERSATION semantically — ANY language/script, typos, slang, long paragraphs, indirect phrasing. User may ask in 1000 different ways; infer intent from meaning, NOT from matching Hindi/English keyword lists. Do NOT echo the full user sentence into search_terms. Your JSON is the ONLY source for color, price, rating, brand, size, SKU, pro_id.
 - NEVER put conversational words in sku (chahiye, dikhao, batana, please, milega, shaadi, mast, …) — sku is ONLY a warehouse code with digits or explicit "SKU ABC123" from the user.
@@ -776,26 +777,210 @@ def _try_text_first_multi_parts(original_msg: str, msg_en: str) -> list[dict]:
 def _message_looks_like_multi_product_ask(original_msg: str, msg_en: str = "") -> bool:
     """
     Only decide WHETHER to ask the Product Entity Extraction LLM for N items.
-    Prefer English gloss (translation already ran) — coordinating 'and'/comma only,
-    never vernacular particle dictionaries.
+    Structural coordinating joiners only (and/aur/comma) — never product-noun lists.
     """
     import re
 
-    text = re.sub(r"\s+", " ", ((msg_en or "").strip() or (original_msg or "").strip()))
-    if not text:
-        return False
-    if "," in text:
-        chunks = [c.strip() for c in text.split(",") if len(c.strip()) >= 3]
-        if len(chunks) >= 2:
-            return True
-    if re.search(r"\b(?:and|or|plus)\b", text, re.I):
-        chunks = [
-            c.strip()
-            for c in re.split(r"\s+(?:and|or|plus)\s+", text, flags=re.I)
-            if len(c.strip()) >= 3
-        ]
-        return len(chunks) >= 2
+    en = re.sub(r"\s+", " ", (msg_en or "").strip())
+    raw = re.sub(r"\s+", " ", (original_msg or "").strip())
+    for text in (en, raw, f"{raw} {en}".strip()):
+        if not text:
+            continue
+        if "," in text:
+            chunks = [c.strip() for c in text.split(",") if len(c.strip()) >= 3]
+            if len(chunks) >= 2:
+                return True
+        joiner = r"\s+(?:and|or|plus|also|aur|va|bhi|saath|sath)\s+"
+        if re.search(joiner, text, re.I):
+            chunks = [
+                c.strip()
+                for c in re.split(joiner, text, flags=re.I)
+                if len(c.strip()) >= 3
+            ]
+            if len(chunks) >= 2:
+                return True
     return False
+
+
+def _collect_brain_product_requests(
+    ai_route: Optional[dict],
+    understanding: Optional[dict] = None,
+) -> list[dict]:
+    """Normalize Brain route product_requests[] when Brain listed 2+ distinct items."""
+    seed: dict = {}
+    if isinstance(understanding, dict):
+        seed = dict(understanding)
+    if isinstance(ai_route, dict):
+        for src in (
+            ai_route.get("product_requests"),
+            (ai_route.get("_product_entities") or {}).get("product_requests")
+            if isinstance(ai_route.get("_product_entities"), dict)
+            else None,
+            (ai_route.get("product_entities") or {}).get("product_requests")
+            if isinstance(ai_route.get("product_entities"), dict)
+            else None,
+        ):
+            if isinstance(src, list) and len(src) >= 2:
+                seed["product_requests"] = src
+                break
+        sq = (ai_route.get("search_query") or "").strip()
+        if sq and not (seed.get("search_terms") or "").strip():
+            seed["search_terms"] = sq
+    return _product_requests_from_ai_understanding(seed if seed else understanding)
+
+
+def _should_probe_multi_product(
+    original_msg: str,
+    msg_en: str,
+    ai_route: Optional[dict] = None,
+    understanding: Optional[dict] = None,
+) -> bool:
+    """True when Brain already split items or the turn structurally asks for 2+ products."""
+    if len(_collect_brain_product_requests(ai_route, understanding)) >= 2:
+        return True
+    return _message_looks_like_multi_product_ask(original_msg, msg_en)
+
+
+def _try_multi_product_catalog_turn(
+    original_msg: str,
+    msg_en: str,
+    user_id: str,
+    *,
+    ctx: Optional[dict] = None,
+    reply_lang: str = "en",
+    conversation_context: str = "",
+    ai_route: Optional[dict] = None,
+    locked_u: Optional[dict] = None,
+) -> Optional[ProductFlowResult]:
+    """Run separate OpenSearch rails per item when this turn asks for multiple products."""
+    try:
+        multi_seed = dict(locked_u or {})
+        brain_multi = _collect_brain_product_requests(ai_route, locked_u)
+        if brain_multi:
+            multi_seed["product_requests"] = [
+                {
+                    "search_terms": r.get("search_terms"),
+                    "label": r.get("label"),
+                    "brand": r.get("brand"),
+                    "color": r.get("color"),
+                    "product_type": r.get("product_type"),
+                    "mandatory_match_tokens": r.get("mandatory_match_tokens"),
+                    "exclude_title_tokens": r.get("exclude_title_tokens"),
+                    "match_mode": r.get("match_mode"),
+                    "max_price": r.get("max_price"),
+                    "min_price": r.get("min_price"),
+                    "rating_min": r.get("rating_min"),
+                    "rating_max": r.get("rating_max"),
+                }
+                for r in brain_multi
+            ]
+        elif isinstance(ai_route, dict):
+            for src in (
+                ai_route.get("product_requests"),
+                (ai_route.get("_product_entities") or {}).get("product_requests"),
+            ):
+                if isinstance(src, list) and len(src) >= 2:
+                    multi_seed["product_requests"] = src
+                    break
+            sq_route = (ai_route.get("search_query") or "").strip()
+            if sq_route and not multi_seed.get("search_terms"):
+                multi_seed["search_terms"] = sq_route
+
+        allow_multi_llm = _should_probe_multi_product(
+            original_msg, msg_en, ai_route, locked_u
+        )
+        multi_reqs = resolve_multi_product_requests(
+            multi_seed,
+            original_msg,
+            msg_en,
+            conversation_context=conversation_context,
+            reply_lang=reply_lang,
+            allow_ai_multi=allow_multi_llm,
+        )
+        if len(multi_reqs) >= 2:
+            log_reasoning(
+                f"Multi-product catalog — {len(multi_reqs)} OpenSearch rails."
+            )
+            return _run_multi_product_catalog_search(
+                original_msg,
+                msg_en,
+                user_id,
+                multi_reqs,
+                ctx=ctx,
+                reply_lang=reply_lang,
+                conversation_context=conversation_context,
+            )
+    except Exception as e:
+        log_reasoning(f"Multi-product resolve skipped: {e}")
+    return None
+
+
+def _brain_catalog_fast_path_eligible(
+    ai_route: Optional[dict],
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    """Brain already classified product + filters — skip duplicate NLU before OpenSearch."""
+    try:
+        from services.product_catalog_resolver import (
+            KIND_PRODUCT_SEARCH,
+            _locked_product_turn_from_route,
+            product_catalog_route_is_locked,
+        )
+
+        if product_catalog_route_is_locked(ai_route):
+            return True
+        if not isinstance(ai_route, dict):
+            return False
+        if ai_route.get("_needs_product_nlu_llm") is not False:
+            return False
+        locked_turn = _locked_product_turn_from_route(
+            ai_route,
+            original_msg=original_msg,
+            msg_en=msg_en,
+        )
+        return locked_turn is not None and locked_turn.kind == KIND_PRODUCT_SEARCH
+    except ImportError:
+        return False
+
+
+def _finish_locked_product_catalog_turn(
+    original_msg: str,
+    msg_en: str,
+    user_id: str,
+    *,
+    ctx: Optional[dict] = None,
+    reply_lang: str = "en",
+    search_query: str = "",
+    conversation_context: str = "",
+    ai_understanding: Optional[dict] = None,
+    ai_route: Optional[dict] = None,
+) -> ProductFlowResult:
+    """Multi-product sections first; otherwise one locked OpenSearch pass."""
+    multi_hit = _try_multi_product_catalog_turn(
+        original_msg,
+        msg_en,
+        user_id,
+        ctx=ctx,
+        reply_lang=reply_lang,
+        conversation_context=conversation_context,
+        ai_route=ai_route,
+        locked_u=ai_understanding,
+    )
+    if multi_hit is not None:
+        return multi_hit
+    return _run_locked_catalog_search_fast(
+        original_msg,
+        msg_en,
+        user_id,
+        ctx=ctx,
+        reply_lang=reply_lang,
+        search_query=search_query,
+        conversation_context=conversation_context,
+        ai_understanding=ai_understanding,
+        ai_route=ai_route,
+    )
 
 
 def _product_requests_from_ai_understanding(understanding: Optional[dict]) -> list[dict]:
@@ -1365,6 +1550,23 @@ def _run_locked_catalog_search_fast(
     elif locked_u.get("_product_nlu_from_ai") and (locked_u.get("search_terms") or "").strip():
         # Entity extractor / Brain English title already ready — do not duplicate.
         allow_nlu = False
+    elif (locked_u.get("search_terms") or "").strip() and isinstance(ai_route, dict):
+        try:
+            from services.ai_route_semantics import brain_stamped_product_title_opensearch_ready
+
+            st_brain = (locked_u.get("search_terms") or "").strip()
+            if brain_stamped_product_title_opensearch_ready(st_brain, ai_route):
+                allow_nlu = False
+                locked_u["_product_nlu_from_ai"] = True
+                if isinstance(ai_route, dict):
+                    ai_route = dict(ai_route)
+                    ai_route["_needs_product_nlu_llm"] = False
+                    ai_route["_product_nlu_from_ai"] = True
+                log_reasoning(
+                    f"Catalog locked — Brain product_name {st_brain!r}; skip entity NLU."
+                )
+        except ImportError:
+            pass
     elif isinstance(ai_route, dict) and ai_route.get("category_only_browse") and not (
         (locked_u.get("search_terms") or "").strip() or (sq or "").strip()
     ):
@@ -1493,7 +1695,16 @@ def _run_locked_catalog_search_fast(
             # Skip zero-hit LLM repair only when primary title was already confident
             # multi-word catalog English. Vernacular echoes / over-general single nouns
             # must get one repair pass — catalog often has titles under English nouns.
-            title_now = (os_spec.get("title_query") or locked_u.get("search_terms") or "").strip()
+            # Prefer Brain/locked search_terms — token-soft may have collapsed title_query
+            # to a bare noun ("shoes") and wrongly re-trigger repair LLM + 2nd REST pass.
+            title_brain = (
+                (locked_u.get("search_terms") or "").strip()
+                or (locked_u.get("product_name") or "").strip()
+            )
+            title_now = (
+                title_brain
+                or (os_spec.get("title_query") or "").strip()
+            )
             skip_repair = False
             # Soft-token already tried Brain related gloss (e.g. chunri→scarf).
             # Another repair LLM + REST pass is pure latency on known empty catalog.
@@ -1502,6 +1713,16 @@ def _run_locked_catalog_search_fast(
                 or (locked_u.get("related_search_terms") or "").strip()
             ):
                 skip_repair = True
+            # Brand+product already exhausted OS + short REST — repair rarely helps
+            # and doubles empty-catalog latency (nike shoes → sneakers → shoe again).
+            elif single_pass and (
+                (locked_u.get("brand") or os_spec.get("brand") or "").strip()
+            ):
+                skip_repair = True
+                log_reasoning(
+                    "Catalog 0 hits — skip zero-hit repair LLM "
+                    "(brand already searched on single-pass)."
+                )
             elif single_pass and title_now and locked_u.get("_product_nlu_from_ai"):
                 try:
                     from services.ai_route_semantics import (
@@ -2189,12 +2410,11 @@ def run_product_search_ai_flow(
 
     # Brain/direct locked catalog — skip gates, classifiers, and duplicate order-intent LLMs.
     try:
-        from services.product_catalog_resolver import (
-            product_catalog_route_is_locked,
-            understanding_from_locked_product_route,
-        )
+        from services.product_catalog_resolver import understanding_from_locked_product_route
 
-        if product_catalog_route_is_locked(ai_route):
+        if _brain_catalog_fast_path_eligible(
+            ai_route, original_msg=original_msg, msg_en=msg_en
+        ):
             work_route = dict(ai_route) if isinstance(ai_route, dict) else {}
             locked_u = understanding_from_locked_product_route(
                 work_route,
@@ -2221,57 +2441,12 @@ def run_product_search_ai_flow(
             except ImportError:
                 pass
             log_reasoning(
-                "Product brain-locked fast path — AI NLU → OpenSearch."
+                "Product brain-locked fast path — OpenSearch (skip duplicate NLU)."
             )
             if isinstance(ai_route, dict):
                 ai_route.setdefault("_ai_single_pass", True)
 
-            # Multi-product before singular locked search — one OS rail per item.
-            # Only call the multi LLM when Brain already listed 2+ product_requests
-            # or the English gloss clearly coordinates 2 items — never probe on
-            # locked single-item turns (saves 0.5–3s false multi LLM).
-            try:
-                multi_seed = dict(locked_u or {})
-                brain_multi: list = []
-                if isinstance(ai_route, dict):
-                    pe = ai_route.get("_product_entities") or {}
-                    if isinstance(pe, dict) and pe.get("product_requests"):
-                        multi_seed["product_requests"] = pe.get("product_requests")
-                        brain_multi = list(pe.get("product_requests") or [])
-                    elif isinstance(ai_route.get("product_requests"), list):
-                        multi_seed["product_requests"] = ai_route.get("product_requests")
-                        brain_multi = list(ai_route.get("product_requests") or [])
-                    sq_route = (ai_route.get("search_query") or "").strip()
-                    if sq_route and not multi_seed.get("search_terms"):
-                        multi_seed["search_terms"] = sq_route
-                allow_multi_llm = len(brain_multi) >= 2 or _message_looks_like_multi_product_ask(
-                    original_msg, msg_en
-                )
-                multi_reqs = resolve_multi_product_requests(
-                    multi_seed,
-                    original_msg,
-                    msg_en,
-                    conversation_context=conversation_context,
-                    reply_lang=reply_lang,
-                    allow_ai_multi=allow_multi_llm,
-                )
-                if len(multi_reqs) >= 2:
-                    log_reasoning(
-                        f"Product brain-locked multi — {len(multi_reqs)} catalog rails."
-                    )
-                    return _run_multi_product_catalog_search(
-                        original_msg,
-                        msg_en,
-                        user_id,
-                        multi_reqs,
-                        ctx=ctx,
-                        reply_lang=reply_lang,
-                        conversation_context=conversation_context,
-                    )
-            except Exception as e:
-                log_reasoning(f"Locked multi-product resolve skipped: {e}")
-
-            return _run_locked_catalog_search_fast(
+            return _finish_locked_product_catalog_turn(
                 original_msg,
                 msg_en,
                 user_id,
@@ -2429,7 +2604,9 @@ def run_product_search_ai_flow(
             log_reasoning(
                 "Product search fast path — AI entities locked (one OpenSearch pass)."
             )
-            return _run_locked_catalog_search_fast(
+            if isinstance(ai_route, dict):
+                ai_route.setdefault("_ai_single_pass", True)
+            return _finish_locked_product_catalog_turn(
                 original_msg,
                 msg_en,
                 user_id,
@@ -2459,7 +2636,8 @@ def run_product_search_ai_flow(
                         filters=route_entities,
                         source="ai_route_locked",
                     )
-                    return _run_locked_catalog_search_fast(
+                    ai_route.setdefault("_ai_single_pass", True)
+                    return _finish_locked_product_catalog_turn(
                         original_msg,
                         msg_en,
                         user_id,
@@ -2474,7 +2652,8 @@ def run_product_search_ai_flow(
                 log_reasoning(
                     "Product catalog locked — force fast OpenSearch (no Product-catalog LLM)."
                 )
-                return _run_locked_catalog_search_fast(
+                ai_route.setdefault("_ai_single_pass", True)
+                return _finish_locked_product_catalog_turn(
                     original_msg,
                     msg_en,
                     user_id,
@@ -2487,7 +2666,8 @@ def run_product_search_ai_flow(
     except ImportError:
         pass
 
-    if not understanding and not catalog_locked:
+    brain_nlu_done = isinstance(ai_route, dict) and ai_route.get("_needs_product_nlu_llm") is False
+    if not understanding and not catalog_locked and not (brain_nlu_done and route_sq):
         try:
             from services.product_catalog_resolver import (
                 entities_to_understanding,
@@ -2650,7 +2830,16 @@ def run_product_search_ai_flow(
     except ImportError:
         pass
 
-    multi_reqs = resolve_multi_product_requests(understanding, original_msg, msg_en)
+    multi_reqs = resolve_multi_product_requests(
+        understanding,
+        original_msg,
+        msg_en,
+        conversation_context=conversation_context,
+        reply_lang=reply_lang,
+        allow_ai_multi=_should_probe_multi_product(
+            original_msg, msg_en, ai_route, understanding
+        ),
+    )
 
     if len(multi_reqs) >= 2:
         log_reasoning(f"Multi-product flow: {len(multi_reqs)} separate catalog searches.")
@@ -2717,6 +2906,21 @@ def run_product_search_ai_flow(
                 )
             )
             return ProductFlowResult(handled=True, reply_html=body, intent="general")
+
+    if _brain_catalog_fast_path_eligible(
+        ai_route, original_msg=original_msg, msg_en=msg_en
+    ):
+        return _finish_locked_product_catalog_turn(
+            original_msg,
+            msg_en,
+            user_id,
+            ctx=ctx,
+            reply_lang=reply_lang,
+            search_query=search_query or route_sq,
+            conversation_context=conversation_context,
+            ai_understanding=understanding,
+            ai_route=ai_route,
+        )
 
     return _run_catalog_search(
         original_msg,

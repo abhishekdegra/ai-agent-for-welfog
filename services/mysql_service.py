@@ -174,36 +174,180 @@ def _align_chat_collations(cur) -> None:
 def _remove_orphan_innodb_files() -> bool:
     """
     XAMPP #1813: .ibd files left on disk without valid table metadata.
-    Safe only for chat tables in MYSQL_DATABASE (no other tables in that folder).
+    Targets known app tables in MYSQL_DATABASE (chat + knowledge).
     """
+    return _remove_broken_table_files(
+        (
+            "chats",
+            "chat_sessions",
+            "knowledge_documents",
+            "knowledge_document_chunks",
+        ),
+        orphan_only=True,
+    )
+
+
+def _mysql_data_dirs() -> list[Path]:
     db_name = mysql_database_name()
     if not db_name:
-        return False
-    data_dirs = [
+        return []
+    dirs = [
         Path(os.getenv("MYSQL_DATA_DIR") or ""),
         Path(f"C:/xampp/mysql/data/{db_name}"),
         Path(f"C:/XAMPP/mysql/data/{db_name}"),
     ]
+    # Also accept MYSQL_DATA_DIR pointing at the parent mysql/data folder.
+    parent = Path(os.getenv("MYSQL_DATA_DIR") or "")
+    if parent.is_dir() and (parent / db_name).is_dir():
+        dirs.insert(0, parent / db_name)
+    return dirs
+
+
+def _remove_broken_table_files(
+    table_names: tuple[str, ...],
+    *,
+    orphan_only: bool = False,
+) -> bool:
+    """
+    Remove on-disk InnoDB files for broken tables (#1932 / #1813).
+
+    orphan_only=True: only delete .ibd when matching .frm is missing (legacy chat heuristic).
+    orphan_only=False: delete .ibd and .frm for confirmed-broken tables so CREATE can succeed.
+    """
     removed = False
-    for folder in data_dirs:
+    for folder in _mysql_data_dirs():
         if not folder.is_dir():
             continue
-        for fname in ("chats.ibd", "chat_sessions.ibd"):
-            path = folder / fname
-            frm_path = folder / fname.replace(".ibd", ".frm")
-            if not path.is_file():
-                continue
-            # Orphan: .ibd on disk but no table metadata (.frm) — classic XAMPP #1813
-            if frm_path.is_file():
-                continue
-            try:
-                path.unlink()
-                print(f"MySQL: removed orphan file {path}")
-                removed = True
-            except OSError as e:
-                print(f"MySQL: could not remove {path} ({e}). Stop XAMPP MySQL and delete manually.")
-        break
+        for table in table_names:
+            ibd = folder / f"{table}.ibd"
+            frm = folder / f"{table}.frm"
+            if orphan_only:
+                if not ibd.is_file():
+                    continue
+                if frm.is_file():
+                    continue
+                targets = (ibd,)
+            else:
+                targets = tuple(p for p in (ibd, frm) if p.is_file())
+            for path in targets:
+                try:
+                    path.unlink()
+                    print(f"MySQL: removed orphan file {path}")
+                    removed = True
+                except OSError as e:
+                    print(
+                        f"MySQL: could not remove {path} ({e}). "
+                        "Stop XAMPP MySQL and delete manually."
+                    )
+        if removed or any(
+            (folder / f"{t}.ibd").is_file() or (folder / f"{t}.frm").is_file()
+            for t in table_names
+        ):
+            # Prefer the first real data dir that contains these tables.
+            break
     return removed
+
+
+def _knowledge_migrations_dir() -> Path:
+    return Path(__file__).resolve().parents[1] / "migrations"
+
+
+def _execute_mysql_script(cur, sql_text: str) -> None:
+    """Run a multi-statement migration SQL file (comments stripped)."""
+    lines: list[str] = []
+    for line in (sql_text or "").splitlines():
+        if line.strip().startswith("--"):
+            continue
+        lines.append(line)
+    cleaned = "\n".join(lines)
+    for stmt in cleaned.split(";"):
+        stmt = stmt.strip()
+        if stmt:
+            cur.execute(stmt)
+
+
+def _apply_knowledge_migration_sql(cur, filename: str) -> None:
+    path = _knowledge_migrations_dir() / filename
+    sql_text = path.read_text(encoding="utf-8")
+    _execute_mysql_script(cur, sql_text)
+
+
+def _drop_knowledge_tables(cur) -> None:
+    # Chunks first — same force-drop pattern as chat tables.
+    _force_drop_table(cur, "knowledge_document_chunks")
+    _force_drop_table(cur, "knowledge_documents")
+
+
+def _create_knowledge_tables(cur) -> None:
+    """Recreate from existing migration SQL — do not duplicate schema here."""
+    _apply_knowledge_migration_sql(cur, "20260707_create_knowledge_documents.sql")
+    _apply_knowledge_migration_sql(cur, "20260707_create_knowledge_document_chunks.sql")
+
+
+def repair_mysql_knowledge_tables_if_broken() -> bool:
+    """
+    Detect XAMPP/MySQL #1932 ghost tables and recreate empty working knowledge tables.
+    Mirrors repair_mysql_chat_tables_if_broken(). Returns True if tables were recreated.
+    """
+    conn = get_mysql_connection()
+    if not conn:
+        return False
+    recreated = False
+    try:
+        with conn.cursor() as cur:
+            broken = False
+            for table in ("knowledge_documents", "knowledge_document_chunks"):
+                try:
+                    cur.execute(f"SELECT 1 FROM `{table}` LIMIT 1")
+                except Exception as e:
+                    if _is_mysql_table_broken(e):
+                        broken = True
+                        print(f"MySQL: table `{table}` broken — will recreate knowledge tables.")
+                    else:
+                        raise
+            if broken:
+                _remove_broken_table_files(
+                    ("knowledge_documents", "knowledge_document_chunks"),
+                    orphan_only=False,
+                )
+                try:
+                    _drop_knowledge_tables(cur)
+                    _create_knowledge_tables(cur)
+                    conn.commit()
+                    recreated = True
+                    print("MySQL: knowledge tables recreated successfully.")
+                except Exception as drop_err:
+                    if _is_mysql_table_broken(drop_err):
+                        conn.rollback()
+                        conn.close()
+                        conn = None
+                        _remove_broken_table_files(
+                            ("knowledge_documents", "knowledge_document_chunks"),
+                            orphan_only=False,
+                        )
+                        conn2 = get_mysql_connection()
+                        if conn2:
+                            with conn2.cursor() as cur2:
+                                _drop_knowledge_tables(cur2)
+                                _create_knowledge_tables(cur2)
+                            conn2.commit()
+                            conn2.close()
+                            recreated = True
+                            print("MySQL: knowledge tables recreated after orphan file cleanup.")
+                    else:
+                        raise
+        return recreated
+    except Exception as e:
+        print(f"MySQL knowledge repair error: {e}")
+        try:
+            if conn:
+                conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        if conn:
+            conn.close()
 
 
 def _recreate_welfog_ai_database() -> None:
@@ -403,36 +547,25 @@ def init_mysql_chat_schema():
 def init_mysql_knowledge_documents_schema():
     """
     Step-1 knowledge schema migration.
-    Adds MySQL `knowledge_documents` without touching existing tables/logic.
+    Repairs #1932 ghosts (same approach as chat), then applies migration SQL.
     """
     _ensure_mysql_database_exists()
+    repair_mysql_knowledge_tables_if_broken()
+
     conn = get_mysql_connection()
     if not conn:
         print("MySQL unreachable — knowledge_documents schema init skipped.")
         return
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS knowledge_documents (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    title VARCHAR(512) NOT NULL,
-                    category VARCHAR(128) NOT NULL,
-                    content LONGTEXT NOT NULL,
-                    language VARCHAR(32) NOT NULL DEFAULT 'en',
-                    status VARCHAR(32) NOT NULL DEFAULT 'active',
-                    version INT NOT NULL DEFAULT 1,
-                    index_status VARCHAR(32) NOT NULL DEFAULT 'pending',
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    INDEX idx_kd_category_status_lang (category, status, language),
-                    INDEX idx_kd_updated_at (updated_at)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE {MYSQL_COLLATION}
-                """
-            )
+            _apply_knowledge_migration_sql(cur, "20260707_create_knowledge_documents.sql")
         conn.commit()
     except Exception as e:
         print(f"MySQL knowledge_documents schema init error: {e}")
+        if _is_mysql_table_broken(e):
+            _remove_orphan_innodb_files()
+            if repair_mysql_knowledge_tables_if_broken():
+                print("MySQL: knowledge_documents schema init recovered after table repair.")
     finally:
         conn.close()
 
@@ -552,39 +685,105 @@ def import_knowledge_txt_files_to_mysql(knowledge_dir: str) -> dict:
 def init_mysql_knowledge_chunks_schema():
     """Step-3 schema: deterministic cleaned/chunked documents (no vectors yet)."""
     _ensure_mysql_database_exists()
+    repair_mysql_knowledge_tables_if_broken()
+
     conn = get_mysql_connection()
     if not conn:
         print("MySQL unreachable — knowledge_document_chunks schema init skipped.")
         return
     try:
         with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS knowledge_document_chunks (
-                    id BIGINT AUTO_INCREMENT PRIMARY KEY,
-                    chunk_id VARCHAR(128) NOT NULL,
-                    doc_id BIGINT NOT NULL,
-                    version INT NOT NULL,
-                    chunk_no INT NOT NULL,
-                    title VARCHAR(512) NOT NULL,
-                    category VARCHAR(128) NOT NULL,
-                    language VARCHAR(32) NOT NULL,
-                    content LONGTEXT NOT NULL,
-                    content_hash CHAR(64) NOT NULL,
-                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-                    UNIQUE KEY uq_kdc_chunk_id (chunk_id),
-                    UNIQUE KEY uq_kdc_doc_ver_chunk (doc_id, version, chunk_no),
-                    INDEX idx_kdc_doc_ver (doc_id, version),
-                    INDEX idx_kdc_category_lang (category, language)
-                ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE {MYSQL_COLLATION}
-                """
-            )
+            _apply_knowledge_migration_sql(cur, "20260707_create_knowledge_document_chunks.sql")
         conn.commit()
     except Exception as e:
         print(f"MySQL knowledge_document_chunks schema init error: {e}")
+        if _is_mysql_table_broken(e):
+            _remove_orphan_innodb_files()
+            if repair_mysql_knowledge_tables_if_broken():
+                print("MySQL: knowledge_document_chunks schema init recovered after table repair.")
     finally:
         conn.close()
+
+
+def ensure_knowledge_mysql_ready() -> dict:
+    """
+    Idempotent knowledge MySQL recovery:
+    - repair/create both tables (migration SQL)
+    - import support/knowledge/*.txt if documents table empty
+    - chunk pending docs if chunks missing / still pending
+    Does not touch Qdrant vectors (caller reconciles index status).
+    """
+    from support_paths import KNOWLEDGE_DIR
+
+    init_mysql_knowledge_documents_schema()
+    init_mysql_knowledge_chunks_schema()
+
+    result: dict = {
+        "tables_ok": False,
+        "documents": 0,
+        "chunks": 0,
+        "imported": 0,
+        "chunked_documents": 0,
+        "errors": 0,
+    }
+    pending_docs = 0
+
+    conn = get_mysql_connection()
+    if not conn:
+        result["errors"] = 1
+        return result
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM knowledge_documents")
+            doc_count = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute("SELECT COUNT(*) AS c FROM knowledge_document_chunks")
+            chunk_count = int((cur.fetchone() or {}).get("c") or 0)
+            cur.execute(
+                "SELECT COUNT(*) AS c FROM knowledge_documents "
+                "WHERE status = 'active' AND index_status = 'pending'"
+            )
+            pending_docs = int((cur.fetchone() or {}).get("c") or 0)
+        result["tables_ok"] = True
+        result["documents"] = doc_count
+        result["chunks"] = chunk_count
+    except Exception as e:
+        print(f"MySQL knowledge ready check error: {e}")
+        result["errors"] = 1
+        return result
+    finally:
+        conn.close()
+
+    if result["documents"] == 0:
+        print("MySQL: knowledge_documents empty — importing knowledge/*.txt", flush=True)
+        imported = import_knowledge_txt_files_to_mysql(KNOWLEDGE_DIR)
+        result["imported"] = int(imported.get("imported") or 0)
+        result["documents"] = int(imported.get("total_rows") or 0)
+        result["errors"] += int(imported.get("errors") or 0)
+        pending_docs = result["documents"]
+
+    if result["chunks"] == 0 or pending_docs > 0:
+        print("MySQL: running knowledge chunking for pending documents", flush=True)
+        chunked = ingest_knowledge_documents_for_chunking()
+        result["chunked_documents"] = int(chunked.get("documents") or 0)
+        result["errors"] += int(chunked.get("errors") or 0)
+
+    conn2 = get_mysql_connection()
+    if conn2:
+        try:
+            with conn2.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS c FROM knowledge_documents")
+                result["documents"] = int((cur.fetchone() or {}).get("c") or 0)
+                cur.execute("SELECT COUNT(*) AS c FROM knowledge_document_chunks")
+                result["chunks"] = int((cur.fetchone() or {}).get("c") or 0)
+        finally:
+            conn2.close()
+
+    print(
+        f"MySQL: knowledge ready documents={result['documents']} chunks={result['chunks']}",
+        flush=True,
+    )
+    return result
 
 
 def clean_knowledge_document_content(raw: str) -> str:

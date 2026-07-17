@@ -584,6 +584,58 @@ if (chat) {
         void runWishlistMore(ev, btn, nextPage);
     }
 
+    function getChatContentBottomInset() {
+        const composer = document.querySelector(".composer");
+        const h = composer ? composer.getBoundingClientRect().height : 72;
+        return Math.round(h + 12);
+    }
+
+    function scrollPurchaseHistoryTrackIntoView(card, panel) {
+        if (!card || !panel || !chat) return;
+        const anchor = panel.querySelector(".wf-ph-track-panel-title") || panel;
+        const motion = window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+        const padding = 36;
+        const nudge = 112;
+
+        function revealInContainer(container, visibleTop, visibleBottom) {
+            if (!container) return false;
+            const rect = anchor.getBoundingClientRect();
+            let delta = 0;
+            if (rect.top < visibleTop) {
+                delta = rect.top - visibleTop;
+            } else if (rect.bottom > visibleBottom) {
+                delta = rect.bottom - visibleBottom + padding;
+            } else if (rect.top > visibleBottom - 128) {
+                delta = nudge + Math.max(0, rect.bottom - visibleBottom);
+            }
+            if (Math.abs(delta) < 3) return false;
+            container.scrollBy({ top: delta, behavior: motion });
+            return true;
+        }
+
+        requestAnimationFrame(function() {
+            requestAnimationFrame(function() {
+                const phScroll = card.closest(".wf-ph-scroll");
+                if (phScroll) {
+                    const box = phScroll.getBoundingClientRect();
+                    revealInContainer(phScroll, box.top + 8, box.bottom - 8);
+                }
+
+                window.setTimeout(function() {
+                    const chatRect = chat.getBoundingClientRect();
+                    const visibleBottom = Math.min(
+                        chatRect.bottom,
+                        window.innerHeight - getChatContentBottomInset()
+                    );
+                    revealInContainer(chat, chatRect.top + 10, visibleBottom);
+                    if (window.matchMedia("(max-width: 767px)").matches) {
+                        anchor.scrollIntoView({ block: "center", inline: "nearest", behavior: motion });
+                    }
+                }, phScroll ? 60 : 0);
+            });
+        });
+    }
+
     function onPurchaseHistoryTrackToggle(ev) {
         const btn = ev.target.closest(".wf-ph-track-btn");
         if (!btn || !chat.contains(btn)) return;
@@ -597,6 +649,9 @@ if (chat) {
         panel.hidden = !open;
         btn.setAttribute("aria-expanded", open ? "true" : "false");
         btn.textContent = open ? "Hide tracking" : "Track order";
+        if (open) {
+            scrollPurchaseHistoryTrackIntoView(card, panel);
+        }
     }
 
     chat.addEventListener("pointerdown", onPurchaseHistoryMorePointerOrClick, true);

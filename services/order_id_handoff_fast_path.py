@@ -554,6 +554,57 @@ def _bot_awaiting_order_id(
         return False
 
 
+def _message_prefers_pincode_serviceability(
+    original_msg: str,
+    msg_en: str,
+    conversation_context: str,
+    ctx: dict | None,
+) -> bool:
+    """
+    Guard against stale order-id lock stealing a delivery/pincode turn.
+    Uses existing semantic helpers (no keyword routing).
+    """
+    comb = _combined(original_msg, msg_en)
+    if not comb:
+        return False
+    if isinstance(ctx, dict):
+        if (ctx.get("awaiting") or "").strip().lower() == "pincode":
+            return True
+        pending = (((ctx.get("data") or {}).get("pending_action")) or "").strip().lower()
+        if pending == "pincode_check":
+            return True
+        topic = (((ctx.get("data") or {}).get("topic_mode")) or "").strip().lower()
+        if topic == "pincode_check":
+            return True
+    try:
+        from utils.helpers import (
+            _text_is_pincode_serviceability_question,
+            extract_embedded_query_identifiers,
+        )
+
+        ids = extract_embedded_query_identifiers(comb, comb, conversation_context) or {}
+        if (ids.get("numeric_context") or "").strip().lower() == "pincode":
+            if (ids.get("pincode") or "").strip():
+                return True
+        if _text_is_pincode_serviceability_question(comb, conversation_context):
+            return True
+    except ImportError:
+        pass
+    try:
+        from services.location_delivery_resolver import turn_requests_delivery_serviceability
+
+        if turn_requests_delivery_serviceability(
+            original_msg,
+            msg_en,
+            conversation_context,
+            allow_llm=True,
+        ):
+            return True
+    except ImportError:
+        pass
+    return False
+
+
 def _is_order_id_handoff_turn(
     original_msg: str,
     msg_en: str,
@@ -573,6 +624,11 @@ def _is_order_id_handoff_turn(
             return False
     except ImportError:
         pass
+
+    if _message_prefers_pincode_serviceability(
+        original_msg, msg_en, conversation_context, ctx
+    ):
+        return False
 
     # Session lock / pending_action wins — order IDs often embed 6-digit PIN substrings.
     if _bot_awaiting_order_id(conversation_context, ctx):

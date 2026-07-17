@@ -275,22 +275,22 @@ def ai_classify_scope_and_reply(
     )
     user_line = _trim_text_mid(comb, 120)
 
-    system_prompt = f"""Welfog support chat classifier. Latest message only.
+    system_prompt = f"""Welfog shopping-support chat classifier. Latest message + RECENT when given.
 
 Scopes:
-- welfog_support: shopping/orders/wishlist/PIN/refund/policies on Welfog
+- welfog_support: shopping/orders/wishlist/PIN/refund/policies on Welfog. ALSO: product browse/buy/show asks; correcting or narrowing a product just shown ("I only wanted X", "sirf X", "only show X"); typos/slang about a product the customer is shopping for.
 - general_chitchat: greeting, thanks, bye, how-are-you, bot smalltalk (any language)
-- out_of_domain: unrelated topics (weather, cricket, homework, other apps…)
+- out_of_domain: truly unrelated topics (weather, cricket scores, homework, other apps…) — NOT shopping typos and NOT follow-ups about products in RECENT.
 
 JSON only:
 {{
   "user_meaning": "one English sentence",
   "conversation_scope": "welfog_support" | "general_chitchat" | "out_of_domain",
-  "scope_reply": "REQUIRED unless welfog_support: 1-2 sentences mirroring user language/style. Empty if welfog_support.",
+  "scope_reply": "REQUIRED unless welfog_support. For general_chitchat: 1-2 sentences in user's language/style — warm ack THEN soft invite how you can help on Welfog (shop/orders/delivery/returns). You are support assistant, not inventing personal hangout history. For out_of_domain: briefly nod then say you only help with Welfog shopping/support. Empty if welfog_support.",
   "confidence": 0.0-1.0
 }}
 {language_reply_instruction(rl)}
-No keyword lists — use meaning."""
+No keyword lists — use meaning. When RECENT shows catalog products and LATEST narrows/corrects that ask (even with typos), ALWAYS welfog_support."""
 
     user_payload = f"LATEST:\n{user_line}"
     if compact_ctx:

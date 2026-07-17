@@ -3830,6 +3830,63 @@ def _try_early_ai_brain_reply(
         except ImportError:
             pass
 
+        # Catalog menu (categories list / deals) BEFORE KB SoT — Brain often
+        # briefly locks KB then menu-finalize flips to categories/live_api; without
+        # this, KB SoT invents names / "not in knowledge base" / schema leaks.
+        try:
+            from services.brain_direct_dispatch import _try_brain_catalog_menu_direct_reply
+
+            menu_now = _try_brain_catalog_menu_direct_reply(
+                brain_route_data,
+                original_msg=original_msg,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if menu_now:
+                log_reasoning(
+                    "Brain early — catalog menu API (categories/deals before KB SoT)."
+                )
+                return _finish_early_brain(menu_now, brain_route_data)
+        except ImportError:
+            pass
+        try:
+            from utils.helpers import (
+                message_asks_welfog_categories_list,
+                _text_requests_category_product_browse,
+            )
+
+            _intent_menu = (brain_route_data.get("intent") or "").strip().lower()
+            _comb_menu = f"{original_msg or ''} {msg_en or ''}".strip()
+            _wants_menu_list = (
+                _intent_menu in ("categories", "category_feed")
+                or (
+                    message_asks_welfog_categories_list(_comb_menu)
+                    and not _text_requests_category_product_browse(_comb_menu)
+                )
+            )
+            if _intent_menu == "deals":
+                from services.catalog_menu_replies import build_today_deals_reply_html
+
+                deals_body = build_today_deals_reply_html(
+                    original_msg, reply_lang=lang
+                )
+                if deals_body:
+                    return _finish_early_brain(deals_body, brain_route_data)
+            elif _wants_menu_list:
+                from services.catalog_menu_replies import build_categories_list_reply_html
+
+                cat_body = build_categories_list_reply_html(
+                    ctx, original_msg, reply_lang=lang
+                )
+                if cat_body:
+                    log_reasoning(
+                        "Brain early — categories list API (menu ask / locked)."
+                    )
+                    return _finish_early_brain(cat_body, brain_route_data)
+        except ImportError:
+            pass
+
         # KB SoT — only when Brain did NOT already lock product catalog.
         # Shopping turns were spending 2–25s probing KB then answering catalog.
         try:
@@ -3837,6 +3894,7 @@ def _try_early_ai_brain_reply(
             from services.product_catalog_resolver import product_catalog_route_is_locked
             from services.ai_route_semantics import brain_route_indicates_product_catalog
 
+            _intent_early = (brain_route_data.get("intent") or "").strip().lower()
             _skip_kb_for_product = bool(
                 product_catalog_route_is_locked(brain_route_data)
                 or (
@@ -3844,10 +3902,15 @@ def _try_early_ai_brain_reply(
                     == "catalog"
                 )
                 or brain_route_indicates_product_catalog(brain_route_data)
+                or _intent_early in ("deals", "categories", "category_feed")
+                or (
+                    brain_route_data.get("_catalog_menu_locked")
+                    and _intent_early in ("deals", "categories", "category_feed")
+                )
             )
             if _skip_kb_for_product:
                 log_reasoning(
-                    "Brain early — skip KB SoT (product catalog already locked)."
+                    "Brain early — skip KB SoT (product/catalog-menu already locked)."
                 )
             else:
                 log_reasoning("Brain early — entering KB SoT…")
@@ -5971,12 +6034,27 @@ def chat():
             )
             from services.chitchat_resolver import try_scope_ai_early_reply
 
+            # Session last catalog title — zero MySQL; stops OOD on shopping corrections.
+            scope_ctx = ""
+            try:
+                last_os = ((ctx or {}).get("data") or {}).get("last_os_spec") or {}
+                last_tq = (
+                    (last_os.get("title_query") or last_os.get("product_query") or "")
+                    .strip()
+                )
+                if last_tq:
+                    scope_ctx = (
+                        f"Assistant: showed Welfog catalog products for '{last_tq}'."
+                    )
+            except Exception:
+                scope_ctx = ""
+
             begin_pre_brain_live_api_preflight()
             try:
                 scope_early = try_scope_ai_early_reply(
                     original_msg,
                     msg_en,
-                    "",
+                    scope_ctx,
                     reply_lang=lang,
                 )
             finally:
@@ -6075,6 +6153,67 @@ def chat():
     # Skip micro-LLM preflight classifiers; route once via universal brain below.
     # === AI BRAIN FIRST (one LLM — intent in any language, then dispatch) ===
     if _brain_route_first:
+        # Named department products first, then full categories menu — never confuse the two.
+        try:
+            from services.brain_direct_dispatch import try_category_browse_catalog_reply
+
+            cat_browse_fast = try_category_browse_catalog_reply(
+                original_msg,
+                msg_en,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if cat_browse_fast:
+                log_reasoning(
+                    "Brain-first — named category product browse (skip Brain for dept ask)."
+                )
+                return _fast_path_json_reply(
+                    cat_browse_fast,
+                    ai_route_snapshot={
+                        "intent": "product",
+                        "data_channel": "catalog",
+                        "route_handler": "category_browse_structural_fast",
+                        "category_only_browse": True,
+                    },
+                )
+        except ImportError:
+            pass
+
+        # Clear category-list asks → live categories API (no Brain/KB inventing names).
+        try:
+            from utils.helpers import (
+                message_asks_welfog_categories_list,
+                _text_requests_category_product_browse,
+            )
+            from services.catalog_menu_replies import build_categories_list_reply_html
+
+            comb_cat = f"{original_msg or ''} {msg_en or ''}".strip()
+            if (
+                comb_cat
+                and message_asks_welfog_categories_list(comb_cat)
+                and not _text_requests_category_product_browse(comb_cat)
+            ):
+                cat_fast = build_categories_list_reply_html(
+                    ctx, original_msg, reply_lang=lang
+                )
+                if cat_fast:
+                    log_reasoning(
+                        "Brain-first — categories list API (skip Brain/KB for menu ask)."
+                    )
+                    return _fast_path_json_reply(
+                        cat_fast,
+                        ai_route_snapshot={
+                            "intent": "categories",
+                            "data_channel": "live_api",
+                            "route_handler": "categories_api",
+                            "_catalog_menu_locked": True,
+                        },
+                    )
+        except ImportError:
+            pass
+
         bf_body, bf_route = _try_brain_first_chat_turn(
             original_msg,
             msg_en,
@@ -6124,6 +6263,33 @@ def chat():
             pass
 
         try:
+            from services.brain_direct_dispatch import try_category_browse_catalog_reply
+
+            # Named department products BEFORE "All Categories" menu — the word
+            # "category" in "Home & Kitchen category ke items" is browse, not menu.
+            cat_pre_brain = try_category_browse_catalog_reply(
+                original_msg,
+                msg_en,
+                user_id=user_id,
+                lang=lang,
+                ctx=ctx,
+                reset_context_fn=reset_context,
+            )
+            if cat_pre_brain:
+                log_reasoning("Structural lane — catalog-map category browse.")
+                return _fast_path_json_reply(
+                    cat_pre_brain,
+                    ai_route_snapshot={
+                        "intent": "product",
+                        "data_channel": "catalog",
+                        "route_handler": "category_browse_structural_fast",
+                        "category_only_browse": True,
+                    },
+                )
+        except ImportError:
+            pass
+
+        try:
             from services.ai_first_router import _try_catalog_menu_fast_path
             from services.catalog_menu_replies import (
                 build_categories_list_reply_html,
@@ -6144,6 +6310,27 @@ def chat():
                     menu_body = build_categories_list_reply_html(
                         ctx, original_msg, reply_lang=lang
                     )
+                elif menu_intent == "product" and menu_route.get("run_catalog_search"):
+                    try:
+                        from services.brain_direct_dispatch import (
+                            try_brain_direct_dispatch,
+                        )
+
+                        menu_body = try_brain_direct_dispatch(
+                            menu_route,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                            conv_for_llm=conv_for_llm,
+                            user_id=user_id,
+                            lang=lang,
+                            ctx=ctx,
+                            format_purchase_history_reply=format_purchase_history_reply,
+                            format_wishlist_reply=format_wishlist_reply,
+                            reset_context_fn=reset_context,
+                            reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
+                        )
+                    except ImportError:
+                        menu_body = None
                 if menu_body:
                     log_reasoning(f"Structural lane — {menu_intent} API.")
                     return _fast_path_json_reply(
@@ -6194,30 +6381,6 @@ def chat():
                     return _fast_path_json_reply(
                         zero_body, ai_route_snapshot=zero_route
                     )
-        except ImportError:
-            pass
-
-        try:
-            from services.brain_direct_dispatch import try_category_browse_catalog_reply
-
-            cat_pre_brain = try_category_browse_catalog_reply(
-                original_msg,
-                msg_en,
-                user_id=user_id,
-                lang=lang,
-                ctx=ctx,
-                reset_context_fn=reset_context,
-            )
-            if cat_pre_brain:
-                log_reasoning("Structural lane — catalog-map category browse.")
-                return _fast_path_json_reply(
-                    cat_pre_brain,
-                    ai_route_snapshot={
-                        "intent": "product",
-                        "data_channel": "catalog",
-                        "route_handler": "category_browse_structural_fast",
-                    },
-                )
         except ImportError:
             pass
 

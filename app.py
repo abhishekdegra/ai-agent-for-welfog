@@ -20,7 +20,9 @@ from extensions import db, login_manager
 from routes.admin_routes import register_admin_routes
 from routes.chat_routes import register_chat_routes
 from services.mysql_service import (
+    ensure_knowledge_mysql_ready,
     init_mysql_chat_schema,
+    init_mysql_knowledge_chunks_schema,
     init_mysql_knowledge_documents_schema,
 )
 from services.qdrant_service import init_qdrant_on_startup
@@ -143,7 +145,20 @@ def create_app():
 
     init_mysql_chat_schema()
     init_mysql_knowledge_documents_schema()
+    init_mysql_knowledge_chunks_schema()
+    try:
+        ensure_knowledge_mysql_ready()
+    except Exception as kb_ready_err:
+        print(f"[startup] knowledge MySQL ready check failed: {kb_ready_err}", flush=True)
     init_qdrant_on_startup()
+    try:
+        from services.knowledge_embedding_indexer import (
+            reconcile_knowledge_vectors_after_mysql_recovery,
+        )
+
+        reconcile_knowledge_vectors_after_mysql_recovery()
+    except Exception as kb_vec_err:
+        print(f"[startup] knowledge vector reconcile failed: {kb_vec_err}", flush=True)
     register_chat_routes(app)
     register_admin_routes(app)
 

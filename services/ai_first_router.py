@@ -2062,6 +2062,13 @@ def _try_catalog_menu_fast_path(
                 if ctx is not None:
                     ctx.setdefault("data", {})["selected_category_id"] = cid
                     ctx["awaiting"] = None
+                cat_label = ""
+                try:
+                    from services.welfog_api import category_name_for_id
+
+                    cat_label = (category_name_for_id(str(cid), ctx=ctx) or "").strip()
+                except ImportError:
+                    cat_label = ""
                 log_reasoning(
                     f"Catalog-menu fast-path → category browse (category_id={cid})."
                 )
@@ -2071,10 +2078,13 @@ def _try_catalog_menu_fast_path(
                     "intent": "product",
                     "data_channel": "catalog",
                     "run_catalog_search": True,
-                    "search_query": sq,
+                    "search_query": sq or "",
+                    "category_browse": cat_label or sq or "",
+                    "category_only_browse": not bool((sq or "").strip()),
                     "needs_order_id": False,
                     "numeric_context": "none",
                     "_preflight_catalog_menu": True,
+                    "_product_catalog_locked": True,
                 }
                 return (
                     AnswerRouteDecision(

@@ -669,6 +669,16 @@ def understanding_from_locked_product_route(
                     u["search_terms"] = sq
             except ImportError:
                 u["search_terms"] = sq
+    if isinstance(ai_route, dict):
+        for src in (
+            ai_route.get("product_requests"),
+            (ai_route.get("_product_entities") or {}).get("product_requests")
+            if isinstance(ai_route.get("_product_entities"), dict)
+            else None,
+        ):
+            if isinstance(src, list) and len(src) >= 2:
+                u["product_requests"] = src
+                break
     return u
 
 

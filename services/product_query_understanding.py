@@ -116,14 +116,15 @@ def scrub_conversational_tail_from_terms(terms: str) -> str:
 def soft_collapse_repeated_letters(text: str) -> str:
     """
     Algorithmic typo soften (not a product dictionary):
-    - vowel runs → single (fliipflops→flipflops, baniiyan→baniyan, iphonee→iphone)
+    - vowel runs of 3+ → single (fliiipflops→flipflops, iphoneee→iphone)
+      Keep normal doubles (moose, google, book) — collapsing oo→o destroys catalog names.
     - consonant runs of 3+ → single (samsunggg→samsung)
-    Use as search VARIANT / primary when the model echoed raw keysmash.
+    Use as search VARIANT when the model echoed raw keysmash — never as sole primary.
     """
     t = (text or "").lower()
     if not t:
         return t
-    t = re.sub(r"([aeiou])\1+", r"\1", t)
+    t = re.sub(r"([aeiou])\1{2,}", r"\1", t)
     t = re.sub(r"([b-df-hj-np-tv-z])\1{2,}", r"\1", t)
     return t
 

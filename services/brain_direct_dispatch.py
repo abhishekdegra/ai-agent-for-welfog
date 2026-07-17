@@ -1085,14 +1085,61 @@ def _prepare_brain_product_route(
     # and locked understanding share one SoT (never leave vernacular product_name).
     route["search_query"] = sq
     route["_ai_single_pass"] = True
+    # When Brain only filled search_query (product_name empty), stamp it so
+    # locked OpenSearch + skip-NLU gates see one SoT.
+    pe0 = route.get("_product_entities") or {}
+    if not isinstance(pe0, dict):
+        pe0 = {}
+    if sq and not (pe0.get("product_name") or "").strip():
+        pe0 = dict(pe0)
+        pe0["product_name"] = sq
+        route["_product_entities"] = pe0
+        if isinstance(route.get("product_entities"), dict):
+            pe_top = dict(route["product_entities"])
+            if not (pe_top.get("product_name") or "").strip():
+                pe_top["product_name"] = sq
+                route["product_entities"] = pe_top
+        elif route.get("product_entities") is None:
+            route["product_entities"] = {"product_name": sq}
     # Preserve Brain multi-item list for locked multi rails.
-    if isinstance(brain.get("product_requests"), list) and len(brain.get("product_requests") or []) >= 2:
-        route["product_requests"] = brain.get("product_requests")
+    brain_multi = brain.get("product_requests")
+    if isinstance(brain_multi, list) and len(brain_multi) >= 2:
+        route["product_requests"] = brain_multi
+        route["search_query"] = ""
+        sq = ""
     pe = route.get("_product_entities") or {}
     if not isinstance(pe, dict):
         pe = {}
-    if isinstance(pe.get("product_requests"), list) and len(pe.get("product_requests") or []) >= 2:
-        route["product_requests"] = pe.get("product_requests")
+    pe_multi = pe.get("product_requests")
+    if isinstance(pe_multi, list) and len(pe_multi) >= 2:
+        route["product_requests"] = pe_multi
+        route["search_query"] = ""
+        sq = ""
+    if isinstance(route.get("product_requests"), list) and len(route.get("product_requests") or []) >= 2:
+        route["_needs_product_nlu_llm"] = False
+        route["_product_nlu_from_ai"] = True
+        log_reasoning(
+            f"Brain product turn — {len(route['product_requests'])} items; "
+            "multi OpenSearch (skip entity NLU)."
+        )
+    # Brain JSON product_name is already LLM-extracted — use for OpenSearch when Latin.
+    if not sq and not (
+        isinstance(route.get("product_requests"), list)
+        and len(route.get("product_requests") or []) >= 2
+    ):
+        try:
+            from services.ai_route_semantics import brain_stamped_product_title_opensearch_ready
+
+            pn_seed = (pe.get("product_name") or entities.get("product_name") or "").strip()
+            if pn_seed and brain_stamped_product_title_opensearch_ready(pn_seed, route):
+                sq = pn_seed
+                route["search_query"] = sq
+                log_reasoning(
+                    f"Brain product turn — trust Brain product_name {sq!r}; "
+                    "OpenSearch next (skip entity NLU)."
+                )
+        except ImportError:
+            pass
     entities = route.get("entities") or {}
     if not isinstance(entities, dict):
         entities = {}
@@ -1115,8 +1162,13 @@ def _prepare_brain_product_route(
     # resolve_catalog_search_phrase already chose Brain English or confident title.
     # Any non-empty sq here is OpenSearch-ready — skip redundant entity NLU LLM.
     title_ready = bool(sq)
+    multi_items = isinstance(route.get("product_requests"), list) and len(
+        route.get("product_requests") or []
+    ) >= 2
 
-    if pe.get("sku") or pe.get("pro_id") or pe.get("product_id") or entities.get("sku"):
+    if multi_items:
+        pass
+    elif pe.get("sku") or pe.get("pro_id") or pe.get("product_id") or entities.get("sku"):
         route["_needs_product_nlu_llm"] = False
     elif route.get("category_only_browse") and not sq:
         route["_needs_product_nlu_llm"] = False
@@ -1127,11 +1179,30 @@ def _prepare_brain_product_route(
             f"Brain product turn — catalog title {sq!r}; OpenSearch next (skip entity NLU)."
         )
     elif has_name and not title_ready:
-        route["_needs_product_nlu_llm"] = True
-        route.pop("_product_nlu_from_ai", None)
-        log_reasoning(
-            "Brain product turn — vernacular/empty title; run Product Entity Extraction once."
-        )
+        pn_fb = (pe.get("product_name") or entities.get("product_name") or "").strip()
+        try:
+            from services.ai_route_semantics import brain_stamped_product_title_opensearch_ready
+
+            if pn_fb and brain_stamped_product_title_opensearch_ready(pn_fb, route):
+                route["search_query"] = pn_fb
+                route["_needs_product_nlu_llm"] = False
+                route["_product_nlu_from_ai"] = True
+                log_reasoning(
+                    f"Brain product turn — Brain product_name {pn_fb!r}; "
+                    "OpenSearch next (skip entity NLU)."
+                )
+            else:
+                route["_needs_product_nlu_llm"] = True
+                route.pop("_product_nlu_from_ai", None)
+                log_reasoning(
+                    "Brain product turn — vernacular/empty title; run Product Entity Extraction once."
+                )
+        except ImportError:
+            route["_needs_product_nlu_llm"] = True
+            route.pop("_product_nlu_from_ai", None)
+            log_reasoning(
+                "Brain product turn — vernacular/empty title; run Product Entity Extraction once."
+            )
     else:
         route["_needs_product_nlu_llm"] = True
     return route, sq
@@ -2925,6 +2996,15 @@ def _try_brain_catalog_menu_direct_reply(
     intent = (brain_route.get("intent") or "").strip().lower()
     if intent not in ("deals", "categories", "category_feed"):
         return None
+    # Mis-locked "categories" when user asked for products in a named department.
+    if intent in ("categories", "category_feed"):
+        try:
+            from utils.helpers import _text_requests_category_product_browse
+
+            if _text_requests_category_product_browse(original_msg or ""):
+                return None
+        except ImportError:
+            pass
     try:
         from services.catalog_menu_replies import (
             build_categories_list_reply_html,

@@ -442,6 +442,16 @@ def _locked_catalog_spec_ready(
     if route.get("_needs_product_nlu_llm") is False and has_title:
         return True
 
+    st = (locked.get("search_terms") or "").strip()
+    if st:
+        try:
+            from services.ai_route_semantics import brain_stamped_product_title_opensearch_ready
+
+            if brain_stamped_product_title_opensearch_ready(st, route):
+                return True
+        except ImportError:
+            pass
+
     if route.get("_needs_product_nlu_llm"):
         return False
 

@@ -1295,20 +1295,33 @@ def brain_turn_indicates_categories(
 ) -> bool:
     if not isinstance(route, dict):
         return False
+    # Products inside a named department are catalog browse — not the menu list.
+    if route.get("category_only_browse") or (route.get("category_browse") or "").strip():
+        return False
     intent = (route.get("intent") or "").strip().lower()
+    if intent in ("product", "product_search") and (
+        route.get("run_catalog_search") or route.get("_product_catalog_locked")
+    ):
+        return False
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if comb:
+        try:
+            from utils.helpers import (
+                _text_requests_category_product_browse,
+                message_asks_welfog_categories_list,
+            )
+
+            if _text_requests_category_product_browse(comb):
+                return False
+            if message_asks_welfog_categories_list(comb):
+                return True
+        except ImportError:
+            pass
     if intent in ("categories", "category_feed"):
         return True
     blob = _brain_meaning_blob(route)
     if any(m in blob for m in _CATEGORIES_MEANING_MARKERS):
         return True
-    if original_msg or msg_en:
-        try:
-            from utils.helpers import message_asks_welfog_categories_list
-
-            comb = f"{original_msg or ''} {msg_en or ''}".strip()
-            return message_asks_welfog_categories_list(comb)
-        except ImportError:
-            pass
     return False
 
 
@@ -1361,6 +1374,15 @@ def reconcile_deals_from_brain_meaning(route: dict | None) -> dict:
     out["meta_kind"] = "none"
     out.pop("_product_catalog_locked", None)
     out.pop("_product_entities", None)
+    out.pop("kb_keys", None)
+    out.pop("_kb_route_locked", None)
+    out["_catalog_menu_locked"] = True
+    try:
+        from services.chat_flow_telemetry import clear_authoritative_kb_route_lock
+
+        clear_authoritative_kb_route_lock(reason="deals_menu")
+    except ImportError:
+        pass
     return out
 
 
@@ -1377,6 +1399,15 @@ def reconcile_categories_from_brain_meaning(route: dict | None) -> dict:
     out["scope_reply"] = ""
     out["meta_kind"] = "none"
     out.pop("_product_catalog_locked", None)
+    out.pop("kb_keys", None)
+    out.pop("_kb_route_locked", None)
+    out["_catalog_menu_locked"] = True
+    try:
+        from services.chat_flow_telemetry import clear_authoritative_kb_route_lock
+
+        clear_authoritative_kb_route_lock(reason="categories_menu")
+    except ImportError:
+        pass
     return out
 
 
@@ -1707,6 +1738,11 @@ def _catalog_phrase_echoes_customer_raw(
     if _brain_english_meaning_confirms_product_noun(brain_route, p):
         return False
 
+    # Brain JSON already stamped this Latin product_name — Hinglish is on verbs only
+    # ("watch dikha", "jeans chahiye"); the noun itself is OpenSearch-ready.
+    if brain_stamped_product_title_opensearch_ready(p, brain_route):
+        return False
+
     # Multi-word Latin product already typed by the customer ("nike shoes", "flip flop")
     # is OpenSearch-ready even inside a Hinglish sentence.
     if len(phrase_toks) >= 2 and _latin_script_only(p) and not is_hinglish_message(p):
@@ -1790,6 +1826,50 @@ def _brain_english_meaning_confirms_product_noun(
     return all(t in um_fold or (t.endswith("s") and t[:-1] in um_fold) for t in noun_toks)
 
 
+def brain_stamped_product_title_opensearch_ready(
+    phrase: str, brain_route: dict | None = None
+) -> bool:
+    """
+    True when Brain JSON already extracted a Latin catalog title — skip 2nd NLU LLM.
+
+    Structural only (no product synonym lists): Brain product_name OR search_query
+    in route JSON is itself an LLM output; when it is Latin and not Hinglish,
+    OpenSearch can use it even if the customer sentence was Hinglish
+    (watch dikha → search_query=watch, product_name often empty).
+    """
+    p = (phrase or "").strip()
+    if len(p) < 2 or is_generic_catalog_search_phrase(p):
+        return False
+    r = brain_route if isinstance(brain_route, dict) else {}
+    ent = _raw_route_product_entities(r)
+    candidates = [
+        _usable_catalog_entity_phrase(ent.get("product_name") or "", r),
+        _usable_catalog_entity_phrase((r.get("search_query") or "").strip(), r),
+    ]
+    stamped = next(
+        (c for c in candidates if c and c.lower() == p.lower()),
+        "",
+    )
+    if not stamped:
+        return False
+    try:
+        from services.translation_service import (
+            _latin_script_only,
+            is_hinglish_message,
+            text_usable_as_english_retrieval,
+            _looks_english_only_latin,
+        )
+
+        if not _latin_script_only(p) or is_hinglish_message(p):
+            return False
+        tokens = re.findall(r"[a-zA-Z]{2,}", p)
+        if len(tokens) >= 1:
+            return True
+        return bool(text_usable_as_english_retrieval(p) or _looks_english_only_latin(p))
+    except ImportError:
+        return len(p.split()) >= 1
+
+
 def _phrase_is_catalog_english(phrase: str, *, brain_route: dict | None = None) -> bool:
     """
     True when phrase is confident OpenSearch catalog English from Brain/NLU.
@@ -1822,7 +1902,9 @@ def _phrase_is_catalog_english(phrase: str, *, brain_route: dict | None = None) 
         tokens = re.findall(r"[a-zA-Z]{2,}", p)
         if len(tokens) >= 2:
             return True
-        # Single token: trust only when Brain English meaning already named it.
+        # Single token: Brain JSON product_name or English meaning confirms it.
+        if tokens and brain_stamped_product_title_opensearch_ready(p, brain_route):
+            return True
         return bool(tokens) and _brain_english_meaning_confirms_product_noun(
             brain_route, p
         )
@@ -2326,7 +2408,26 @@ def _repair_brain_product_entities(
                     _title_match_tokens,
                 )
 
-                for tok in _title_match_tokens(pn):
+                title_toks = list(_title_match_tokens(pn))
+                # Distinctive modifiers (person/theme/brand-like tokens) MUST stay
+                # required — otherwise OpenSearch soft-path collapses to bare type
+                # ("frame") and returns every frame in catalog.
+                stop = {"the", "and", "for", "with", "of", "ka", "ki", "ke"}
+                distinctive = sorted(
+                    (
+                        t
+                        for t in title_toks
+                        if len(t) >= 4
+                        and t not in stop
+                        and t not in _PRODUCT_NOUNS
+                        and t.rstrip("s") not in _PRODUCT_NOUNS
+                    ),
+                    key=lambda t: (-len(t), t),
+                )
+                for tok in distinctive[:2]:
+                    if tok not in mandatory:
+                        mandatory.append(tok)
+                for tok in title_toks:
                     base = (
                         tok.rstrip("s")
                         if tok.endswith("s") and tok[:-1] in _PRODUCT_NOUNS
@@ -2697,6 +2798,14 @@ def resolve_catalog_search_phrase(
     sq_hint = _usable_catalog_entity_phrase(
         (ai_search_query or r.get("search_query") or "").strip(), r
     )
+    # Brain search_query is LLM-emitted catalog English — trust even when the
+    # customer typed the same Latin noun inside a Hinglish sentence.
+    if sq_hint and brain_stamped_product_title_opensearch_ready(sq_hint, r):
+        log_reasoning(
+            f"Catalog title — Brain search_query {sq_hint!r}; OpenSearch next "
+            "(skip entity NLU)."
+        )
+        return sq_hint
     if (
         sq_hint
         and _phrase_is_catalog_english(sq_hint, brain_route=r)
@@ -2706,6 +2815,8 @@ def resolve_catalog_search_phrase(
     ):
         return sq_hint
 
+    if pn and brain_stamped_product_title_opensearch_ready(pn, r):
+        return pn
     if (
         pn
         and _phrase_is_catalog_english(pn, brain_route=r)

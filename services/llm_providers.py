@@ -350,42 +350,42 @@ def llm_json_with_retry(
                 read_to = float(timeout_sec)
             except (TypeError, ValueError):
                 read_to = 12.0
-            # Chitchat/scope pass small timeouts (<=5s) — enforce them strictly.
-            # Brain/product keep their larger budgets (cap at 45s only as safety).
+            # Always enforce a hard wall-clock budget. Socket timeouts alone can
+            # hang 30–70s on stuck TLS/providers (esp. OpenAI) and poison later turns.
             if read_to <= 5.0:
                 read_to = max(1.0, min(5.0, read_to))
             else:
-                read_to = max(5.0, min(45.0, read_to))
+                read_to = max(5.0, min(20.0, read_to))
 
             def _do_post():
                 return session.post(
                     url, headers=headers, json=req, timeout=(3.0, read_to)
                 )
 
-            # Wall-clock hard stop: some hosts ignore short socket timeouts.
-            # IMPORTANT: on timeout, shut down wait=False — otherwise context-manager
-            # shutdown(wait=True) blocks until the stuck HTTP finally returns (20–60s).
-            if read_to <= 5.0:
-                import concurrent.futures
+            # Wall-clock hard stop for every call — cancel futures without waiting
+            # so a stuck HTTP body cannot block Flask for tens of seconds.
+            import concurrent.futures
 
-                pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            timed_out = False
+            try:
+                fut = pool.submit(_do_post)
                 try:
-                    fut = pool.submit(_do_post)
-                    try:
-                        res = fut.result(timeout=read_to + 0.75)
-                    except concurrent.futures.TimeoutError:
-                        set_last_llm_failure("timeout")
-                        log_reasoning(
-                            f"{provider_name} hard timeout ({read_to}s) — next provider."
-                        )
-                        return None
-                finally:
-                    try:
-                        pool.shutdown(wait=False, cancel_futures=True)
-                    except TypeError:
-                        pool.shutdown(wait=False)
-            else:
-                res = _do_post()
+                    res = fut.result(timeout=read_to + 0.75)
+                except concurrent.futures.TimeoutError:
+                    timed_out = True
+                    set_last_llm_failure("timeout")
+                    log_reasoning(
+                        f"{provider_name} hard timeout ({read_to}s) — next provider."
+                    )
+                    return None
+            finally:
+                # On success wait briefly so the worker exits cleanly; on timeout
+                # abandon immediately so Flask is not blocked by stuck TLS.
+                try:
+                    pool.shutdown(wait=not timed_out, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
             if res.status_code == 200:
                 body = res.json()
                 content = (

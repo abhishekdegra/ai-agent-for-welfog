@@ -479,6 +479,13 @@ def _build_route_data_from_resolution(
     out["meta_kind"] = "none"
     out["conversation_scope"] = "welfog_support"
     out["_turn_promotions_done"] = True
+    out.pop("_kb_route_locked", None)
+    try:
+        from services.chat_flow_telemetry import clear_authoritative_kb_route_lock
+
+        clear_authoritative_kb_route_lock(reason="catalog_menu_resolution")
+    except ImportError:
+        pass
     return out
 
 
