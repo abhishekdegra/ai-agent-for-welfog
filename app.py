@@ -265,11 +265,24 @@ if __name__ == "__main__":
         "off",
     )
 
+    # Bind all interfaces so the chat is reachable as http://<LAN-IP>:5000 (not only localhost).
+    host = (os.getenv("FLASK_HOST") or "0.0.0.0").strip() or "0.0.0.0"
+    lan_hint = ""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("8.8.8.8", 80))
+            lan_ip = s.getsockname()[0]
+        if lan_ip and not lan_ip.startswith("127."):
+            lan_hint = f"  LAN -> http://{lan_ip}:{port}"
+    except OSError:
+        pass
     print(
-        f"[startup] Welfog support server PID {os.getpid()} on http://127.0.0.1:{port} "
-        f"(Ctrl+C to stop, reloader={'on' if use_reloader else 'off'})",
+        f"[startup] Welfog support server PID {os.getpid()} on http://{host}:{port} "
+        f"(Ctrl+C to stop, reloader={'on' if use_reloader else 'off'})"
+        f"{lan_hint}",
         flush=True,
     )
-    # Sync handler — one /chat at a time per worker; async threads caused encode-lock pileups.
-    os.environ.setdefault("CHAT_ASYNC_HANDLER", "0")
-    app.run(port=port, debug=debug, use_reloader=use_reloader, threaded=True)
+    # Async deadline — sync mode cannot interrupt a hung turn (client saw 95s abort).
+    # Abandoned workers stop further LLM/embed via chat_turn_abandoned().
+    os.environ.setdefault("CHAT_ASYNC_HANDLER", "1")
+    app.run(host=host, port=port, debug=debug, use_reloader=use_reloader, threaded=True)

@@ -72,14 +72,24 @@ def merge_ai_into_catalog_spec(
         spec["related_search_terms"] = related
 
     skip_cat_lookup = bool(spec.get("_ai_single_pass") or ai.get("_ai_first"))
-    if terms and not skip_cat_lookup:
+    # Never wipe a product title just because it fuzzy-matches a department
+    # (e.g. "women tshirt" → Women Fashion). Only clear when terms ARE the
+    # department label and AI did not name a product_type.
+    if terms and not skip_cat_lookup and not (ai.get("product_type") or "").strip():
         try:
-            from services.welfog_api import get_category_id_from_text
+            from services.welfog_api import (
+                _normalize_cat_name,
+                category_name_for_id,
+                get_category_id_from_text,
+            )
 
             cat_id = spec.get("category_id")
             if cat_id and get_category_id_from_text(terms) == str(cat_id):
-                spec.pop("title_query", None)
-                terms = ""
+                cat_n = _normalize_cat_name(category_name_for_id(str(cat_id)) or "")
+                tq_n = _normalize_cat_name(terms)
+                if cat_n and tq_n and tq_n == cat_n:
+                    spec.pop("title_query", None)
+                    terms = ""
         except ImportError:
             pass
 
@@ -176,6 +186,48 @@ def merge_ai_into_catalog_spec(
     if ptype:
         spec["product_type"] = ptype
 
+    def _semantic_list(value) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        out: list[str] = []
+        for item in value:
+            text = re.sub(r"\s+", " ", str(item or "").strip().lower())
+            if text and text not in out:
+                out.append(text)
+        return out
+
+    compatibility = (ai.get("compatibility") or ai.get("model") or "").strip().lower()
+    audience = _semantic_list(ai.get("audience") or ai.get("audience_tokens"))
+    materials = _semantic_list(ai.get("material") or ai.get("material_tokens"))
+    occasions = _semantic_list(ai.get("occasion"))
+    features = _semantic_list(ai.get("feature_tokens") or ai.get("features"))
+    if audience:
+        spec["audience_tokens"] = audience
+    if materials:
+        spec["material_tokens"] = materials
+    if occasions:
+        spec["occasion_tokens"] = occasions
+    if features:
+        spec["feature_tokens"] = features
+    quantity = ai.get("quantity")
+    if quantity not in (None, ""):
+        spec["quantity"] = quantity
+    if ai.get("in_stock_only"):
+        spec["in_stock_only"] = True
+    sort_value = (ai.get("sort") or "").strip().lower()
+    sort_map = {
+        "price_asc": "purchase_price_asc",
+        "price_desc": "purchase_price_desc",
+        "purchase_price_asc": "purchase_price_asc",
+        "purchase_price_desc": "purchase_price_desc",
+        "rating_desc": "rating_desc",
+        "relevance": None,
+    }
+    if sort_value in sort_map and sort_map[sort_value]:
+        spec["sort"] = sort_map[sort_value]
+
     mode = (ai.get("match_mode") or "").strip().lower()
     if not mode:
         mode = "strict" if brand else "universal"
@@ -183,11 +235,18 @@ def merge_ai_into_catalog_spec(
     mandatory = _norm_list(ai.get("mandatory_match_tokens"))
     if ptype and ptype not in mandatory:
         mandatory.append(ptype)
+    # Compatibility/model and explicit features must survive OpenSearch ranking.
+    # They are semantic AI slots, not product-name keyword rules.
+    for token in [compatibility, *features]:
+        if token and token not in mandatory:
+            mandatory.append(token)
+    if compatibility or features:
+        spec["_semantic_constraints_from_ai"] = True
     try:
         from services.opensearch_products import extract_material_tokens
 
         blob = f"{terms} {original_msg}"
-        mats = extract_material_tokens(blob)
+        mats = materials or extract_material_tokens(blob)
         if mats:
             for m in mats:
                 if m not in mandatory:
@@ -289,19 +348,21 @@ def merge_ai_into_catalog_spec(
 
     try:
         from services.catalog_spec_semantics import (
+            ai_set_price_filter,
             user_mentions_rating_this_turn,
         )
-        from services.opensearch_products import _user_mentions_price_this_turn
 
-        allow_price = _user_mentions_price_this_turn(original_msg or "")
+        allow_price = ai_set_price_filter(ai)
         allow_rating = user_mentions_rating_this_turn(original_msg or "")
     except ImportError:
         allow_price = allow_rating = True
 
-    if allow_price or ai.get("_ai_first"):
+    if allow_price or ai.get("_ai_first") or ai_set_price_filter(ai):
         for src, dst in (
             ("max_price", "purchase_price_max"),
             ("min_price", "purchase_price_min"),
+            ("price_max", "purchase_price_max"),
+            ("price_min", "purchase_price_min"),
             ("purchase_price_max", "purchase_price_max"),
             ("purchase_price_min", "purchase_price_min"),
         ):
@@ -392,19 +453,26 @@ def merge_ai_into_catalog_spec(
             pass
 
     if spec.get("category_id") and original_msg:
-        try:
-            from services.welfog_api import query_should_use_category_id_only
-
-            if query_should_use_category_id_only(
-                spec["category_id"], original_msg, ctx=None
-            ):
-                spec["title_query"] = ""
-                spec["_category_only_browse"] = True
-                spec.pop("brand", None)
-                spec.pop("brand_aliases", None)
-                spec.pop("brand_name_match_only", None)
-        except ImportError:
+        # Keep an AI-extracted product noun — never demote "bnaiyan under 500"
+        # (or any named product + filters) into a department-only browse.
+        has_product_title = bool((spec.get("title_query") or "").strip())
+        ai_wants_cat_only = bool(ai.get("category_only_browse"))
+        if has_product_title and not ai_wants_cat_only:
             pass
+        else:
+            try:
+                from services.welfog_api import query_should_use_category_id_only
+
+                if query_should_use_category_id_only(
+                    spec["category_id"], original_msg, ctx=None
+                ):
+                    spec["title_query"] = ""
+                    spec["_category_only_browse"] = True
+                    spec.pop("brand", None)
+                    spec.pop("brand_aliases", None)
+                    spec.pop("brand_name_match_only", None)
+            except ImportError:
+                pass
 
     try:
         from services.opensearch_products import _scrub_price_filters_on_rating_turn
@@ -413,7 +481,7 @@ def merge_ai_into_catalog_spec(
             reconcile_ai_first_catalog_spec,
         )
 
-        _scrub_price_filters_on_rating_turn(spec, original_msg or "")
+        _scrub_price_filters_on_rating_turn(spec, original_msg or "", ai_understanding=ai)
         from services.catalog_spec_semantics import enforce_explicit_user_filters_only
 
         spec = enforce_explicit_user_filters_only(

@@ -521,6 +521,16 @@ def reconcile_wishlist_from_brain_meaning(
 
     kind = _norm_account_list_kind(coerce_route_str(out.get("account_list_kind"), KIND_NONE))
 
+    # Locked purchase-history kinds must not flip to wishlist on a conflicting
+    # intent alone (that caused wishlist↔orders swaps in chat).
+    if kind in (KIND_PURCHASE_IN_CHAT, KIND_PURCHASE_HOWTO):
+        if saved and not bought:
+            return _apply_kind_to_route(
+                out, _wishlist_kind_from_route(out), "fix_purchase_wishlist_drift"
+            )
+        # Re-apply so intent/channel=live_api beat a premature KB lock.
+        return _apply_kind_to_route(out, kind, "brain_account_list_kind")
+
     # Brain already selected wishlist feature — keep it unless THIS turn has hard
     # product evidence (brand/sku/category). Never clear on search_query alone.
     if kind in (KIND_WISHLIST_IN_CHAT, KIND_WISHLIST_HOWTO):
@@ -1228,12 +1238,22 @@ def _apply_kind_to_route(out: dict, kind: str, source: str) -> dict:
     out.pop("_product_catalog_locked", None)
     out["continue_previous_topic"] = False
     out.pop("_semantic_override", None)
+    # Brain often pairs account_list_kind with a premature channel=kb /
+    # scope_reply ack ("I will fetch…"). Clear that so live API owns the turn.
+    out["scope_reply"] = ""
 
     if kind == KIND_WISHLIST_IN_CHAT:
         out["intent"] = "wishlist"
         out["data_channel"] = "live_api"
         out["answer_strategy"] = "live_api_only"
         out.pop("route_handler", None)
+        out.pop("_kb_route_locked", None)
+        try:
+            from services.chat_flow_telemetry import clear_authoritative_kb_route_lock
+
+            clear_authoritative_kb_route_lock(reason="wishlist_live_api")
+        except ImportError:
+            pass
         log_reasoning(f"Account-list ({source}): saved/liked → wishlist API.")
     elif kind == KIND_WISHLIST_HOWTO:
         out["intent"] = "general"
@@ -1251,6 +1271,13 @@ def _apply_kind_to_route(out: dict, kind: str, source: str) -> dict:
         out["data_channel"] = "live_api"
         out["answer_strategy"] = "live_api_only"
         out.pop("route_handler", None)
+        out.pop("_kb_route_locked", None)
+        try:
+            from services.chat_flow_telemetry import clear_authoritative_kb_route_lock
+
+            clear_authoritative_kb_route_lock(reason="order_history_live_api")
+        except ImportError:
+            pass
         log_reasoning(f"Account-list ({source}): purchase list → order_history API.")
     elif kind == KIND_PURCHASE_HOWTO:
         out["intent"] = "general"

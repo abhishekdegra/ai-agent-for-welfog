@@ -232,7 +232,25 @@ def ai_understanding_has_shopping(ai: Optional[dict]) -> bool:
 def ai_set_price_filter(ai: Optional[dict]) -> bool:
     if not ai:
         return False
-    return ai.get("max_price") is not None or ai.get("min_price") is not None
+    return (
+        ai.get("max_price") is not None
+        or ai.get("min_price") is not None
+        or ai.get("price_max") is not None
+        or ai.get("price_min") is not None
+        or ai.get("purchase_price_max") is not None
+        or ai.get("purchase_price_min") is not None
+    )
+
+
+def spec_has_price_filter(spec: Optional[dict]) -> bool:
+    if not spec:
+        return False
+    return (
+        spec.get("purchase_price_max") is not None
+        or spec.get("purchase_price_min") is not None
+        or spec.get("unit_price_max") is not None
+        or spec.get("unit_price_min") is not None
+    )
 
 
 def ai_set_rating_filter(ai: Optional[dict]) -> bool:
@@ -446,7 +464,6 @@ def scrub_ai_product_understanding(
         from services.opensearch_products import (
             _is_valid_sku_token,
             _looks_like_warehouse_sku,
-            _user_mentions_price_this_turn,
         )
     except ImportError:
         return out
@@ -494,9 +511,7 @@ def scrub_ai_product_understanding(
         else:
             out.pop("rating_max", None)
 
-    if not _user_mentions_price_this_turn(comb):
-        out.pop("max_price", None)
-        out.pop("min_price", None)
+    # Price/budget: Product NLU owns max_price/min_price in any language — do not strip.
 
     st = (out.get("search_terms") or "").strip()
     if st:
@@ -616,13 +631,12 @@ def enforce_explicit_user_filters_only(
     """
     if not spec:
         return spec
-    if spec.get("_catalog_ai") or (isinstance(ai_understanding, dict) and ai_understanding.get("_ai_first")):
+    if spec.get("_catalog_ai") or spec.get("_ai_single_pass"):
         return spec
-    try:
-        from services.opensearch_products import _user_mentions_price_this_turn
-    except ImportError:
-        _user_mentions_price_this_turn = lambda _t: False  # type: ignore
-
+    if isinstance(ai_understanding, dict) and (
+        ai_understanding.get("_ai_first") or ai_set_price_filter(ai_understanding)
+    ):
+        return spec
     comb = f"{original_msg or ''} {msg_en or ''}".strip()
     spec = dict(spec)
 
@@ -657,24 +671,7 @@ def enforce_explicit_user_filters_only(
                 ):
                     spec.pop("rating_max", None)
 
-    if not _user_mentions_price_this_turn(comb):
-        for k in (
-            "purchase_price_max",
-            "purchase_price_min",
-            "unit_price_max",
-            "unit_price_min",
-        ):
-            spec.pop(k, None)
-    else:
-        pmax = spec.get("purchase_price_max")
-        pmin = spec.get("purchase_price_min")
-        nums_in_msg = [int(x) for x in re.findall(r"\d{2,7}", comb)]
-        if pmax is not None and nums_in_msg and int(float(pmax)) not in nums_in_msg:
-            if not any(abs(int(float(pmax)) - n) <= 5 for n in nums_in_msg):
-                spec.pop("purchase_price_max", None)
-        if pmin is not None and nums_in_msg and int(float(pmin)) not in nums_in_msg:
-            if not any(abs(int(float(pmin)) - n) <= 5 for n in nums_in_msg):
-                spec.pop("purchase_price_min", None)
+    # Price/budget filters: Brain + Product NLU JSON — never strip on keyword mismatch.
 
     if ai_understanding and not user_mentions_rating_this_turn(comb):
         ai_understanding.pop("rating_min", None) if isinstance(ai_understanding, dict) else None
@@ -745,7 +742,9 @@ def reconcile_ai_first_catalog_spec(
         spec["sku"] = gap["sku"]
 
     if ai_set_rating_filter(ai_understanding):
-        _scrub_price_filters_on_rating_turn(spec, comb)
+        _scrub_price_filters_on_rating_turn(
+            spec, comb, ai_understanding=ai_understanding
+        )
 
     _scrub_bogus_brand_from_spec(spec, comb)
     normalize_rating_filters_from_message(comb, spec)
@@ -753,12 +752,25 @@ def reconcile_ai_first_catalog_spec(
         spec, original_msg, msg_en, ai_understanding=ai_understanding
     )
 
-    try:
-        from services.opensearch_products import scrub_filter_only_catalog_title
+    # scrub_filter_only_catalog_title uses a keyword product-noun heuristic to drop
+    # junk titles on price/rating browses. When the AI slot-filler already emitted an
+    # explicit product noun (search_terms/product_name), that title is authoritative —
+    # "tshirts under 250" must stay title='tshirts' + price<=250, never a bare
+    # everything-under-250 browse just because "tshirts" isn't in the keyword list.
+    ai_title = ""
+    if isinstance(ai_understanding, dict):
+        ai_title = str(
+            ai_understanding.get("search_terms")
+            or ai_understanding.get("product_name")
+            or ""
+        ).strip()
+    if not ai_title:
+        try:
+            from services.opensearch_products import scrub_filter_only_catalog_title
 
-        scrub_filter_only_catalog_title(spec, comb)
-    except ImportError:
-        pass
+            scrub_filter_only_catalog_title(spec, comb)
+        except ImportError:
+            pass
 
     if isinstance(ai_understanding, dict) and ai_understanding.get("_ai_first"):
         spec["_ai_single_pass"] = True

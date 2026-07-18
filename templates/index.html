@@ -9,6 +9,8 @@
 <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&display=swap" rel="stylesheet">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+<script src="{{ url_for('static', filename='js/chat-form.js') }}" defer></script>
+<script src="{{ url_for('static', filename='js/chat-experience.js') }}" defer></script>
 <script src="{{ url_for('static', filename='js/voice-dictation.js') }}" defer></script>
 <script src="{{ url_for('static', filename='js/product-carousel.js') }}" defer></script>
 </head>
@@ -34,6 +36,10 @@ let pendingDeleteId = null;
 let chatAwaitingReply = false;
 /** Voice dictation controller (mic / speech-to-text) */
 let welfogVoice = null;
+/** Chat UX: thinking bubble, keyboard-aware scroll, message enter anim */
+let chatXp = null;
+/** Active in-chat support form; prevents duplicate cards on repeated taps. */
+let activeSupportForm = null;
 /** While purchase-history "View more" is loading — suppresses global Typing bubble if send() races */
 window.__welfogPhAppendBusy = false;
 window.__welfogWlAppendBusy = false;
@@ -121,19 +127,73 @@ function dedupePurchaseHistoryCards(html, scrollEl) {
     return frag;
 }
 
-function addMessage(text, type){
+function addMessage(text, type, opts){
+    opts = opts || {};
     const div = document.createElement("div");
     div.className = "msg " + type;
     div.innerHTML = text;
-    chat.appendChild(div);
+    if (chatXp && chatXp.appendMessage) {
+        chatXp.appendMessage(div, {
+            forceScroll: opts.forceScroll !== false && (type === "user" || type === "bot"),
+            animate: opts.instant ? false : true,
+        });
+    } else {
+        div.classList.add("wf-msg--visible");
+        chat.appendChild(div);
+        chat.scrollTop = chat.scrollHeight;
+    }
     if (typeof window.welfogInitProductCarousels === "function") {
         window.welfogInitProductCarousels(div);
     }
-    chat.scrollTop = chat.scrollHeight;
+    return div;
 }
 
-function showTyping(){
+function openSupportForm(options) {
+    options = options || {};
+    enterChatMode();
+    if (
+        activeSupportForm &&
+        activeSupportForm.root &&
+        activeSupportForm.root.isConnected &&
+        !activeSupportForm.succeeded
+    ) {
+        activeSupportForm.root.scrollIntoView({
+            behavior: window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth",
+            block: "center"
+        });
+        const firstEmpty = activeSupportForm.fields.find(function(field) {
+            const control = activeSupportForm.controls[field.name];
+            return control && !control.value.trim();
+        });
+        if (firstEmpty) activeSupportForm.controls[firstEmpty.name].focus({ preventScroll: true });
+        return activeSupportForm;
+    }
+    if (!window.WelfogChatForms || !window.WelfogChatForms.createSupportForm) {
+        addMessage("Support form is temporarily unavailable. Please try again.", "bot");
+        return null;
+    }
+    const host = addMessage("", "bot", { forceScroll: true });
+    host.classList.add("wf-form-message");
+    activeSupportForm = window.WelfogChatForms.createSupportForm(host, {
+        prefill: options.initialMessage ? { message: options.initialMessage } : {}
+    });
+    requestAnimationFrame(function() {
+        const firstEmpty = activeSupportForm.fields.find(function(field) {
+            const control = activeSupportForm.controls[field.name];
+            return control && !control.value.trim();
+        });
+        if (firstEmpty) activeSupportForm.controls[firstEmpty.name].focus({ preventScroll: true });
+        if (chatXp && chatXp.scrollToLatest) chatXp.scrollToLatest(false);
+    });
+    return activeSupportForm;
+}
+
+function showTyping(userMessage){
     if (window.__welfogPhAppendBusy || window.__welfogWlAppendBusy) return;
+    if (chatXp && chatXp.showThinking) {
+        chatXp.showThinking(userMessage || "");
+        return;
+    }
     const div = document.createElement("div");
     div.className = "typing";
     div.id = "typing";
@@ -143,6 +203,10 @@ function showTyping(){
 }
 
 function removeTyping(){
+    if (chatXp && chatXp.hideThinking) {
+        chatXp.hideThinking();
+        return;
+    }
     const t = document.getElementById("typing");
     if (t) t.remove();
 }
@@ -219,6 +283,17 @@ async function send(){
     if (!message) return;
     if (chatAwaitingReply) return;
 
+    if (
+        window.WelfogChatForms &&
+        window.WelfogChatForms.shouldOpenSupportForMessage(message)
+    ) {
+        enterChatMode();
+        addMessage(message, "user");
+        input.value = "";
+        openSupportForm({ initialMessage: message.length >= 24 ? message : "" });
+        return;
+    }
+
     chatAwaitingReply = true;
     setChatComposerLocked(true);
 
@@ -231,10 +306,11 @@ async function send(){
         addMessage(message, "user");
         input.value = "";
 
-        showTyping();
+        showTyping(message);
 
         const chatCtrl = new AbortController();
-        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 95000);
+        // Server hard-deadline is ~45s; abort slightly after so busy/fallback HTML can arrive.
+        const chatTimer = setTimeout(function() { chatCtrl.abort(); }, 55000);
         let res;
         try {
             res = await fetch(addUserIdToApiPath("/chat"), {
@@ -297,7 +373,7 @@ async function send(){
             } catch (unlockErr) { /* ignore */ }
         }
         const busyMsg = (e && e.name === "AbortError")
-            ? "<div style='color:#333;line-height:1.55;'>This is taking longer than usual — your reply may still be processing. Please wait a few seconds and send the same message again if nothing appears.</div>"
+            ? "<div style='color:#333;line-height:1.55;'>Sorry — reply thodi late ho gayi. Please apna message ek baar phir bhej do, main turant help karta hoon.</div>"
             : "<div style='color:#333;line-height:1.55;'>Sorry — we could not reach the server. Please check your connection and try again in a moment.</div>";
         addMessage(busyMsg, "bot");
     }
@@ -667,6 +743,7 @@ async function newChat() {
     chatAwaitingReply = false;
     setChatComposerLocked(false);
     chat.innerHTML = "";
+    activeSupportForm = null;
     currentChatId = null;
     setChatIdInUrl(null);
     enterLandingMode();
@@ -766,6 +843,7 @@ async function loadOldChat(id, skipUrlUpdate = false) {
     chatAwaitingReply = false;
     setChatComposerLocked(false);
     chat.innerHTML = "";
+    activeSupportForm = null;
     currentChatId = id;
     if (!skipUrlUpdate) {
         setChatIdInUrl(id);
@@ -790,9 +868,16 @@ async function loadOldChat(id, skipUrlUpdate = false) {
 
     enterChatMode();
     data.forEach(m => {
-        addMessage(m.message, m.sender === "user" ? "user" : "bot");
+        addMessage(m.message, m.sender === "user" ? "user" : "bot", {
+            instant: true,
+            forceScroll: false,
+        });
     });
-    chat.scrollTop = chat.scrollHeight;
+    if (chatXp && chatXp.scrollToLatest) {
+        chatXp.scrollToLatest(true);
+    } else {
+        chat.scrollTop = chat.scrollHeight;
+    }
     syncHistoryActive();
 }
 
@@ -851,12 +936,30 @@ window.addEventListener("resize", scheduleResizeHistorySync);
 
 window.addEventListener("DOMContentLoaded", async () => {
     initTheme();
+    if (window.WelfogChatExperience && typeof window.WelfogChatExperience.create === "function") {
+        chatXp = window.WelfogChatExperience.create({ chatEl: chat });
+    }
     if (typeof initWelfogVoiceDictation === "function") {
         welfogVoice = initWelfogVoiceDictation({
             isLocked: function () { return chatAwaitingReply; },
             transcribeUrl: function () { return addUserIdToApiPath("/api/voice/transcribe"); }
         });
     }
+    const chatInputEl = document.getElementById("chatInput");
+    if (chatInputEl) {
+        chatInputEl.addEventListener("focus", function () {
+            if (chatXp && chatXp.scrollToLatest) {
+                chatXp.scrollToLatest(true);
+            }
+        });
+    }
+    const supportButton = document.getElementById("supportChatButton");
+    if (supportButton) {
+        supportButton.addEventListener("click", function() {
+            openSupportForm();
+        });
+    }
+    window.openWelfogSupportForm = openSupportForm;
     await initDesktopHistory();
     await initializeChatFromUrl();
 });

@@ -87,11 +87,11 @@ def mysql_connect_kwargs(*, with_database: bool = True) -> dict[str, Any] | None
         return None
 
     try:
-        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT") or "10")
-        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT") or "30")
-        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT") or "30")
+        connect_timeout = float(os.getenv("MYSQL_CONNECT_TIMEOUT") or "3")
+        read_timeout = float(os.getenv("MYSQL_READ_TIMEOUT") or "15")
+        write_timeout = float(os.getenv("MYSQL_WRITE_TIMEOUT") or "15")
     except ValueError:
-        connect_timeout, read_timeout, write_timeout = 10.0, 30.0, 30.0
+        connect_timeout, read_timeout, write_timeout = 3.0, 15.0, 15.0
 
     collation = (os.getenv("MYSQL_COLLATION") or "utf8mb4_unicode_ci").strip()
 

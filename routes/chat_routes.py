@@ -85,6 +85,7 @@ from services.welfog_api import (
     repair_multi_product_joiners,
     search_multi_product_parts,
     check_pincode_delivery,
+    submit_support_contact,
     fetch_api,
     fetch_welfog_order_tracking_for_user,
     format_order_tracking_reply,
@@ -1003,6 +1004,14 @@ def _try_brain_first_chat_turn(
     One ai_brain_route LLM — semantic intent in any language/style, then dispatch.
     No keyword pre-routing; Groq/OpenAI/Gemini/DeepSeek classify meaning first.
     """
+    try:
+        from services.chat_resilience import chat_turn_abandoned
+
+        if chat_turn_abandoned():
+            log_reasoning("Brain-first skipped — turn already abandoned (deadline).")
+            return None, {"llm_unavailable": True, "_llm_failure": "deadline_abandoned"}
+    except ImportError:
+        pass
     t0 = time.perf_counter()
     log_reasoning(
         "Chat — AI brain first (one LLM intent → API/KB/catalog/chitchat)."
@@ -1890,6 +1899,19 @@ def _guard_brain_ai_classify_and_dispatch(
         f"{(brain.get('user_meaning') or '')[:80]}"
     )
 
+    # Locked wishlist / order-history MUST beat chitchat/OOD scope_reply.
+    # Brain often emits scope_reply="I will fetch…" or even the enum token
+    # purchase_history_in_chat while account_list_kind is already set.
+    acct = _try_brain_account_list_live_api_reply(
+        brain,
+        user_id=str(user_id),
+        format_purchase_history_reply=format_purchase_history_reply,
+        format_wishlist_reply=format_wishlist_reply,
+        msg_en=msg_en,
+    )
+    if acct and str(acct).strip():
+        return str(acct), brain
+
     scope = (brain.get("conversation_scope") or "").strip().lower()
     if not kb_locked and (
         intent == "out_of_domain"
@@ -1937,15 +1959,6 @@ def _guard_brain_ai_classify_and_dispatch(
         )
     if kb_misroute_ood and str(kb_misroute_ood).strip():
         return str(kb_misroute_ood), brain
-
-    acct = _try_brain_account_list_live_api_reply(
-        brain,
-        user_id=str(user_id),
-        format_purchase_history_reply=format_purchase_history_reply,
-        format_wishlist_reply=format_wishlist_reply,
-    )
-    if acct and str(acct).strip():
-        return str(acct), brain
 
     menu = _try_brain_catalog_menu_direct_reply(
         brain,
@@ -3411,7 +3424,8 @@ def _try_instant_zero_llm_reply(
         from services.conversational_ack_flow import ai_chitchat_reply
 
         if (
-            _is_instant_greeting_thanks_lane(
+            not _brain_route_first
+            and _is_instant_greeting_thanks_lane(
                 original_msg, msg_en, conv_for_llm
             )
             and not _instant_lane_blocked_by_transactional(
@@ -3647,6 +3661,54 @@ def _try_early_ai_brain_reply(
         return body, route
 
     conv = (conv_for_llm or "").strip()
+    # A clarification is explicit conversation state, not keyword routing. Inject
+    # it into the existing Brain context so short answers such as "15 Pro", "any",
+    # or "blue" stay in the shopping thread even when ordinary history loading is
+    # skipped for latency.
+    if isinstance(ctx, dict):
+        pending_product = dict(
+            (ctx.get("data") or {}).get("pending_product_clarification") or {}
+        )
+        if pending_product:
+            pending_note = (
+                "PENDING SHOPPING CLARIFICATION:\n"
+                f"Product state: {json.dumps(pending_product.get('understanding') or {}, ensure_ascii=False)[:700]}\n"
+                f"Question asked: {(pending_product.get('question') or '')[:240]}\n"
+                "Interpret the latest message as the answer/refusal to this shopping "
+                "question and keep intent=product, data_channel=catalog."
+            )
+            conv = f"{conv}\n\n{pending_note}".strip()
+        elif (ctx.get("data") or {}).get("last_os_spec"):
+            last_spec = dict((ctx.get("data") or {}).get("last_os_spec") or {})
+            memory_view = {
+                key: last_spec.get(key)
+                for key in (
+                    "title_query",
+                    "brand",
+                    "color",
+                    "size",
+                    "purchase_price_min",
+                    "purchase_price_max",
+                    "rating_min",
+                    "rating_max",
+                    "product_type",
+                    "compatibility",
+                    "material_tokens",
+                    "audience_tokens",
+                    "feature_tokens",
+                    "sort",
+                )
+                if last_spec.get(key) not in (None, "", [], {})
+            }
+            if memory_view:
+                memory_note = (
+                    "ACTIVE SHOPPING STATE:\n"
+                    f"{json.dumps(memory_view, ensure_ascii=False)[:900]}\n"
+                    "If the latest message only changes a filter, preference, quality, "
+                    "or pagination choice, keep intent=product and continue this catalog "
+                    "search. If it names a different product or support topic, switch normally."
+                )
+                conv = f"{conv}\n\n{memory_note}".strip()
     if not conv and chat_id:
         comb_early = f"{original_msg or ''} {msg_en or ''}".strip()
         load_conv = False
@@ -3745,11 +3807,178 @@ def _try_early_ai_brain_reply(
         if brain_route_data.get("llm_unavailable"):
             return _finish_early_brain(None, brain_route_data)
 
+        pending_product_turn = bool(pending_product)
+        authoritative_product_turn = bool(
+            (brain_route_data.get("intent") or "").strip().lower()
+            in ("product", "product_search")
+            and (brain_route_data.get("data_channel") or "").strip().lower()
+            == "catalog"
+            and brain_route_data.get("run_catalog_search")
+        )
+        if pending_product_turn:
+            # Explicit state-machine continuation: the previous turn asked one
+            # shopping clarification, so this turn is its answer/refusal. Preserve
+            # Brain as the single reasoning pass but lock dispatch to catalog and
+            # skip unrelated account/category rescue classifiers.
+            brain_route_data.update(
+                {
+                    "intent": "product",
+                    "data_channel": "catalog",
+                    "run_catalog_search": True,
+                    "conversation_scope": "welfog_support",
+                    "is_welfog_related": True,
+                    "needs_order_id": False,
+                    "_product_catalog_locked": True,
+                    "_pending_product_clarification": True,
+                }
+            )
+            brain_route_data["kb_keys"] = []
+            brain_route_data.pop("scope_reply", None)
+
         ctx.setdefault("data", {})["ai_route"] = brain_route_data
 
-        # KB channel locked by Brain — answer immediately (no account/order detours).
+        try:
+            from services.ai_route_semantics import reconcile_category_browse_from_brain_meaning
+
+            if not pending_product_turn and not authoritative_product_turn:
+                brain_route_data = reconcile_category_browse_from_brain_meaning(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    ctx=ctx,
+                )
+            ctx["data"]["ai_route"] = brain_route_data
+        except ImportError:
+            pass
+
+        try:
+            from services.catalog_menu_resolver import guard_reconcile_catalog_menu_route
+
+            if not pending_product_turn and not authoritative_product_turn:
+                brain_route_data = guard_reconcile_catalog_menu_route(
+                    brain_route_data,
+                    original_msg,
+                    msg_en,
+                    conv,
+                    lang,
+                )
+            ctx["data"]["ai_route"] = brain_route_data
+        except ImportError:
+            pass
+
+        # Wishlist / order history live API BEFORE KB SoT.
+        # Brain often sets channel=kb + intent=general with account_list_kind /
+        # user_meaning already pointing at purchase/wishlist — KB was answering
+        # "I will fetch…" (or leaking enum tokens) and never calling live APIs.
+        try:
+            from services.account_list_semantics import (
+                account_list_route_is_locked,
+                reconcile_account_list_from_brain_meaning,
+            )
+
+            if not pending_product_turn and not authoritative_product_turn:
+                brain_route_data = reconcile_account_list_from_brain_meaning(
+                    brain_route_data, msg_en=msg_en
+                )
+            ctx["data"]["ai_route"] = brain_route_data
+            _alk_live = (
+                False
+                if pending_product_turn or authoritative_product_turn
+                else account_list_route_is_locked(brain_route_data)
+            )
+        except ImportError:
+            _alk_live = False
+
+        acct_live = None
+        if not pending_product_turn and not authoritative_product_turn:
+            acct_live = _try_brain_account_list_live_api_reply(
+                brain_route_data,
+                user_id=user_id,
+                format_purchase_history_reply=format_purchase_history_reply,
+                format_wishlist_reply=format_wishlist_reply,
+                msg_en=msg_en,
+            )
+        if acct_live:
+            return _finish_early_brain(acct_live, brain_route_data)
+
+        # Authoritative product route: execute immediately after the only live
+        # account-list precedence check. The old ordering ran structural-order,
+        # scope, catalog-menu and language helpers first; several of those could
+        # launch fallback LLMs and exhaust the 45s deadline before OpenSearch.
+        _product_locked_now = bool(
+            (brain_route_data.get("intent") or "").strip().lower() == "product"
+            and (brain_route_data.get("data_channel") or "").strip().lower()
+            == "catalog"
+            and brain_route_data.get("run_catalog_search")
+        )
+        if _product_locked_now:
+            try:
+                from services.product_turn_sot import try_run_locked_product_catalog
+
+                product_body, product_route = try_run_locked_product_catalog(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    reset_context_fn=reset_context,
+                    allow_rescue_llm=False,
+                )
+                if product_body:
+                    log_reasoning(
+                        "Brain early — authoritative product dispatched immediately; "
+                        "skip order/scope/menu helper graph."
+                    )
+                    return _finish_early_brain(
+                        product_body, product_route or brain_route_data
+                    )
+            except ImportError:
+                pass
+
+        # Chitchat / OOD / harm — answer immediately after Brain (and account-list).
+        # Never fall into KB SoT / product rescue / order stacks for banter.
+        _scope_now = (brain_route_data.get("conversation_scope") or "").strip().lower()
+        _intent_now = (brain_route_data.get("intent") or "").strip().lower()
+        if (
+            brain_route_data.get("is_welfog_related") is False
+            or _intent_now == "out_of_domain"
+            or _scope_now in ("general_chitchat", "out_of_domain", "harm_sensitive")
+        ) and (brain_route_data.get("data_channel") or "").strip().lower() not in (
+            "live_api",
+            "catalog",
+            "kb",
+        ):
+            try:
+                from services.conversational_ack_flow import try_immediate_brain_scope_reply
+
+                scope_body = try_immediate_brain_scope_reply(
+                    brain_route_data,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conversation_context=conv,
+                    reply_lang=lang,
+                    ctx=ctx,
+                )
+                if scope_body:
+                    log_reasoning(
+                        "Brain early — conversational scope reply "
+                        f"(scope={_scope_now or _intent_now}; skip KB/product)."
+                    )
+                    return _finish_early_brain(scope_body, brain_route_data)
+            except ImportError:
+                pass
+
+        # KB channel locked by Brain — answer immediately (skip when account-list owns turn).
         _ch_after_brain = (brain_route_data.get("data_channel") or "").strip().lower()
-        if _ch_after_brain == "kb" and not brain_route_data.get("needs_order_id"):
+        if (
+            _ch_after_brain == "kb"
+            and not brain_route_data.get("needs_order_id")
+            and not _alk_live
+            and (brain_route_data.get("intent") or "").strip().lower()
+            not in ("order_history", "wishlist")
+        ):
             try:
                 from services.kb_turn_sot import try_run_locked_kb_reply
 
@@ -3785,15 +4014,6 @@ def _try_early_ai_brain_reply(
                         return _finish_early_brain(gap, kb_route)
             except Exception as kb_exc:
                 log_reasoning(f"Brain early — KB immediate SoT failed: {kb_exc}")
-
-        acct_live = _try_brain_account_list_live_api_reply(
-            brain_route_data,
-            user_id=user_id,
-            format_purchase_history_reply=format_purchase_history_reply,
-            format_wishlist_reply=format_wishlist_reply,
-        )
-        if acct_live:
-            return _finish_early_brain(acct_live, brain_route_data)
 
         order_struct_body, order_struct_route = _try_instant_order_id_structural_reply(
             original_msg,
@@ -4280,9 +4500,12 @@ def _try_early_ai_brain_reply(
                 or (brain_route_data.get("intent") or "").strip().lower() == "wishlist"
             ):
                 alk = (brain_route_data.get("account_list_kind") or "").strip().lower()
+                # Trust account_list_kind over conflicting intent (prevents wishlist↔orders swap).
                 if alk == "wishlist_in_chat" or (
-                    brain_route_data.get("intent") or ""
-                ).strip().lower() == "wishlist":
+                    alk in ("", "none")
+                    and (brain_route_data.get("intent") or "").strip().lower()
+                    == "wishlist"
+                ):
                     wl_body = format_wishlist_reply(
                         user_id, page=1, append_only=False
                     )
@@ -4306,8 +4529,12 @@ def _try_early_ai_brain_reply(
             if account_list_route_is_locked(brain_route_data):
                 alk = (brain_route_data.get("account_list_kind") or "").strip().lower()
                 if alk == "purchase_history_in_chat" or (
-                    brain_route_data.get("intent") or ""
-                ).strip().lower() == "order_history":
+                    alk in ("", "none")
+                    and (brain_route_data.get("intent") or "")
+                    .strip()
+                    .lower()
+                    == "order_history"
+                ):
                     ph_body = format_purchase_history_reply(
                         user_id, page=1, append_only=False
                     )
@@ -4412,34 +4639,25 @@ def _try_early_ai_brain_reply(
                 if _prod_cat and not _info_kb:
                     try:
                         from services.brain_direct_dispatch import (
-                            try_category_browse_catalog_reply,
-                        )
-                        from services.welfog_api import (
-                            message_requests_category_browse,
+                            _try_brain_category_browse_direct_reply,
                         )
 
-                        if message_requests_category_browse(
-                            original_msg
-                        ) and not (
-                            brain_route_data.get("category_only_browse")
-                            or (brain_route_data.get("category_browse") or "").strip()
-                        ):
-                            cat_browse_body = try_category_browse_catalog_reply(
-                                original_msg,
-                                msg_en,
-                                user_id=user_id,
-                                lang=lang,
-                                ctx=ctx,
-                                reset_context_fn=reset_context,
+                        cat_browse_body = _try_brain_category_browse_direct_reply(
+                            brain_route_data,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                            user_id=user_id,
+                            lang=lang,
+                            ctx=ctx,
+                            reset_context_fn=reset_context,
+                        )
+                        if cat_browse_body:
+                            log_reasoning(
+                                "Brain early — AI category browse (category_id catalog)."
                             )
-                            if cat_browse_body:
-                                log_reasoning(
-                                    "Brain early — catalog-map category browse "
-                                    "(overrides product title search)."
-                                )
-                                return _finish_early_brain(
-                                    cat_browse_body, brain_route_data
-                                )
+                            return _finish_early_brain(
+                                cat_browse_body, brain_route_data
+                            )
                     except ImportError:
                         pass
                     product_route, sq = _prepare_brain_product_route(
@@ -4539,34 +4757,25 @@ def _try_early_ai_brain_reply(
                 ) or brain_route_indicates_product_catalog(brain_route_data):
                     try:
                         from services.brain_direct_dispatch import (
-                            try_category_browse_catalog_reply,
-                        )
-                        from services.welfog_api import (
-                            message_requests_category_browse,
+                            _try_brain_category_browse_direct_reply,
                         )
 
-                        if message_requests_category_browse(
-                            original_msg
-                        ) and not (
-                            brain_route_data.get("category_only_browse")
-                            or (brain_route_data.get("category_browse") or "").strip()
-                        ):
-                            cat_browse_body = try_category_browse_catalog_reply(
-                                original_msg,
-                                msg_en,
-                                user_id=user_id,
-                                lang=lang,
-                                ctx=ctx,
-                                reset_context_fn=reset_context,
+                        cat_browse_body = _try_brain_category_browse_direct_reply(
+                            brain_route_data,
+                            original_msg=original_msg,
+                            msg_en=msg_en,
+                            user_id=user_id,
+                            lang=lang,
+                            ctx=ctx,
+                            reset_context_fn=reset_context,
+                        )
+                        if cat_browse_body:
+                            log_reasoning(
+                                "Brain early — AI category browse (category_id catalog)."
                             )
-                            if cat_browse_body:
-                                log_reasoning(
-                                    "Brain early — catalog-map category browse "
-                                    "(overrides product title search)."
-                                )
-                                return _finish_early_brain(
-                                    cat_browse_body, brain_route_data
-                                )
+                            return _finish_early_brain(
+                                cat_browse_body, brain_route_data
+                            )
                     except ImportError:
                         pass
                     product_route, sq = _prepare_brain_product_route(
@@ -5079,6 +5288,25 @@ def unlock_stuck_chat():
     except ImportError:
         pass
     return jsonify({"ok": True, "chat_id": chat_id or None})
+
+
+@chat_bp.route("/api/support/contact", methods=["POST"])
+def submit_support_request():
+    """Same-origin proxy to the live contact API (avoids browser CORS)."""
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name") or "").strip()
+    email = str(data.get("email") or "").strip()
+    phone = str(data.get("phone") or "").strip()
+    message = str(data.get("message") or "").strip()
+
+    if not name or not email or not message:
+        return jsonify({"success": False, "message": "Name, email and message are required."}), 400
+    if not re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]{2,}$", email):
+        return jsonify({"success": False, "message": "Please enter a valid email address."}), 400
+
+    status_code, payload = submit_support_contact(name, email, phone, message)
+    return jsonify(payload), status_code
+
 
 @chat_bp.route("/api/chats", methods=["GET"])
 def get_history():
@@ -5885,6 +6113,7 @@ def chat():
         ctx.setdefault("data", {})["extracted_order_id"] = glued_oid
         log_reasoning(f"Alphanumeric guard — attached order id {glued_oid} for routing.")
 
+    _chat_core_t0 = time.perf_counter()
     chat_request_id = "-"
     try:
         from services.chat_flow_telemetry import ensure_chat_turn_started, record_user_query
@@ -6005,19 +6234,24 @@ def chat():
     # Short social turns — one fast scope+reply LLM. Must run BEFORE conversation
     # snapshot load (MySQL hang was dominating chitchat latency).
     comb_scope = f"{original_msg or ''} {msg_en or ''}".strip()
-    _skip_early_scope = False
-    try:
-        from utils.helpers import (
-            _message_looks_like_shopping_query,
-            _text_has_product_shopping_intent_core,
-        )
+    # In strict AI-first mode the universal Brain handles product, chitchat and
+    # OOD in one call. Do not execute the legacy pre-scope intent graph first:
+    # its product/support checks can traverse KB/MySQL and spend 8–45s before
+    # Brain starts.
+    _skip_early_scope = bool(_brain_route_first)
+    if not _brain_route_first:
+        try:
+            from utils.helpers import (
+                _message_looks_like_shopping_query,
+                _text_has_product_shopping_intent_core,
+            )
 
-        if _message_looks_like_shopping_query(comb_scope) or (
-            _text_has_product_shopping_intent_core(comb_scope)
-        ):
-            _skip_early_scope = True
-    except ImportError:
-        pass
+            if _message_looks_like_shopping_query(comb_scope) or (
+                _text_has_product_shopping_intent_core(comb_scope)
+            ):
+                _skip_early_scope = True
+        except ImportError:
+            pass
     if (
         not _skip_early_scope
         and comb_scope
@@ -6077,17 +6311,26 @@ def chat():
     comb_standalone = f"{original_msg or ''} {msg_en or ''}".strip()
     ctx_sess_body = None
     ctx_sess_route = ""
-    skip_sess_cont = bool(
-        _brain_route_first
-        and _message_is_complete_standalone_question(comb_standalone)
-        and not (
-            isinstance(ctx, dict)
-            and ctx.get("awaiting") in ("order_id", "pincode")
-        )
+    pending_session = (
+        (ctx.get("awaiting") or "").strip().lower()
+        if isinstance(ctx, dict)
+        else ""
     )
+    if _brain_route_first and pending_session not in ("order_id", "pincode"):
+        # No active continuation exists, so there is nothing to inspect. The
+        # legacy standalone-question graph can traverse support/KB/MySQL and
+        # added ~10s to every fresh product turn.
+        skip_sess_cont = True
+    else:
+        skip_sess_cont = bool(
+            _brain_route_first
+            and _message_is_complete_standalone_question(comb_standalone)
+            and pending_session not in ("order_id", "pincode")
+        )
     if skip_sess_cont:
         log_reasoning(
-            "Brain-first standalone — skip order-session continuation (no MySQL)."
+            "Brain-first standalone — skip order-session continuation (no MySQL); "
+            f"pre_brain_elapsed={(time.perf_counter() - _chat_core_t0):.3f}s."
         )
     else:
         ctx_sess_body, ctx_sess_route = _try_ctx_continuation_reply(
@@ -6137,9 +6380,14 @@ def chat():
     brain_uni_route = None
     _t_brain_universal = time.perf_counter()
 
-    conv_for_llm = conv_for_llm or _conversation_context_for_routing(
-        current_chat_id, original_msg, msg_en, ctx
-    )
+    # A complete standalone turn does not need chat history. Loading MySQL here
+    # contradicted the "skip order-session continuation" decision above and could
+    # consume the entire 45s deadline before Brain/product routing even started.
+    # Ambiguous/follow-up turns still load recent context for semantic resolution.
+    if not conv_for_llm and not skip_sess_cont:
+        conv_for_llm = _conversation_context_for_routing(
+            current_chat_id, original_msg, msg_en, ctx
+        )
 
     if _brain_route_first and isinstance(ctx, dict):
         data = ctx.get("data")
@@ -6153,63 +6401,34 @@ def chat():
     # Skip micro-LLM preflight classifiers; route once via universal brain below.
     # === AI BRAIN FIRST (one LLM — intent in any language, then dispatch) ===
     if _brain_route_first:
-        # Named department products first, then full categories menu — never confuse the two.
+        # Named department products and categories list are classified by Brain /
+        # catalog-menu LLM — no pre-brain keyword fast paths.
         try:
-            from services.brain_direct_dispatch import try_category_browse_catalog_reply
+            from services.ai_first_router import _try_zero_llm_universal_brain_route
+            from services.brain_direct_dispatch import try_brain_direct_dispatch
 
-            cat_browse_fast = try_category_browse_catalog_reply(
-                original_msg,
-                msg_en,
-                user_id=user_id,
-                lang=lang,
-                ctx=ctx,
-                reset_context_fn=reset_context,
+            zero_route = _try_zero_llm_universal_brain_route(
+                original_msg, msg_en, ctx=ctx
             )
-            if cat_browse_fast:
-                log_reasoning(
-                    "Brain-first — named category product browse (skip Brain for dept ask)."
+            if isinstance(zero_route, dict):
+                ctx.setdefault("data", {})["ai_route"] = zero_route
+                zero_body = try_brain_direct_dispatch(
+                    zero_route,
+                    original_msg=original_msg,
+                    msg_en=msg_en,
+                    conv_for_llm=conv_for_llm,
+                    user_id=user_id,
+                    lang=lang,
+                    ctx=ctx,
+                    format_purchase_history_reply=format_purchase_history_reply,
+                    format_wishlist_reply=format_wishlist_reply,
+                    reset_context_fn=reset_context,
+                    reply_for_live_order_id_lookup=_reply_for_live_order_id_lookup,
                 )
-                return _fast_path_json_reply(
-                    cat_browse_fast,
-                    ai_route_snapshot={
-                        "intent": "product",
-                        "data_channel": "catalog",
-                        "route_handler": "category_browse_structural_fast",
-                        "category_only_browse": True,
-                    },
-                )
-        except ImportError:
-            pass
-
-        # Clear category-list asks → live categories API (no Brain/KB inventing names).
-        try:
-            from utils.helpers import (
-                message_asks_welfog_categories_list,
-                _text_requests_category_product_browse,
-            )
-            from services.catalog_menu_replies import build_categories_list_reply_html
-
-            comb_cat = f"{original_msg or ''} {msg_en or ''}".strip()
-            if (
-                comb_cat
-                and message_asks_welfog_categories_list(comb_cat)
-                and not _text_requests_category_product_browse(comb_cat)
-            ):
-                cat_fast = build_categories_list_reply_html(
-                    ctx, original_msg, reply_lang=lang
-                )
-                if cat_fast:
-                    log_reasoning(
-                        "Brain-first — categories list API (skip Brain/KB for menu ask)."
-                    )
+                if zero_body:
+                    log_reasoning("Universal brain — zero-LLM dispatch before brain route.")
                     return _fast_path_json_reply(
-                        cat_fast,
-                        ai_route_snapshot={
-                            "intent": "categories",
-                            "data_channel": "live_api",
-                            "route_handler": "categories_api",
-                            "_catalog_menu_locked": True,
-                        },
+                        zero_body, ai_route_snapshot=zero_route
                     )
         except ImportError:
             pass
@@ -6259,33 +6478,6 @@ def chat():
                         return _fast_path_json_reply(
                             oh_body, ai_route_snapshot=acct_route
                         )
-        except ImportError:
-            pass
-
-        try:
-            from services.brain_direct_dispatch import try_category_browse_catalog_reply
-
-            # Named department products BEFORE "All Categories" menu — the word
-            # "category" in "Home & Kitchen category ke items" is browse, not menu.
-            cat_pre_brain = try_category_browse_catalog_reply(
-                original_msg,
-                msg_en,
-                user_id=user_id,
-                lang=lang,
-                ctx=ctx,
-                reset_context_fn=reset_context,
-            )
-            if cat_pre_brain:
-                log_reasoning("Structural lane — catalog-map category browse.")
-                return _fast_path_json_reply(
-                    cat_pre_brain,
-                    ai_route_snapshot={
-                        "intent": "product",
-                        "data_channel": "catalog",
-                        "route_handler": "category_browse_structural_fast",
-                        "category_only_browse": True,
-                    },
-                )
         except ImportError:
             pass
 
@@ -7474,40 +7666,6 @@ def chat():
                     "intent": "product",
                     "data_channel": "catalog",
                     "route_handler": "sku_structural_fast",
-                },
-            )
-    except ImportError:
-        pass
-
-    # === ZERO-LLM CATEGORY BROWSE (Beauty/Electronics/any dept — before brain) ===
-    _t_cat_fast = time.perf_counter()
-    try:
-        from services.brain_direct_dispatch import try_category_browse_catalog_reply
-
-        cat_body = try_category_browse_catalog_reply(
-            original_msg,
-            msg_en,
-            user_id=user_id,
-            lang=lang,
-            ctx=ctx,
-            reset_context_fn=reset_context,
-        )
-        if cat_body:
-            try:
-                from services.chat_flow_telemetry import record_phase
-
-                record_phase(
-                    "category_browse_structural",
-                    (time.perf_counter() - _t_cat_fast) * 1000.0,
-                )
-            except ImportError:
-                pass
-            return _fast_path_json_reply(
-                cat_body,
-                ai_route_snapshot={
-                    "intent": "product",
-                    "data_channel": "catalog",
-                    "route_handler": "category_browse_structural_fast",
                 },
             )
     except ImportError:

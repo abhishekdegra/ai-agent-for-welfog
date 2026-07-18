@@ -1932,21 +1932,15 @@ def _try_account_list_fast_path(
         return None
 
     try:
-        from utils.helpers import _text_is_welfog_payment_info_question
-
-        if _text_is_welfog_payment_info_question(combined):
-            return None
-    except ImportError:
-        pass
-
-    try:
         import re
 
-        from services.semantic_intent import should_skip_order_history_list_for_turn
-
-        if re.search(r"\b\d{4,20}\b", combined) or should_skip_order_history_list_for_turn(
-            original_msg, msg_en, ""
-        ):
+        # Account-list fast path must remain dependency-free. The former
+        # should_skip_order_history_list_for_turn() call traversed order/refund →
+        # support/social KB → MySQL schema lookup for every ordinary product
+        # query, blocking up to the full chat deadline before Brain/OpenSearch.
+        # Numeric turns are already excluded structurally; non-numeric intent is
+        # resolved by the account-list meaning checks below or universal Brain.
+        if re.search(r"\b\d{4,20}\b", combined):
             return None
     except ImportError:
         pass
@@ -3183,15 +3177,21 @@ def _try_zero_llm_universal_brain_route(
     Obvious wishlist / deals / categories / product browse — skip ai_brain_route (~12s).
     Uses msg_en (auto-translated) so Tamil/Hindi/Hinglish reach OpenSearch without routing LLM.
     """
-    api_fast = _try_account_list_fast_path(original_msg, msg_en)
-    if api_fast:
-        _, route_data = api_fast
-        route_data = dict(route_data)
-        route_data["_universal_brain_route"] = True
-        route_data["_turn_promotions_done"] = True
-        route_data["_zero_llm_fast"] = True
-        log_reasoning("Universal brain — zero-LLM wishlist/order-list fast path.")
-        return route_data
+    import re
+
+    comb = f"{original_msg or ''} {msg_en or ''}".strip()
+    if not comb:
+        return None
+
+    # Natural-language meaning belongs to the universal AI Brain. The previous
+    # "zero-LLM" product/account probes traversed a recursive helper graph
+    # (wishlist → order → support/social KB → MySQL), so an ordinary product ask
+    # could block 45s before intent routing even began. Keep this lane only for
+    # truly structural numeric submissions (Order ID / PIN / product ID); all
+    # free-form languages/styles get one bounded Brain call.
+    has_digits = bool(re.search(r"\b\d{4,20}\b", comb))
+    if not has_digits:
+        return None
 
     try:
         from services.ai_route_semantics import (
@@ -3310,8 +3310,7 @@ def _try_zero_llm_universal_brain_route(
     try:
         from services.semantic_intent import zero_llm_intent_guess_allowed
 
-        if not zero_llm_intent_guess_allowed():
-            return None
+        allow_guess = zero_llm_intent_guess_allowed()
         from services.conversation_followup import is_deals_request_message
         from services.location_delivery_resolver import turn_requests_delivery_serviceability
         from utils.helpers import (
@@ -3323,6 +3322,11 @@ def _try_zero_llm_universal_brain_route(
             turn_is_obvious_product_shopping_turn,
         )
         comb = f"{original_msg or ''} {msg_en or ''}".strip()
+        obvious_product = bool(
+            comb and turn_is_obvious_product_shopping_turn(original_msg, msg_en, "")
+        )
+        if not allow_guess and not obvious_product:
+            return None
         if comb and (
             is_deals_request_message(original_msg, msg_en)
             or message_asks_welfog_categories_list(comb)
@@ -3333,10 +3337,27 @@ def _try_zero_llm_universal_brain_route(
         ):
             pass
         elif comb and (
-            _message_looks_like_shopping_query(comb)
-            or _text_is_phone_product_accessory_context(comb)
-            or turn_is_obvious_product_shopping_turn(original_msg, msg_en, "")
+            obvious_product
+            or (
+                allow_guess
+                and (
+                    _message_looks_like_shopping_query(comb)
+                    or _text_is_phone_product_accessory_context(comb)
+                )
+            )
         ):
+            try:
+                import re
+                from services.welfog_api import resolve_nav_category_id_fast
+
+                # Keep department/category browse turns on Brain path; zero-LLM
+                # lock is only for direct product searches.
+                if resolve_nav_category_id_fast(comb) and re.search(
+                    r"\b(categor\w*|catagor\w*|department|section)\b", comb.lower()
+                ):
+                    return None
+            except ImportError:
+                pass
             try:
                 from services.pincode_delivery_fast_path import (
                     turn_is_pincode_delivery_fast_path,
@@ -3369,6 +3390,21 @@ def _try_zero_llm_universal_brain_route(
                 comb
             ):
                 return None
+            sq_fast = ""
+            needs_product_nlu_llm = True
+            try:
+                from utils.helpers import extract_product_search_query
+                from services.welfog_api import _message_has_structured_product_attrs
+
+                sq_fast = (extract_product_search_query(original_msg, msg_en, "") or "").strip()
+                # Short obvious product asks can skip product-entity LLM and go
+                # straight to OpenSearch title_query.
+                tok_count = len(re.findall(r"[a-z0-9]+", sq_fast.lower()))
+                if sq_fast and tok_count <= 4 and not _message_has_structured_product_attrs(comb):
+                    needs_product_nlu_llm = False
+            except ImportError:
+                pass
+
             product_route: dict = {
                 "intent": "product",
                 "data_channel": "catalog",
@@ -3377,8 +3413,9 @@ def _try_zero_llm_universal_brain_route(
                 "_universal_brain_route": True,
                 "_turn_promotions_done": True,
                 "_zero_llm_fast": True,
-                "_needs_product_nlu_llm": True,
+                "_needs_product_nlu_llm": needs_product_nlu_llm,
                 "_ai_single_pass": True,
+                "search_query": sq_fast if not needs_product_nlu_llm else "",
             }
             log_reasoning(
                 "Universal brain — zero-LLM product lock "
@@ -3594,12 +3631,17 @@ def _brain_route_needs_product_rescue(out: dict) -> bool:
     except ImportError:
         pass
     try:
-        from services.chat_flow_telemetry import brain_route_authoritative_kb_lock
+        from services.chat_flow_telemetry import (
+            brain_route_authoritative_kb_lock,
+            is_authoritative_kb_route_locked,
+        )
 
-        if brain_route_authoritative_kb_lock(out):
+        if brain_route_authoritative_kb_lock(out) or is_authoritative_kb_route_locked():
             return False
     except ImportError:
         pass
+    if out.get("_kb_route_locked") and (out.get("data_channel") or "").strip().lower() == "kb":
+        return False
     # Pure greeting/assistant meta — leave to chitchat (rescue skip handles hard blocks).
     if meta in ("assistant_intro",) and channel != "kb":
         return False
@@ -3619,8 +3661,32 @@ def _brain_route_needs_product_rescue(out: dict) -> bool:
                 return False
         except ImportError:
             return False
-    if intent in ("out_of_domain",) or scope in ("out_of_domain", "harm_sensitive"):
-        return True
+    # Pure OOD / personal banter (love-you jokes, weather, etc.) — Brain already
+    # said not Welfog. Only run product rescue when Brain left HARD shopping signals
+    # (search_query / product entities / catalog lock). Do NOT use
+    # brain_route_indicates_product_catalog — that matches the word "shopping" inside
+    # banter meanings and was forcing a 40–90s Product-catalog LLM + busy timeout.
+    if (
+        out.get("is_welfog_related") is False
+        or intent in ("out_of_domain",)
+        or scope in ("out_of_domain", "harm_sensitive")
+    ):
+        try:
+            from services.ai_route_semantics import _brain_route_has_shopping_entities
+
+            has_shop = bool(
+                _brain_route_has_shopping_entities(out)
+                or (out.get("search_query") or "").strip()
+                or out.get("run_catalog_search")
+                or out.get("_product_catalog_locked")
+            )
+        except ImportError:
+            has_shop = bool(
+                (out.get("search_query") or "").strip()
+                or out.get("run_catalog_search")
+                or out.get("_product_catalog_locked")
+            )
+        return has_shop
     # KB channel alone is authoritative — rescue only when Brain left shopping signals.
     if channel == "kb":
         try:
@@ -3733,6 +3799,14 @@ def _try_brain_misroute_product_rescue_via_ai(
         return out
     if out.get("_product_rescue_attempted"):
         return None
+    try:
+        from services.chat_flow_telemetry import should_skip_micro_classifier_llm
+
+        if should_skip_micro_classifier_llm():
+            log_reasoning("Product rescue skipped — turn deadline/budget exhausted.")
+            return None
+    except ImportError:
+        pass
     # Mark early so KB + reconcile paths don't re-fire the product LLM this turn.
     out["_product_rescue_attempted"] = True
     if _turn_should_skip_product_rescue(
@@ -3978,6 +4052,18 @@ def _fast_finalize_promote_catalog_menu(
                 promoted["_universal_brain_route"] = True
                 return promoted
 
+        # The universal Brain is the single semantic classifier. Once it selected
+        # product+catalog, do not run a second catalog-menu LLM that can add
+        # 10–40s and turn a named item ("baniyan") into a broad department.
+        # Category/deals decisions were already handled explicitly above; named
+        # category product browsing remains a normal catalog product flow.
+        channel = (out.get("data_channel") or "").strip().lower()
+        if intent in ("product", "product_search") and channel == "catalog":
+            log_reasoning(
+                "Catalog-menu rescue skipped — Brain already locked product catalog."
+            )
+            return None
+
         needs_force = (
             _suspicious_product_search_for_menu(out)
             or _user_meaning_suggests_catalog_menu(out)
@@ -3988,12 +4074,24 @@ def _fast_finalize_promote_catalog_menu(
         if not needs_force:
             scope = (out.get("conversation_scope") or "").strip().lower()
             channel = (out.get("data_channel") or "").strip().lower()
+            intent = (out.get("intent") or "").strip().lower()
+            # Never force an extra catalog-menu LLM on authoritative KB / company FAQ
+            # turns — that was burning 10–40s on "welfog krta kya h" after Brain
+            # already locked channel=kb.
+            if channel == "kb" or out.get("_kb_route_locked"):
+                return None
+            try:
+                from services.chat_flow_telemetry import is_authoritative_kb_route_locked
+
+                if is_authoritative_kb_route_locked():
+                    return None
+            except ImportError:
+                pass
             if (
                 intent in ("general", "out_of_domain", "product")
                 and out.get("is_welfog_related", True) is not False
                 and (
                     scope in ("general_chitchat",)
-                    or channel == "kb"
                     or bool((out.get("scope_reply") or "").strip())
                 )
             ):
@@ -4057,14 +4155,19 @@ def _fast_finalize_promote_product_catalog(
     ):
         return None
 
-    rescued = _try_brain_misroute_product_rescue_via_ai(
-        out,
-        original_msg,
-        msg_en,
-        conversation_context=conversation_context,
-    )
-    if isinstance(rescued, dict):
-        return rescued
+    # Fast finalize must not start a second Product-catalog LLM on conversational
+    # turns (was the 45–90s busy timeout). Only structural reconcile when False.
+    if allow_product_llm:
+        rescued = _try_brain_misroute_product_rescue_via_ai(
+            out,
+            original_msg,
+            msg_en,
+            conversation_context=conversation_context,
+        )
+        if isinstance(rescued, dict):
+            return rescued
+    elif not _brain_route_needs_product_rescue(out):
+        return None
 
     try:
         from services.ai_route_semantics import (
@@ -4134,6 +4237,48 @@ def _try_fast_finalize_brain_route_after_ai(
     Industry path: one routing LLM → lock handler fields → dispatch (2–4s target).
     """
     out = dict(route_data or {})
+
+    # Account-list (wishlist / purchase history) MUST reconcile before any KB
+    # hard-stop. Brain often emits intent=general + channel=kb with
+    # account_list_kind / user_meaning already set — KB finalize was answering
+    # "I will fetch…" and never calling the live APIs.
+    try:
+        from services.account_list_semantics import (
+            account_list_route_is_locked,
+            reconcile_account_list_from_brain_meaning,
+        )
+
+        out = reconcile_account_list_from_brain_meaning(out, msg_en=msg_en)
+        if account_list_route_is_locked(out):
+            alk = (out.get("account_list_kind") or "").strip().lower()
+            if alk in ("wishlist_in_chat", "purchase_history_in_chat"):
+                out["_turn_promotions_done"] = True
+                out["_universal_brain_route"] = True
+                out.pop("_kb_route_locked", None)
+                try:
+                    from services.chat_flow_telemetry import (
+                        clear_authoritative_kb_route_lock,
+                    )
+
+                    clear_authoritative_kb_route_lock(reason="account_list_live_api")
+                except ImportError:
+                    pass
+                log_reasoning(
+                    "Universal brain — account-list live API fast finalize "
+                    f"(alk={alk}; skip KB hard-stop)."
+                )
+                return out
+            if alk in ("wishlist_howto", "purchase_history_howto"):
+                out["_turn_promotions_done"] = True
+                out["_universal_brain_route"] = True
+                log_reasoning(
+                    "Universal brain — account-list howto KB fast finalize "
+                    f"(alk={alk})."
+                )
+                return out
+    except ImportError:
+        pass
+
     intent = (out.get("intent") or "").strip().lower()
     channel = (out.get("data_channel") or "").strip().lower()
     scope = (out.get("conversation_scope") or "").strip().lower()
@@ -4141,10 +4286,110 @@ def _try_fast_finalize_brain_route_after_ai(
     meta = (out.get("meta_kind") or "none").strip().lower()
     kb_keys = [str(k).strip() for k in (out.get("kb_keys") or []) if str(k).strip()]
 
+    # Conversational lock FIRST — before catalog-menu / product-rescue / KB probes.
+    # Brain already classified chitchat/OOD/harm; a second Product-catalog LLM was
+    # burning 40–90s on banter that mentioned "shopping" and hitting busy timeout.
+    _conv_locked = (
+        out.get("is_welfog_related") is False
+        or intent == "out_of_domain"
+        or scope in ("general_chitchat", "out_of_domain", "harm_sensitive")
+        or meta in ("conversational", "assistant_intro")
+    )
+    if _conv_locked and channel not in ("live_api", "catalog") and not out.get(
+        "run_catalog_search"
+    ):
+        # Hard catalog evidence only — meaning blobs that merely say "shopping"
+        # in banter must NOT block conversational finalize.
+        _has_shop_signal = False
+        try:
+            from services.ai_route_semantics import _brain_route_has_shopping_entities
+
+            _has_shop_signal = bool(
+                _brain_route_has_shopping_entities(out)
+                or (out.get("search_query") or "").strip()
+                or out.get("_product_catalog_locked")
+            )
+        except ImportError:
+            _has_shop_signal = bool(
+                (out.get("search_query") or "").strip()
+                or out.get("_product_catalog_locked")
+            )
+        if not _has_shop_signal:
+            out["_turn_promotions_done"] = True
+            out["_universal_brain_route"] = True
+            out["run_catalog_search"] = False
+            out["data_channel"] = "none"
+            out.pop("_product_catalog_locked", None)
+            out.pop("search_query", None)
+            if (
+                scope in ("out_of_domain", "harm_sensitive")
+                or out.get("is_welfog_related") is False
+                or intent == "out_of_domain"
+            ):
+                out["intent"] = "out_of_domain"
+                out["conversation_scope"] = (
+                    "harm_sensitive" if scope == "harm_sensitive" else "out_of_domain"
+                )
+                out["is_welfog_related"] = False
+            else:
+                out["intent"] = "general"
+                out["conversation_scope"] = "general_chitchat"
+                out["is_welfog_related"] = True
+            log_reasoning(
+                "Universal brain — conversational fast finalize "
+                f"(scope={out.get('conversation_scope')}; skip product/KB/catalog)."
+            )
+            return out
+
+    # Hard stop: TLS already locked KB this turn (set when brain JSON stored).
+    # Must run before catalog-menu / product-rescue probes — those were hanging
+    # company FAQ turns for 30–180s after Brain already chose KB.
+    # Never steal locked wishlist / order-history live API turns.
+    try:
+        from services.account_list_semantics import account_list_route_is_locked
+        from services.chat_flow_telemetry import is_authoritative_kb_route_locked
+
+        _alk_locked = account_list_route_is_locked(out)
+        if (
+            is_authoritative_kb_route_locked()
+            and not _alk_locked
+            and intent
+            not in (
+                "order",
+                "order_history",
+                "wishlist",
+                "product",
+                "pincode_check",
+                "deals",
+                "categories",
+            )
+        ):
+            out["data_channel"] = "kb"
+            out["run_catalog_search"] = False
+            out["needs_order_id"] = False
+            out["conversation_scope"] = "welfog_support"
+            out["is_welfog_related"] = True
+            out["scope_reply"] = ""
+            out["meta_kind"] = "none"
+            out["_turn_promotions_done"] = True
+            out["_universal_brain_route"] = True
+            out["_kb_route_locked"] = True
+            out.pop("_product_catalog_locked", None)
+            out.pop("search_query", None)
+            log_reasoning(
+                "Universal brain — KB channel lock → extractive fast finalize."
+            )
+            return out
+    except ImportError:
+        pass
+
     # Production hot path: Brain already locked channel=kb → finalize immediately.
     # Zero imports / probes — avoid lockups under concurrent /chat threads.
     if (
-        channel == "kb"
+        (
+            channel == "kb"
+            or out.get("_kb_route_locked")
+        )
         and not out.get("needs_order_id")
         and out.get("is_welfog_related", True) is not False
         and intent
@@ -4158,24 +4403,36 @@ def _try_fast_finalize_brain_route_after_ai(
             "categories",
         )
     ):
-        out["data_channel"] = "kb"
-        out["run_catalog_search"] = False
-        out["needs_order_id"] = False
-        out["conversation_scope"] = "welfog_support"
-        out["is_welfog_related"] = True
-        out["scope_reply"] = ""
-        out["meta_kind"] = "none"
-        out["_turn_promotions_done"] = True
-        out["_universal_brain_route"] = True
-        out["_kb_route_locked"] = True
-        out.pop("_product_catalog_locked", None)
-        out.pop("search_query", None)
-        if intent not in ("seller", "refund", "payment"):
-            out["intent"] = intent or "general"
-        log_reasoning(
-            "Universal brain — KB channel lock → extractive fast finalize."
-        )
-        return out
+        try:
+            from services.account_list_semantics import account_list_route_is_locked
+            from services.chat_flow_telemetry import is_authoritative_kb_route_locked
+
+            if account_list_route_is_locked(out):
+                _kb_locked = False
+            else:
+                # If TLS already locked KB this turn, always trust it.
+                _kb_locked = is_authoritative_kb_route_locked() or channel == "kb"
+        except ImportError:
+            _kb_locked = channel == "kb"
+        if _kb_locked:
+            out["data_channel"] = "kb"
+            out["run_catalog_search"] = False
+            out["needs_order_id"] = False
+            out["conversation_scope"] = "welfog_support"
+            out["is_welfog_related"] = True
+            out["scope_reply"] = ""
+            out["meta_kind"] = "none"
+            out["_turn_promotions_done"] = True
+            out["_universal_brain_route"] = True
+            out["_kb_route_locked"] = True
+            out.pop("_product_catalog_locked", None)
+            out.pop("search_query", None)
+            if intent not in ("seller", "refund", "payment"):
+                out["intent"] = intent or "general"
+            log_reasoning(
+                "Universal brain — KB channel lock → extractive fast finalize."
+            )
+            return out
 
     try:
         from services.chat_flow_telemetry import brain_route_authoritative_kb_lock
@@ -4188,6 +4445,28 @@ def _try_fast_finalize_brain_route_after_ai(
             and not out.get("needs_order_id")
             and out.get("is_welfog_related", True) is not False
         )
+
+    # Authoritative product plan must beat catalog-menu/account-list rescue.
+    # Those semantic helpers may invoke fallback LLMs; running them after Brain
+    # already chose product+catalog caused 45s timeouts on recommendation-style
+    # searches such as occasion/gift queries.
+    if intent in ("product", "product_search") and channel == "catalog":
+        out["intent"] = "product"
+        out["data_channel"] = "catalog"
+        out["run_catalog_search"] = True
+        out["needs_order_id"] = False
+        out["conversation_scope"] = "welfog_support"
+        out["is_welfog_related"] = True
+        out["_product_catalog_locked"] = True
+        out["_turn_promotions_done"] = True
+        out["_universal_brain_route"] = True
+        out.pop("_kb_route_locked", None)
+        out.pop("scope_reply", None)
+        log_reasoning(
+            "Universal brain — authoritative product catalog fast finalize "
+            "(skip all rescue classifiers)."
+        )
+        return out
 
     catalog_fast = _fast_finalize_promote_catalog_menu(
         out,
@@ -4969,16 +5248,31 @@ def early_universal_brain_route(
             return route_data if isinstance(route_data, dict) else None
         route_data = dict(route_data)
 
-    try:
-        from services.ai_route_semantics import repair_brain_json_quality
+    pre_intent = (route_data.get("intent") or "").strip().lower()
+    if pre_intent in ("product", "product_search"):
+        # Raw Brain product JSON is already sufficient and authoritative.
+        # Generic quality repair may invoke translation/retrieval helpers and
+        # legacy semantic graphs; normalize the one schema alias in-process.
+        route_data["intent"] = "product"
+        route_data["data_channel"] = "catalog"
+        route_data["run_catalog_search"] = True
+    else:
+        try:
+            from services.ai_route_semantics import repair_brain_json_quality
 
-        route_data = repair_brain_json_quality(route_data, original_msg, msg_en=msg_en)
-    except ImportError:
-        pass
+            route_data = repair_brain_json_quality(route_data, original_msg, msg_en=msg_en)
+        except ImportError:
+            pass
     route_data["_universal_brain_route"] = True
-    route_data = _reconcile_off_topic_brain_misroute(
-        route_data, original_msg, msg_en=msg_en
-    )
+    raw_intent = (route_data.get("intent") or "").strip().lower()
+    raw_channel = (route_data.get("data_channel") or "").strip().lower()
+    if not (
+        raw_intent in ("product", "product_search")
+        and raw_channel == "catalog"
+    ):
+        route_data = _reconcile_off_topic_brain_misroute(
+            route_data, original_msg, msg_en=msg_en
+        )
 
     _t_post_brain = time.perf_counter()
     fast_final = _try_fast_finalize_brain_route_after_ai(

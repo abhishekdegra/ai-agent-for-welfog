@@ -5197,13 +5197,12 @@ def extract_embedded_query_identifiers(
 
 def _text_requests_category_product_browse(t: str, ctx=None) -> bool:
     """
-    Products FROM a named live-nav department — not the full category menu.
-    Delegates to catalog API label resolve (any language via Brain/nav map).
+    Products FROM a named live-nav department — Brain / catalog-menu LLM only.
     """
     try:
         from services.welfog_api import message_requests_category_browse
 
-        return bool(message_requests_category_browse(t))
+        return bool(message_requests_category_browse(t, ctx=ctx))
     except ImportError:
         return False
 

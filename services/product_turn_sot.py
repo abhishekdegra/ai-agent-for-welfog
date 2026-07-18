@@ -12,6 +12,7 @@ No product keyword lists. No downstream reinterpretation of customer text.
 """
 from __future__ import annotations
 
+import time
 from typing import Any, Callable, Optional
 
 from utils.reasoning_log import log_reasoning
@@ -232,33 +233,47 @@ def try_run_locked_product_catalog(
     Lock product turn (Brain or one classifier) → prepare route → ONE OpenSearch pass.
     Returns (reply_html, locked_route) or (None, None).
     """
-    try:
-        from services.order_turn_sot import brain_route_blocks_product_rescue
+    authoritative_product = bool(
+        (route.get("intent") or "").strip().lower() in ("product", "product_search")
+        and (route.get("data_channel") or "").strip().lower() == "catalog"
+        and route.get("_product_catalog_locked")
+    )
+    if authoritative_product:
+        # Universal Brain already resolved conflicts and locked this turn. Running
+        # order/refund/KB blockers (and lock rescue) again traverses legacy intent
+        # graphs and can touch MySQL before OpenSearch.
+        locked = dict(route)
+        log_reasoning(
+            "Product SoT — authoritative Brain lock; skip blocker/rescue graphs."
+        )
+    else:
+        try:
+            from services.order_turn_sot import brain_route_blocks_product_rescue
 
-        if brain_route_blocks_product_rescue(
+            if brain_route_blocks_product_rescue(
+                route,
+                ctx=ctx,
+                original_msg=original_msg,
+                msg_en=msg_en,
+                conversation_context=conv_for_llm,
+            ):
+                log_reasoning("Product SoT skipped — order/refund session or live API locked.")
+                return None, None
+            from services.kb_turn_sot import kb_turn_blocks_product_rescue
+
+            if kb_turn_blocks_product_rescue(route):
+                log_reasoning("Product SoT skipped — KB route locked.")
+                return None, None
+        except ImportError:
+            pass
+
+        locked = lock_product_turn_from_ai(
             route,
-            ctx=ctx,
             original_msg=original_msg,
             msg_en=msg_en,
             conversation_context=conv_for_llm,
-        ):
-            log_reasoning("Product SoT skipped — order/refund session or live API locked.")
-            return None, None
-        from services.kb_turn_sot import kb_turn_blocks_product_rescue
-
-        if kb_turn_blocks_product_rescue(route):
-            log_reasoning("Product SoT skipped — KB route locked.")
-            return None, None
-    except ImportError:
-        pass
-
-    locked = lock_product_turn_from_ai(
-        route,
-        original_msg=original_msg,
-        msg_en=msg_en,
-        conversation_context=conv_for_llm,
-        allow_rescue_llm=allow_rescue_llm,
-    )
+            allow_rescue_llm=allow_rescue_llm,
+        )
     if not locked:
         return None, None
 
@@ -268,9 +283,14 @@ def try_run_locked_product_catalog(
             _run_product_catalog_flow,
         )
 
+        _t_prepare = time.perf_counter()
         product_route, sq = _prepare_brain_product_route(
             locked, original_msg, msg_en
         )
+        log_reasoning(
+            f"Product SoT phase prepare={(time.perf_counter() - _t_prepare):.3f}s."
+        )
+        _t_catalog = time.perf_counter()
         body = _run_product_catalog_flow(
             product_route,
             sq,
@@ -281,6 +301,9 @@ def try_run_locked_product_catalog(
             lang=lang,
             ctx=ctx,
             reset_context_fn=reset_context_fn,
+        )
+        log_reasoning(
+            f"Product SoT phase catalog={(time.perf_counter() - _t_catalog):.3f}s."
         )
         if body:
             log_reasoning(

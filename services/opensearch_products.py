@@ -51,8 +51,10 @@ _FILTER_STOP = frozenset(
 )
 
 _SIZE_PATTERNS = (
-    r"\bsize\s*[:=\-]?\s*(free\s*size|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?\s*(?:inch|in|cm)?)\b",
-    r"\bsize\s+(free\s*size|xs|s|m|l|xl|xxl|\d+(?:\.\d+)?)\b",
+    r"\bsize\s*[:=\-]?\s*(free\s*size|xxl|xl|xs|s|m|l|\d+(?:\.\d+)?\s*(?:inch|in|cm)?)\b",
+    r"\bsize\s+(free\s*size|xxl|xl|xs|s|m|l|\d+(?:\.\d+)?)\b",
+    # Hinglish / natural word order: "XXL size", "L size ki tshirt"
+    r"\b(free\s*size|xxl|xl|xs|s|m|l)\s+size\b",
     r"\b(free\s*size)\b",
     r"\b(\d+(?:\.\d+)?)\s*(?:inch|in|cm)\s+size\b",
 )
@@ -257,9 +259,10 @@ _UNDER_PRICE_MARKERS = re.compile(
     r"\bandar\s+andar\b|kam\s+price|kam\s+me|"
     r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*(?:budget|range)\b|"
     r"\bi\s+have\s+(?:only\s+)?(?:rs|₹|inr|\d)|\bbudget\s+of\b|"
+    r"\b\d+(?:\.\d+)?\s*k\s+tak\b|"
     r"இன்\s*கீழ்|கீழ்|க்கு\s*கீழ்|"
     r"से\s*कम|से\s*नीचे|"
-    r"below\s+rs|rs\s+se\s+kam)",
+    r"below\s+rs|rs\s+se\s+kam|\btak\b)",
     re.IGNORECASE,
 )
 _BUDGET_AMOUNT_PATTERNS = (
@@ -684,31 +687,153 @@ def _turn_mentions_rating_filter(text: str) -> bool:
     return bool(_RATING_CONTEXT.search(text or ""))
 
 
-def _user_mentions_price_this_turn(text: str) -> bool:
-    """True when the user explicitly asked for a money/budget filter this turn."""
-    low = (text or "").lower()
-    if not low.strip():
-        return False
-    if re.search(r"\b(?:rs|₹|rupee|rupees|inr|budget|price|priced)\b", low, re.I):
-        return True
-    if any(re.search(p, low, re.I) for p in _PRICE_UNDER + _PRICE_OVER):
-        return True
-    for pat in _BUDGET_AMOUNT_PATTERNS:
-        if re.search(pat, low, re.I):
+def _user_mentions_price_this_turn(
+    text: str,
+    *,
+    ai_understanding: Optional[dict] = None,
+    spec: Optional[dict] = None,
+) -> bool:
+    """
+    Budget/price intent — Brain + Product Entity Extraction own this in any language.
+    No Hinglish/English keyword lists; trust AI fields when present.
+    """
+    try:
+        from services.catalog_spec_semantics import ai_set_price_filter, spec_has_price_filter
+
+        if ai_understanding and ai_set_price_filter(ai_understanding):
             return True
-    if re.search(r"\b(\d{1,7})\s*se\s+kam\b", low):
-        return True
-    if re.search(r"\b(\d{1,7})\s*rs?\s*ke\s+andar\b", low, re.I):
-        return True
-    if re.search(r"\bke\s+andar\b", low) and re.search(r"\d", low):
-        return True
-    if re.search(r"\b(?:range|hissab|hisaab|hisab)\s+ke\s+andar\b", low):
-        return True
-    if re.search(r"\b\d{2,7}\s*(?:rs|₹|rupees?|inr)?\s+ki\s+range\b", low, re.I):
-        return True
-    if re.search(r"\b(?:under|below|upto)\b", low) and re.search(r"\d", low):
-        return True
+        if spec and spec_has_price_filter(spec):
+            return True
+    except ImportError:
+        pass
     return False
+
+
+def _extract_price_bounds(raw: str, low: str) -> tuple[Optional[float], Optional[float]]:
+    """Price bounds come from Brain / Product NLU JSON — not regex keyword maps."""
+    return None, None
+
+
+# Universal budget parser — keys off NUMBERS + currency/comparator context, so it
+# works for ANY product in ANY language/script (₹, rs, rupee, "under", "se kam",
+# "ke andar", "tak", "range", "budget"…). This is a deterministic safety net for
+# when the routing/entity LLM drops the price filter — NOT a product-keyword list.
+_PRICE_CURRENCY_RE = re.compile(
+    r"(?:₹|\brs\.?\b|\brs\b|rupees?|\binr\b|/-|\bprice\b|\bbudget\b|\brange\b|\bwithin\b|"
+    r"\bunder\b|\bbelow\b|\bupto\b|\bup\s*to\b|\bmax(?:imum)?\b|\bmin(?:imum)?\b|"
+    r"\babove\b|\bover\b|\bmore\s+than\b|\bat\s*least\b|\bbetween\b|\bbe?ech\b|"
+    r"se\s*kam|se\s*jyada|se\s*zyada|"
+    r"se\s*ni?ch[ae]|se\s*upar|ke\s*andar|\bandar\b|\btak\b|ke\s*ni?ch[ae]|ke\s*upar)",
+    re.IGNORECASE,
+)
+_PRICE_MIN_RE = re.compile(
+    r"(?:\babove\b|\bover\b|\bmore\s+than\b|\bat\s*least\b|\bminimum\b|\bmin\b|"
+    r"se\s*jyada|se\s*zyada|se\s*upar|se\s*adhik|ke\s*upar)",
+    re.IGNORECASE,
+)
+_PRICE_MAX_RE = re.compile(
+    r"(?:\bunder\b|\bbelow\b|\bupto\b|\bup\s*to\b|\bwithin\b|\bless\s+than\b|"
+    r"\bmax(?:imum)?\b|se\s*kam|se\s*ni?ch[ae]|ke\s*andar|\bandar\b|\btak\b|ke\s*ni?ch[ae])",
+    re.IGNORECASE,
+)
+
+
+def _price_number_tokens(low: str) -> list[float]:
+    """Numbers (2-7 digits, optional comma / k-suffix) that look like money amounts."""
+    out: list[float] = []
+    for m in re.finditer(r"\b(\d{1,3}(?:,\d{2,3})+|\d{2,7})\s*(k\b)?", low):
+        num = m.group(1).replace(",", "")
+        try:
+            val = float(num)
+        except ValueError:
+            continue
+        if m.group(2):  # "2k" → 2000
+            val *= 1000.0
+        out.append(val)
+    return out
+
+
+def parse_price_bounds_from_text(text: str) -> tuple[Optional[float], Optional[float]]:
+    """Return (min_price, max_price) from a shopping message. None when no budget."""
+    raw = (text or "").strip()
+    if not raw:
+        return None, None
+    low = raw.lower()
+    if not _PRICE_CURRENCY_RE.search(low):
+        return None, None
+    nums = _price_number_tokens(low)
+    if not nums:
+        return None, None
+
+    # Explicit range: "300 to 500", "300-500", "300 se 500".
+    rng = re.search(
+        r"\b(\d{2,7})\s*(?:-|–|to|se|and|aur)\s*(\d{2,7})\b", low
+    )
+    if rng:
+        a, b = float(rng.group(1)), float(rng.group(2))
+        return (min(a, b), max(a, b))
+
+    has_min = bool(_PRICE_MIN_RE.search(low))
+    has_max = bool(_PRICE_MAX_RE.search(low))
+    amount = max(nums)  # the budget figure, not stray digits like "combo 5"
+    if has_min and not has_max:
+        return (amount, None)
+    if has_max and not has_min:
+        return (None, amount)
+    # Currency present, no direction word → treat as budget ceiling (ecommerce default).
+    return (None, amount)
+
+
+def strip_price_tokens_from_title(title: str) -> str:
+    """Remove budget phrases from a title so OpenSearch matches the product noun only.
+
+    Structural (number + currency/comparator + connective filler) — never a
+    product-keyword list. "baniyan under 400 rs" → "baniyan"; "500 ki range me
+    baniyan" → "baniyan".
+    """
+    t = (title or "").strip()
+    if not t or not _PRICE_CURRENCY_RE.search(t):
+        # No budget context in the title — leave the product noun untouched.
+        return t
+    # Drop currency/comparator words, standalone money numbers, and the small set of
+    # connective fillers that glue a budget phrase to the product noun.
+    t = _PRICE_CURRENCY_RE.sub(" ", t)
+    t = re.sub(r"\b\d{1,3}(?:,\d{2,3})+\b|\b\d{2,7}\s*k?\b", " ", t, flags=re.IGNORECASE)
+    t = re.sub(
+        r"\b(?:ki|ka|ke|me|mein|mera|meri|mere|wali|wala|se|aur|and|to|tak|liye)\b",
+        " ",
+        t,
+        flags=re.IGNORECASE,
+    )
+    cleaned = " ".join(t.split()).strip()
+    # Never return an empty title from stripping — keep original if we nuked it all.
+    return cleaned or title.strip()
+
+
+def _scrub_price_filters_on_rating_turn(
+    spec: dict[str, Any],
+    text: str,
+    *,
+    ai_understanding: Optional[dict] = None,
+) -> None:
+    """Remove purchase_price_* on rating-only turns unless AI also set a budget."""
+    if not spec or not _turn_mentions_rating_filter(text):
+        return
+    try:
+        from services.catalog_spec_semantics import ai_set_price_filter, spec_has_price_filter
+
+        if ai_understanding and ai_set_price_filter(ai_understanding):
+            return
+        if spec_has_price_filter(spec) and (
+            spec.get("_catalog_ai") or spec.get("_ai_single_pass")
+        ):
+            return
+    except ImportError:
+        pass
+    spec.pop("purchase_price_min", None)
+    spec.pop("purchase_price_max", None)
+    spec.pop("unit_price_min", None)
+    spec.pop("unit_price_max", None)
 
 
 def _extract_rating_bounds_from_text(low: str) -> tuple[Optional[float], Optional[float]]:
@@ -775,135 +900,6 @@ def _extract_rating_bounds_from_text(low: str) -> tuple[Optional[float], Optiona
         if rmin is None and re.search(r"\b(?:above|over|upar|jyada)\s*0\b", low):
             rmin = 0.01
     return rmin, rmax
-
-
-def _scrub_price_filters_on_rating_turn(spec: dict[str, Any], text: str) -> None:
-    """Remove purchase_price_* when user asked for rating, not rupees."""
-    if not spec or not _turn_mentions_rating_filter(text):
-        return
-    if not _user_mentions_price_this_turn(text):
-        spec.pop("purchase_price_min", None)
-        spec.pop("purchase_price_max", None)
-        spec.pop("unit_price_min", None)
-        spec.pop("unit_price_max", None)
-
-
-def _extract_price_bounds(raw: str, low: str) -> tuple[Optional[float], Optional[float]]:
-    """Detect under/over price in any language (digits stay in original script)."""
-    combined = f"{raw} {low}"
-    low_s = (low or combined).lower()
-    if _turn_mentions_rating_filter(combined) and not re.search(
-        r"\b(?:rs|₹|rupee|rupees|inr|budget|price)\b", low_s, re.I
-    ):
-        return None, None
-    nums = [float(n) for n in re.findall(r"\d{2,7}", combined)]
-    if not nums:
-        lone = re.findall(r"\b(\d{1,7})\b", combined)
-        if lone and re.search(
-            r"\b(?:rs|₹|rupee|inr|price|budget|under|above|over|kam|sasta|mehnga)\b",
-            low_s,
-            re.I,
-        ):
-            nums = [float(x) for x in lone if int(x) > 0]
-        if not nums:
-            return None, None
-    price_max = None
-    price_min = None
-    for pat in _BUDGET_AMOUNT_PATTERNS:
-        m = re.search(pat, low_s, re.IGNORECASE)
-        if m and m.group(1).isdigit():
-            price_max = float(m.group(1))
-            break
-    if _UNDER_PRICE_MARKERS.search(combined) and price_max is None:
-        price_max = nums[0]
-    if _OVER_PRICE_MARKERS.search(combined) and not (
-        _turn_mentions_rating_filter(combined)
-        and not re.search(r"\b(?:rs|₹|rupee|inr|budget|price)\b", low_s, re.I)
-    ):
-        price_min = nums[0]
-    for pat in _PRICE_UNDER:
-        m = re.search(pat, low_s, re.IGNORECASE)
-        if m and m.lastindex and str(m.group(1)).isdigit():
-            price_max = float(m.group(1))
-            break
-    for pat in _PRICE_OVER:
-        m = re.search(pat, low_s, re.IGNORECASE)
-        if m and m.lastindex and str(m.group(1)).isdigit():
-            price_min = float(m.group(1))
-            break
-    m_kam = re.search(r"(\d{1,7})\s*se\s+kam", low_s)
-    if m_kam:
-        price_max = float(m_kam.group(1))
-    m_neeche = re.search(r"(\d{1,7})\s*ke\s+neeche", low_s)
-    if m_neeche:
-        price_max = float(m_neeche.group(1))
-    m_andar = re.search(r"(\d{1,7})\s*rs?\s*ke\s+andar", low_s, re.I)
-    if m_andar:
-        price_max = float(m_andar.group(1))
-    elif re.search(r"\bke\s+andar\b", low_s) and nums and price_max is None:
-        price_max = nums[0]
-    if re.search(r"\bin\s+this\s+range\b|\bthis\s+range\b|\bwithin\s+(?:my|their|the)?\s*range\b", low_s):
-        if price_max is None and nums:
-            price_max = nums[0]
-    if re.search(r"\b(?:range|hissab|hisaab|hisab)\s+ke\s+andar\b", low_s) and nums:
-        if price_max is None:
-            price_max = nums[0]
-    m_ki_range = re.search(
-        r"\b(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\s+ki\s+range\b",
-        low_s,
-        re.I,
-    )
-    if m_ki_range and price_max is None:
-        price_max = float(m_ki_range.group(1))
-        price_min = None
-    m_budget_rs = re.search(
-        r"\b(\d{2,7})\s*rs\s+(?:h|hai|hain|he)\b|\b(\d{2,7})\s*rs\s+(?:ke\s+)?(?:hisaab|hisaab|hisab|according)\b",
-        low_s,
-        re.I,
-    )
-    if m_budget_rs and price_max is None:
-        g = m_budget_rs.group(1) or m_budget_rs.group(2)
-        if g and g.isdigit():
-            price_max = float(g)
-    m_between = re.search(
-        r"\b(?:between|from)\s+(\d{2,7})\s+(?:and|to|-|–)\s+(\d{2,7})\b",
-        low_s,
-        re.I,
-    )
-    if not m_between:
-        m_between = re.search(
-            r"\b(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\s*(?:se|to|-|–)\s*(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\b",
-            low_s,
-            re.I,
-        )
-    if not m_between:
-        m_between = re.search(
-            r"\b(\d{2,7})\s+se\s+(\d{2,7})\s*(?:rs|₹|rupees?|inr|tk|tak)?\b",
-            low_s,
-            re.I,
-        )
-    if not m_between:
-        m_between = re.search(
-            r"\bprice\s+range\s+(\d{2,7})\s*(?:-|–|to)\s+(\d{2,7})\b",
-            low_s,
-            re.I,
-        )
-    if not m_between:
-        m_between = re.search(
-            r"\b(\d{2,7})\s*(?:-|–)\s*(\d{2,7})\s*(?:rs|₹|rupees?|inr)?\b",
-            low_s,
-            re.I,
-        )
-    if not m_between and len(nums) >= 2 and re.search(
-        r"\b(?:range|hissaab|hisaab|hisab|between|se|to)\b", low_s, re.I
-    ):
-        a, b = sorted(nums[:2])
-        price_min = a
-        price_max = b
-    elif m_between:
-        a, b = float(m_between.group(1)), float(m_between.group(2))
-        price_min, price_max = (min(a, b), max(a, b))
-    return price_max, price_min
 
 
 def _merge_title_queries(left: str, right: str) -> str:
@@ -1010,11 +1006,6 @@ def build_product_search_spec(
         pro_id=pro_id,
     )
     merged = _merge_filter_specs(spec_orig, spec_en)
-    pmax, pmin = _extract_price_bounds(original_msg or "", (msg_en or "").lower())
-    if pmax is not None:
-        merged["purchase_price_max"] = pmax
-    if pmin is not None:
-        merged["purchase_price_min"] = pmin
     kw = _extract_product_keywords((msg_en or original_msg or "").lower())
     if merged.get("sku"):
         merged["title_query"] = kw or ""
@@ -1242,6 +1233,68 @@ def _compound_space_variants(token: str) -> list[str]:
         if len(out) >= 4:
             break
     return out
+
+
+def _compound_token_surface_forms(tok: str) -> list[str]:
+    """
+    Surface forms for compact catalog tokens: tshirt ↔ t shirt / t-shirt.
+    Algorithmic splits only — no per-product synonym tables.
+    """
+    raw = (tok or "").strip().lower()
+    compact = re.sub(r"[^a-z0-9]", "", raw)
+    if not compact:
+        return []
+    forms: list[str] = [compact]
+    if re.search(r"[\s-]", raw):
+        spaced = re.sub(r"[\s-]+", " ", raw).strip()
+        if spaced:
+            forms.append(spaced)
+        forms.append(compact)
+    for i in range(1, len(compact)):
+        left, right = compact[:i], compact[i:]
+        if left.isalpha() and right.isalpha() and len(left) >= 1 and len(right) >= 2:
+            forms.extend([f"{left} {right}", f"{left}-{right}"])
+    seen: set[str] = set()
+    out: list[str] = []
+    for f in forms:
+        f = f.strip()
+        if f and f not in seen:
+            seen.add(f)
+            out.append(f)
+    return out
+
+
+def _focus_title_query_on_product_noun(spec: dict[str, Any]) -> None:
+    """
+    OpenSearch BM25 on the product noun; audience words (women/men/kids) stay for post-filter.
+    """
+    tq = (spec.get("title_query") or "").strip()
+    ptype = (spec.get("product_type") or "").strip().lower()
+    if not tq or not ptype:
+        return
+    words = tq.lower().split()
+    if len(words) < 2:
+        return
+    ptype_base = ptype.rstrip("s")
+    audience: list[str] = []
+    product_words: list[str] = []
+    for w in words:
+        wl = w.lower()
+        if wl in _GENERIC_TITLE_MODIFIERS:
+            audience.append(wl)
+            continue
+        if wl in (ptype, ptype_base) or wl.rstrip("s") == ptype_base:
+            product_words.append(ptype)
+        else:
+            product_words.append(wl)
+    if not audience:
+        return
+    if audience and not spec.get("audience_tokens"):
+        spec["audience_tokens"] = list(dict.fromkeys(audience))
+    if product_words:
+        spec["title_query"] = " ".join(dict.fromkeys(product_words))
+    else:
+        spec["title_query"] = ptype
 
 
 def _soft_collapse_repeated_letters(text: str) -> str:
@@ -1529,7 +1582,12 @@ def _strip_generic_from_mandatory(spec: dict[str, Any]) -> None:
     ]
     ptype = (spec.get("product_type") or "").strip().lower()
     product_nouns = [t for t in cleaned if t in _PRODUCT_NOUNS or t in _PRODUCT_TYPE_SYNONYMS]
-    if product_nouns:
+    if spec.get("_semantic_constraints_from_ai"):
+        # Product NLU explicitly supplied compatibility/features. Preserve those
+        # semantic constraints instead of collapsing everything to the generic
+        # product noun (cover/shirt), which used to lose model/waterproof/etc.
+        spec["mandatory_match_tokens"] = cleaned[:6]
+    elif product_nouns:
         spec["mandatory_match_tokens"] = [product_nouns[0]]
     elif ptype and ptype in _PRODUCT_TYPE_SYNONYMS:
         spec["mandatory_match_tokens"] = [ptype]
@@ -1697,6 +1755,39 @@ def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
     tq = (spec.get("title_query") or "").strip().lower()
     if tq in _FILTER_STOP or tq in ("your", "search", "kesa", "kaise", "hello"):
         spec["title_query"] = ""
+    # Defense: category_id + title that is only the department label → id-only browse.
+    # (name=electronics&categories=16 returns empty; categories=16 alone works.)
+    cid = spec.get("category_id")
+    tq_raw = (spec.get("title_query") or "").strip()
+    # Keep product noun searches (women tshirt, sneakers, iphone) — never promote
+    # them to department-only browse via substring category-name overlap.
+    has_product_signal = bool(
+        (spec.get("product_type") or "").strip()
+        or (spec.get("mandatory_match_tokens") or [])
+        or (spec.get("brand") or "").strip()
+        or (spec.get("pro_id") or spec.get("sku"))
+    )
+    if cid and tq_raw and not has_product_signal:
+        try:
+            from services.welfog_api import (
+                _normalize_cat_name,
+                category_name_for_id,
+                query_should_use_category_id_only,
+            )
+
+            if query_should_use_category_id_only(cid, tq_raw):
+                spec["title_query"] = ""
+                spec["_category_only_browse"] = True
+            else:
+                cat_n = _normalize_cat_name(category_name_for_id(str(cid)) or "")
+                tq_n = _normalize_cat_name(tq_raw)
+                # Exact department label only — "women tshirt" must NOT become
+                # Women Fashion browse because "women" overlaps the category name.
+                if cat_n and tq_n and tq_n == cat_n:
+                    spec["title_query"] = ""
+                    spec["_category_only_browse"] = True
+        except ImportError:
+            pass
     # Algorithmic typo soften on the way into catalog (echoed keysmash → matchable).
     tq = (spec.get("title_query") or "").strip()
     if tq and re.search(r"(.)\1", tq.lower()):
@@ -1712,6 +1803,7 @@ def sanitize_product_search_spec(spec: dict[str, Any]) -> dict[str, Any]:
                 spec["title_query"] = soft
     if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
         spec["_landed_price_filter"] = True
+    _focus_title_query_on_product_noun(spec)
     return spec
 
 
@@ -1808,6 +1900,33 @@ def _product_type_token_in_name(tok: str, name_lower: str) -> bool:
     if synonyms:
         return any(s in name_lower for s in synonyms)
     return False
+
+
+def filter_products_by_audience_tokens(
+    products: list[dict],
+    audience_tokens: list[str],
+) -> list[dict]:
+    """
+    Keep listings whose title reflects requested audience (women/men/kids) from AI terms.
+    Hard filter — never soft-return the full unfiltered list (that mixed watches/socks
+    into 'women tshirt' results).
+    """
+    tokens = [t.strip().lower() for t in (audience_tokens or []) if t and len(str(t).strip()) >= 3]
+    if not tokens or not products:
+        return products
+    expanded: set[str] = set()
+    for t in tokens:
+        expanded.add(t)
+        if not t.endswith("s"):
+            expanded.add(f"{t}s")
+        if t.endswith("s") and len(t) > 3:
+            expanded.add(t[:-1])
+    matched = []
+    for p in products:
+        name = (p.get("name") or "").lower()
+        if any(at in name for at in expanded):
+            matched.append(p)
+    return matched
 
 
 def filter_products_by_ai_mandatory_tokens(
@@ -1968,6 +2087,14 @@ def filter_products_by_requested_sku(products: list[dict], sku: str) -> list[dic
 
 
 def _card_purchase_price(p: dict) -> Optional[float]:
+    display = p.get("price")
+    if display not in (None, ""):
+        try:
+            dv = float(str(display).replace(",", "").replace("₹", "").strip())
+            if dv > 0:
+                return dv
+        except (TypeError, ValueError):
+            pass
     try:
         from services.welfog_api import customer_landed_price
 
@@ -1976,20 +2103,24 @@ def _card_purchase_price(p: dict) -> Optional[float]:
             return landed
     except ImportError:
         pass
-    raw = p.get("purchase_price")
-    if raw is None:
-        raw = p.get("price")
-    if raw is None:
-        return None
-    try:
-        base = float(str(raw).replace(",", "").replace("₹", "").strip())
-    except (TypeError, ValueError):
-        return None
-    try:
-        ship = float(str(p.get("shipping_cost") or 0).replace(",", "").strip())
-    except (TypeError, ValueError):
-        ship = 0.0
-    return base + max(0.0, ship)
+    for key in ("purchase_price", "unit_price", "sale_price", "mrp"):
+        raw = p.get(key)
+        if raw is None or raw == "":
+            continue
+        try:
+            base = float(str(raw).replace(",", "").replace("₹", "").strip())
+        except (TypeError, ValueError):
+            continue
+        if base <= 0:
+            continue
+        try:
+            ship = float(str(p.get("shipping_cost") or 0).replace(",", "").strip())
+        except (TypeError, ValueError):
+            ship = 0.0
+        if key == "purchase_price":
+            return base + max(0.0, ship)
+        return base
+    return None
 
 
 def filter_products_by_purchase_price(products: list[dict], spec: dict[str, Any]) -> list[dict]:
@@ -1997,6 +2128,18 @@ def filter_products_by_purchase_price(products: list[dict], spec: dict[str, Any]
     pmin = spec.get("purchase_price_min")
     if pmax is None and pmin is None:
         return products
+    if products:
+        try:
+            from services.welfog_api import refresh_product_cards_landed_prices
+
+            products = refresh_product_cards_landed_prices(
+                products,
+                title_query=(spec.get("title_query") or ""),
+                color=spec.get("color"),
+                category_id=spec.get("category_id"),
+            )
+        except ImportError:
+            pass
     out = []
     for p in products:
         val = _card_purchase_price(p)
@@ -2217,21 +2360,23 @@ def reconcile_catalog_spec_with_user_turn(
                 continue
             spec[key] = heuristic[key]
 
-    pmax, pmin = _extract_price_bounds(original_msg or comb, (msg_en or comb).lower())
-    if pmax is not None:
-        spec["purchase_price_max"] = pmax
-    if pmin is not None:
-        spec["purchase_price_min"] = pmin
-
     rmin_h, rmax_h = _extract_rating_bounds_from_text((comb or "").lower())
     if rmin_h is not None and spec.get("rating_min") is None:
         spec["rating_min"] = rmin_h
     if rmax_h is not None and spec.get("rating_max") is None:
         spec["rating_max"] = rmax_h
 
-    _scrub_price_filters_on_rating_turn(spec, comb)
+    _scrub_price_filters_on_rating_turn(spec, comb, ai_understanding=ai_understanding)
 
-    if not _user_mentions_price_this_turn(comb):
+    try:
+        from services.catalog_spec_semantics import spec_has_price_filter
+    except ImportError:
+        spec_has_price_filter = lambda _s: False  # type: ignore
+
+    if not spec_has_price_filter(spec) and not (
+        isinstance(ai_understanding, dict)
+        and ai_understanding.get("_ai_first")
+    ):
         spec.pop("purchase_price_max", None)
         spec.pop("purchase_price_min", None)
         spec.pop("unit_price_max", None)
@@ -2252,7 +2397,6 @@ def reconcile_catalog_spec_with_user_turn(
         spec["title_match_strict"] = False
     elif (
         has_budget
-        and _user_mentions_price_this_turn(comb)
         and ctx
         and not _brand_mentioned_in_text(str(spec.get("brand") or ""), comb)
     ):
@@ -2360,6 +2504,21 @@ def apply_catalog_post_filters(
     if spec.get("rating_min") is not None or spec.get("rating_max") is not None:
         products = filter_products_by_rating_range(products, spec)
 
+    # product_type from AI is authoritative for any language/style ask — always enforce
+    # when present (including light/category paths) so sneakers ≠ fashion misc.
+    ptype = (spec.get("product_type") or "").strip()
+    if ptype and not _is_category_only_browse_spec(spec):
+        products = filter_products_by_ai_mandatory_tokens(
+            products,
+            [ptype],
+            product_type=ptype,
+            skip_color_tokens=bool(spec.get("color")),
+        )
+
+    audience = spec.get("audience_tokens") or []
+    if audience:
+        products = filter_products_by_audience_tokens(products, audience)
+
     mats = spec.get("material_tokens") or []
     if mats:
         products = filter_products_by_material_tokens(products, mats)
@@ -2419,8 +2578,36 @@ def _filter_products_to_department(products: list[dict], category_id) -> list[di
     return kept
 
 
+def _edit_distance(a: str, b: str) -> int:
+    """Small Levenshtein distance — used to mirror OpenSearch fuzziness in post-filters."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    if abs(len(a) - len(b)) > 2:
+        return 99
+    # Two-row DP — enough for short catalog tokens.
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            ins = cur[j - 1] + 1
+            delete = prev[j] + 1
+            sub = prev[j - 1] + (0 if ca == cb else 1)
+            cur.append(min(ins, delete, sub))
+        prev = cur
+    return prev[-1]
+
+
 def _title_token_in_name(tok: str, name_lower: str) -> bool:
-    """True when token (or a compound split of it) appears in the product name."""
+    """True when token (or a compound / near-typo form of it) appears in the product name.
+
+    OpenSearch already fuzzy-matches titles; this post-filter must not undo that by
+    requiring exact spelling. Short edit-distance tolerance (AUTO-like) covers
+    typos such as bnaiyan↔baniyan without any product keyword lists.
+    """
     tok = (tok or "").strip().lower()
     if not tok or not name_lower:
         return False
@@ -2430,11 +2617,30 @@ def _title_token_in_name(tok: str, name_lower: str) -> bool:
         return True
     if not tok.endswith("s") and f"{tok}s" in name_lower:
         return True
+    for form in _compound_token_surface_forms(tok):
+        if form in name_lower:
+            return True
+        if form.endswith("s") and len(form) > 3 and form[:-1] in name_lower:
+            return True
+        if not form.endswith("s") and f"{form}s" in name_lower:
+            return True
     # Compound without spaces: flipflops ↔ "flip flops"
     if " " not in tok and len(tok) >= 7:
         for split in _compound_space_variants(tok):
             parts = split.split()
             if len(parts) == 2 and parts[0] in name_lower and parts[1] in name_lower:
+                return True
+    # Typo-tolerant: mirror OpenSearch fuzziness AUTO
+    # (0 for ≤2, 1 for 3–5, 2 for ≥6) so "bnaiyan" still matches "baniyan".
+    if len(tok) >= 4:
+        if len(tok) <= 5:
+            max_ed = 1
+        else:
+            max_ed = 2
+        for word in re.findall(r"[a-z0-9]{3,}", name_lower):
+            if abs(len(word) - len(tok)) > max_ed:
+                continue
+            if _edit_distance(tok, word) <= max_ed:
                 return True
     return False
 
@@ -2844,12 +3050,6 @@ def build_catalog_search_spec(
         spec["pro_id"] = pro_id
     if category_id and not spec.get("category_id"):
         spec["category_id"] = category_id
-    if ai_has_shopping and spec.get("purchase_price_max") is None and spec.get("purchase_price_min") is None:
-        pmax, pmin = _extract_price_bounds(original_msg or "", (msg_en or "").lower())
-        if pmax is not None:
-            spec["purchase_price_max"] = pmax
-        if pmin is not None:
-            spec["purchase_price_min"] = pmin
     spec["_filter_user_msg"] = original_msg or ""
     spec = sanitize_product_search_spec(spec)
     _normalize_generic_title_query(spec, original_msg)
@@ -2997,46 +3197,6 @@ def parse_product_filters_from_text(
         inferred = _infer_brand_from_message(low)
         if inferred:
             spec["brand"] = inferred
-
-    for pat in _PRICE_UNDER:
-        m = re.search(pat, low, re.IGNORECASE)
-        if m:
-            if m.lastindex and m.group(1).isdigit():
-                spec["purchase_price_max"] = float(m.group(1))
-            else:
-                spec["sort"] = spec["sort"] or "purchase_price_asc"
-            break
-
-    for pat in _PRICE_OVER:
-        m = re.search(pat, low, re.IGNORECASE)
-        if m:
-            if m.lastindex and m.group(1).isdigit():
-                spec["purchase_price_min"] = float(m.group(1))
-            else:
-                spec["sort"] = spec["sort"] or "purchase_price_desc"
-            break
-
-    purchase_low = re.search(
-        r"purchase\s+price\s+(?:under|below|max|upto)\s*(\d{2,7})",
-        low,
-        re.IGNORECASE,
-    )
-    if purchase_low:
-        spec["purchase_price_max"] = float(purchase_low.group(1))
-
-    purchase_min = re.search(
-        r"purchase\s+price\s+(?:above|over|min)\s*(\d{2,7})",
-        low,
-        re.IGNORECASE,
-    )
-    if purchase_min:
-        spec["purchase_price_min"] = float(purchase_min.group(1))
-
-    pmax, pmin = _extract_price_bounds(raw, low)
-    if pmax is not None:
-        spec["purchase_price_max"] = pmax
-    if pmin is not None:
-        spec["purchase_price_min"] = pmin
 
     for pat in _RATING_UNDER_PATTERNS:
         m = re.search(pat, low, re.IGNORECASE)
@@ -3405,10 +3565,28 @@ def _build_opensearch_body(spec: dict[str, Any], size: int = PAGE_SIZE, offset: 
         filters.append({"range": {"unit_price": {"lte": spec["unit_price_max"]}}})
     if not spec.get("_os_price_filter_disabled"):
         has_landed = bool(spec.get("_landed_price_filter"))
-        if spec.get("purchase_price_min") is not None and not has_landed:
-            filters.append({"range": {"purchase_price": {"gte": spec["purchase_price_min"]}}})
-        if spec.get("purchase_price_max") is not None and not has_landed:
-            filters.append({"range": {"purchase_price": {"lte": spec["purchase_price_max"]}}})
+        pmin_os = spec.get("purchase_price_min")
+        pmax_os = spec.get("purchase_price_max")
+        if has_landed:
+            # Index purchase_price excludes shipping — widen max slightly, then post-filter
+            # on live landed price (purchase + shipping) for accurate budget matching.
+            if pmin_os is not None:
+                filters.append({"range": {"purchase_price": {"gte": float(pmin_os)}}})
+            if pmax_os is not None:
+                try:
+                    pmax_f = float(pmax_os)
+                except (TypeError, ValueError):
+                    pmax_f = None
+                if pmax_f is not None:
+                    ship_buf = max(120.0, pmax_f * 0.12)
+                    filters.append(
+                        {"range": {"purchase_price": {"lte": pmax_f + ship_buf}}}
+                    )
+        else:
+            if pmin_os is not None:
+                filters.append({"range": {"purchase_price": {"gte": pmin_os}}})
+            if pmax_os is not None:
+                filters.append({"range": {"purchase_price": {"lte": pmax_os}}})
     if spec.get("rating_min") is not None:
         filters.append({"range": {"rating": {"gte": spec["rating_min"]}}})
     if spec.get("rating_max") is not None:
@@ -3590,17 +3768,25 @@ def _search_opensearch_page(
     cards = opensearch_hits_to_product_cards(hits)
     cards = apply_catalog_post_filters(cards, spec, post_filter_mode=post_filter_mode)
     if cards and not skip_price_sync and not spec.get("_ai_single_pass"):
-        from services.welfog_api import sync_product_cards_prices_from_rest_api
+        has_price_filter = (
+            spec.get("purchase_price_max") is not None
+            or spec.get("purchase_price_min") is not None
+        )
+        # Ordinary browse must return indexed cards immediately. The live REST
+        # price refresh can fan out into several network calls and added 8–30s
+        # even when the customer never asked for a budget. Only block on exact
+        # landed-price enrichment when a price constraint makes it necessary.
+        if has_price_filter:
+            from services.welfog_api import sync_product_cards_prices_from_rest_api
 
-        q = (spec.get("title_query") or "").strip()
-        if q:
-            cards = sync_product_cards_prices_from_rest_api(
-                cards,
-                q,
-                color=spec.get("color"),
-                category_id=spec.get("category_id"),
-            )
-        if spec.get("purchase_price_max") is not None or spec.get("purchase_price_min") is not None:
+            q = (spec.get("title_query") or "").strip()
+            if q:
+                cards = sync_product_cards_prices_from_rest_api(
+                    cards,
+                    q,
+                    color=spec.get("color"),
+                    category_id=spec.get("category_id"),
+                )
             cards = filter_products_by_purchase_price(cards, spec)
         if spec.get("rating_min") is not None or spec.get("rating_max") is not None:
             cards = filter_products_by_rating_range(cards, spec)
@@ -3783,10 +3969,25 @@ def search_opensearch_catalog(
 
     if spec.get("_ai_single_pass"):
         pf = _post_filter_mode_for_spec(spec)
+        # OpenSearch index purchase_price lags the live catalog, so a tight budget
+        # (e.g. "baniyan under 400") would drop items that are actually in budget
+        # once landed (purchase + shipping) prices are refreshed. Fetch candidates
+        # WITHOUT the stale index price range and let filter_products_by_purchase_price
+        # enforce the real budget on refreshed prices. Widen the page so enough
+        # candidates survive the post-filter.
+        _has_price_f = (
+            spec.get("purchase_price_max") is not None
+            or spec.get("purchase_price_min") is not None
+        )
+        page_size_eff = page_size
+        if _has_price_f and not spec.get("_os_price_filter_disabled"):
+            spec = dict(spec)
+            spec["_os_price_filter_disabled"] = True
+            page_size_eff = min(page_size * 3, MAX_PAGE_SIZE)
         cards, n, more = _search_opensearch_page(
             spec,
             page=page,
-            page_size=page_size,
+            page_size=page_size_eff,
             post_filter_mode=pf,
             skip_price_sync=True,
         )
@@ -3820,10 +4021,17 @@ def search_opensearch_catalog(
         # catalog names omit — retry each token alone before slow REST fallback.
         if not cards:
             tq = (spec.get("title_query") or "").strip().lower()
+            ptype = (spec.get("product_type") or "").strip().lower()
+            mandatory = [
+                str(m).strip().lower()
+                for m in (spec.get("mandatory_match_tokens") or [])
+                if m and str(m).strip()
+            ]
             toks = [
                 t
                 for t in re.findall(r"[a-z0-9]{3,}", tq)
                 if t not in ("the", "and", "for", "with")
+                and t not in _GENERIC_TITLE_MODIFIERS
             ]
             related_blob = " ".join(
                 str(x)
@@ -3834,28 +4042,48 @@ def search_opensearch_catalog(
                 if x
             )
             for t in re.findall(r"[a-z0-9]{3,}", related_blob.lower()):
-                if t not in toks and t not in ("the", "and", "for", "with"):
+                if (
+                    t not in toks
+                    and t not in ("the", "and", "for", "with")
+                    and t not in _GENERIC_TITLE_MODIFIERS
+                ):
                     toks.append(t)
+            if mandatory:
+                recovery_pool = mandatory
+            elif ptype:
+                recovery_pool = [ptype]
+            else:
+                recovery_pool = toks
             seen_tok: set[str] = set()
             # Prefer longer distinctive tokens first (sidhu/moosewala before frame).
             # Never soft-recover on short generic tails when a longer subject token exists.
-            max_tok_len = max((len(t) for t in toks[:4]), default=0)
-            ordered = sorted(toks[:4], key=lambda t: (-len(t), t))
+            max_tok_len = max((len(t) for t in recovery_pool[:4]), default=0)
+            ordered = sorted(recovery_pool[:4], key=lambda t: (-len(t), t))
             for tok in ordered:
-                if tok in seen_tok or tok == tq:
+                if tok in seen_tok or tok == tq or tok in _GENERIC_TITLE_MODIFIERS:
                     continue
-                if len(toks) >= 2 and max_tok_len >= 6 and len(tok) < max_tok_len - 2:
+                if len(recovery_pool) >= 2 and max_tok_len >= 6 and len(tok) < max_tok_len - 2:
                     continue
                 seen_tok.add(tok)
                 soft = dict(spec)
                 soft["title_query"] = tok
                 soft["title_match_strict"] = False
-                soft.pop("mandatory_match_tokens", None)
+                if mandatory or ptype:
+                    soft["mandatory_match_tokens"] = mandatory or ([ptype] if ptype else [])
+                    if ptype:
+                        soft["product_type"] = ptype
+                else:
+                    soft.pop("mandatory_match_tokens", None)
+                soft_pf = (
+                    "strict"
+                    if soft.get("mandatory_match_tokens")
+                    else "light"
+                )
                 soft_cards, soft_n, soft_more = _search_opensearch_page(
                     soft,
                     page=page,
                     page_size=page_size,
-                    post_filter_mode="light",
+                    post_filter_mode=soft_pf,
                     skip_price_sync=True,
                 )
                 if soft_cards:
@@ -3897,8 +4125,10 @@ def search_opensearch_catalog(
                     brand_aliases=req_aliases if isinstance(req_aliases, list) else None,
                     strict_title=strict_brand,
                 )
-            cards = filter_products_by_purchase_price(cards, spec)
-            cards = filter_products_by_rating_range(cards, spec)
+            # _search_opensearch_page already ran apply_catalog_post_filters,
+            # including one landed-price refresh and rating enforcement. Repeating
+            # them here caused a second bounded REST call on every budget search.
+            spec["_post_filters_applied"] = True
             n = len(cards)
         try:
             from services.product_intent_parser import log_opensearch_query
@@ -4292,26 +4522,15 @@ def catalog_search_live(
 
     single_pass_miss = bool(spec.get("_ai_single_pass"))
     if single_pass_miss:
-        if _is_category_only_browse_spec(spec):
-            cat_rest = _category_browse_rest_fallback(
-                spec, page=page, page_size=page_size, ctx=ctx
-            )
-            if cat_rest[0]:
-                return cat_rest
-        # OpenSearch index can lag the live catalog (vest/baniyan found on REST,
-        # zero on OS). Locked path still tries ONE fast REST — not 4×12s hangs.
-        tq = (spec.get("title_query") or "").strip()
-        if tq or spec.get("brand") or spec.get("sku") or spec.get("pro_id"):
-            log_reasoning(
-                "Catalog AI single-pass: 0 OS hits — live REST title fallback "
-                f"(index may lag catalog) title={tq!r}."
-            )
-            # Fall through to REST path below (do not return empty yet).
-        else:
-            log_reasoning(
-                "Catalog AI single-pass: 0 OS hits, no title/brand/sku — not-found."
-            )
-            return [], spec, 0, False
+        # The authoritative agent contract is one entity pass + one OpenSearch
+        # request. A zero-hit REST fallback added 12–20s and made misses slower
+        # than successful searches. Price enrichment remains bounded separately;
+        # search misses return immediately and can use AI recommendations.
+        log_reasoning(
+            "Catalog AI single-pass: 0 OS hits — return immediately "
+            "(skip slow REST search fallback)."
+        )
+        return [], spec, 0, False
 
     if spec.get("strict_no_relax") and spec.get("pro_id"):
         return [], spec, 0, False

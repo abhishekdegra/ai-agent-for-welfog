@@ -279,8 +279,8 @@ def ai_classify_scope_and_reply(
 
 Scopes:
 - welfog_support: shopping/orders/wishlist/PIN/refund/policies on Welfog. ALSO: product browse/buy/show asks; correcting or narrowing a product just shown ("I only wanted X", "sirf X", "only show X"); typos/slang about a product the customer is shopping for.
-- general_chitchat: greeting, thanks, bye, how-are-you, bot smalltalk (any language)
-- out_of_domain: truly unrelated topics (weather, cricket scores, homework, other apps…) — NOT shopping typos and NOT follow-ups about products in RECENT.
+- general_chitchat: greeting, thanks, bye, how-are-you, bot smalltalk, playful affection/banter ("love you", "bolo love you pehle"), casual bonding — even if they mention shopping later as a joke/condition (any language)
+- out_of_domain: truly unrelated topics (weather, cricket scores, homework, other apps…) — NOT shopping typos and NOT follow-ups about products in RECENT. ALSO: personal/romantic demands that are not a product/order ask.
 
 JSON only:
 {{
@@ -290,7 +290,7 @@ JSON only:
   "confidence": 0.0-1.0
 }}
 {language_reply_instruction(rl)}
-No keyword lists — use meaning. When RECENT shows catalog products and LATEST narrows/corrects that ask (even with typos), ALWAYS welfog_support."""
+No keyword lists — use meaning. When RECENT shows catalog products and LATEST narrows/corrects that ask (even with typos), ALWAYS welfog_support. If LATEST is playful banter / affection / "say X first then shopping", prefer general_chitchat or out_of_domain — NEVER welfog_support just because the word shopping appears."""
 
     user_payload = f"LATEST:\n{user_line}"
     if compact_ctx:

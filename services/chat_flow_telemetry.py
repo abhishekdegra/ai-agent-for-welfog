@@ -241,15 +241,15 @@ def is_authoritative_kb_route_locked() -> bool:
 
 def clear_authoritative_kb_route_lock(*, reason: str = "") -> None:
     """
-    Catalog menu (categories/deals) won over a premature KB lock this turn.
-    Without this, KB SoT still answers 'not in knowledge base' for category list asks.
+    Clear a premature KB lock this turn (catalog menu, wishlist/order-history live API).
+    Without this, KB SoT answers instead of the winning live handler.
     """
     lock = getattr(_TLS, "authoritative_route_lock", None)
     if not isinstance(lock, dict) or lock.get("channel") != "kb":
         return
     _TLS.authoritative_route_lock = None
     label = f" ({reason})" if reason else ""
-    log_reasoning(f"Authoritative KB route lock cleared{label} — catalog menu owns turn.")
+    log_reasoning(f"Authoritative KB route lock cleared{label} — live/menu handler owns turn.")
 
 
 def lock_authoritative_pincode_route(

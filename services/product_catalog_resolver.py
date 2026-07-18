@@ -1798,10 +1798,30 @@ def entities_to_understanding(
         ("sku", "sku"),
         ("category", "product_type"),
         ("model", "model"),
+        ("compatibility", "compatibility"),
+        ("sort", "sort"),
     ):
         v = e.get(src)
         if v is not None and str(v).strip():
             out[dst] = str(v).strip()
+
+    for src, dst in (
+        ("audience", "audience"),
+        ("audience_tokens", "audience"),
+        ("material", "material"),
+        ("material_tokens", "material"),
+        ("occasion", "occasion"),
+        ("occasion_tokens", "occasion"),
+        ("feature_tokens", "feature_tokens"),
+        ("features", "feature_tokens"),
+    ):
+        value = e.get(src)
+        if value not in (None, "", [], {}):
+            out[dst] = value
+    if e.get("quantity") not in (None, ""):
+        out["quantity"] = e["quantity"]
+    if e.get("in_stock_only"):
+        out["in_stock_only"] = True
 
     if not out.get("color") and original_msg:
         try:
@@ -1815,6 +1835,27 @@ def entities_to_understanding(
                 col = normalize_color_fuzzy(original_msg)
             if col:
                 out["color"] = col
+        except ImportError:
+            pass
+
+    # Structural catalog size (XS/S/M/L/XL/XXL/Free Size/numeric) — same role as
+    # colour above. When Brain left size empty but the user named a size, map it
+    # into the size filter field (never leave it stuck inside search_terms).
+    if not out.get("size") and original_msg:
+        try:
+            from services.opensearch_products import (
+                _extract_size_from_text,
+                _strip_size_from_title_query,
+            )
+
+            sz = _extract_size_from_text(original_msg)
+            if sz:
+                out["size"] = sz
+                st = (out.get("search_terms") or "").strip()
+                if st:
+                    cleaned = _strip_size_from_title_query(st, sz)
+                    if cleaned:
+                        out["search_terms"] = cleaned
         except ImportError:
             pass
 
@@ -1847,15 +1888,31 @@ def entities_to_understanding(
             except (TypeError, ValueError):
                 pass
 
-    if out.get("max_price") is None and out.get("min_price") is None and original_msg:
+    # Universal budget gap-fill — numbers + currency/comparator context in any
+    # language. Keeps price filters working even when the routing/entity LLM
+    # drops them (e.g. "baniyan under 400", "400 rs ki range me", "500 tak").
+    if original_msg and out.get("min_price") is None and out.get("max_price") is None:
         try:
-            from services.opensearch_products import _extract_price_bounds
+            from services.opensearch_products import parse_price_bounds_from_text
 
-            pmax, pmin = _extract_price_bounds(original_msg, original_msg.lower())
-            if pmax is not None:
-                out["max_price"] = pmax
+            pmin, pmax = parse_price_bounds_from_text(original_msg)
             if pmin is not None:
                 out["min_price"] = pmin
+            if pmax is not None:
+                out["max_price"] = pmax
+        except ImportError:
+            pass
+
+    # If a budget leaked into the title (noisy Brain search_query like
+    # "baniyan under 400"), strip it so OpenSearch matches the product noun.
+    st = (out.get("search_terms") or "").strip()
+    if st and (out.get("min_price") is not None or out.get("max_price") is not None):
+        try:
+            from services.opensearch_products import strip_price_tokens_from_title
+
+            cleaned = strip_price_tokens_from_title(st)
+            if cleaned and cleaned.lower() != st.lower():
+                out["search_terms"] = cleaned
         except ImportError:
             pass
 

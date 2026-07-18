@@ -205,18 +205,7 @@ def _enrich_brain_entities_structural(
         except ImportError:
             pass
 
-    if e.get("price_max") is None and e.get("price_min") is None:
-        try:
-            from services.opensearch_products import _extract_price_bounds
-
-            comb_low = (original_msg or comb).lower()
-            pmax, pmin = _extract_price_bounds(original_msg or comb, comb_low)
-            if pmax is not None:
-                e["price_max"] = pmax
-            if pmin is not None:
-                e["price_min"] = pmin
-        except ImportError:
-            pass
+    # Price/budget — Brain JSON + Product NLU; no regex gap-fill.
 
     # Brand / colour / product_name — product NLU LLM only (no keyword brand lists).
 
@@ -262,6 +251,7 @@ def merge_session_product_understanding(
     msg_en: str = "",
     ctx=None,
     ai_route: Optional[dict] = None,
+    force: bool = False,
 ) -> dict:
     """Reuse last catalog spec when user sends a thin continuation (not a new product)."""
     out = dict(understanding or {})
@@ -271,11 +261,13 @@ def merge_session_product_understanding(
     if not last:
         return out
     route = ai_route if isinstance(ai_route, dict) else {}
-    if not _should_merge_session_catalog(
+    if not force and not _should_merge_session_catalog(
         out, route, original_msg=original_msg, msg_en=msg_en
     ):
         return out
-    if last.get("title_query") and not (out.get("search_terms") or "").strip():
+    if last.get("title_query") and (
+        force or not (out.get("search_terms") or "").strip()
+    ):
         out["search_terms"] = str(last["title_query"]).strip()
     for src, dst in (
         ("brand", "brand"),
@@ -283,8 +275,16 @@ def merge_session_product_understanding(
         ("size", "size"),
         ("category_id", "category_id"),
         ("product_type", "product_type"),
+        ("compatibility", "compatibility"),
+        ("audience_tokens", "audience"),
+        ("material_tokens", "material"),
+        ("occasion_tokens", "occasion"),
+        ("feature_tokens", "feature_tokens"),
+        ("quantity", "quantity"),
+        ("sort", "sort"),
+        ("in_stock_only", "in_stock_only"),
     ):
-        if last.get(src) and not out.get(dst):
+        if last.get(src) not in (None, "", [], {}) and not out.get(dst):
             out[dst] = last[src]
     for src, dst in (
         ("purchase_price_min", "min_price"),
@@ -339,6 +339,17 @@ def _structural_gap_ai_from_message(
         ("specific_accessory", "specific_accessory"),
         ("related_search_terms", "related_search_terms"),
         ("allow_related_fallback", "allow_related_fallback"),
+        ("compatibility", "compatibility"),
+        ("audience", "audience"),
+        ("audience_tokens", "audience"),
+        ("material", "material"),
+        ("material_tokens", "material"),
+        ("occasion", "occasion"),
+        ("occasion_tokens", "occasion"),
+        ("feature_tokens", "feature_tokens"),
+        ("quantity", "quantity"),
+        ("sort", "sort"),
+        ("in_stock_only", "in_stock_only"),
     ):
         v = locked.get(src)
         if v not in (None, "", []):
@@ -712,28 +723,48 @@ def build_catalog_spec_for_product_turn(
         spec.pop("_ai_single_pass", None)
 
     if spec.get("category_id"):
-        try:
-            from services.welfog_api import (
-                _user_explicitly_browses_category,
-                query_should_use_category_id_only,
-            )
-            from utils.helpers import _text_requests_category_product_browse
-
-            comb_cat = f"{original_msg or ''} {msg_en or ''}".strip()
-            category_browse = (
-                _text_requests_category_product_browse(comb_cat, ctx=ctx)
-                or _user_explicitly_browses_category(comb_cat)
-                or query_should_use_category_id_only(
-                    str(spec["category_id"]), comb_cat, ctx=ctx
-                )
-            )
-            if category_browse:
-                spec["title_query"] = ""
-                spec["_category_only_browse"] = True
-                spec.pop("brand_aliases", None)
-                spec.pop("brand_name_match_only", None)
-        except ImportError:
+        # Never wipe an AI-extracted product noun (e.g. "baniyan" / "tshirt") just
+        # because a department category_id was also inferred. Category-only browse
+        # is correct ONLY when the user asked for a whole department OR the AI
+        # explicitly said category_only_browse with an empty title. Wiping the
+        # title turns "500 rs range me bnaiyan" into a noisy Men-Fashion dump
+        # (socks/sunglasses) that ignores the product the customer named.
+        tq_keep = (spec.get("title_query") or "").strip()
+        ai_cat_only = bool(
+            (nlu or {}).get("category_only_browse")
+            or (locked_understanding or {}).get("category_only_browse")
+            or (ai_route or {}).get("category_only_browse")
+        )
+        if tq_keep and not ai_cat_only:
+            # Keep title + optional category as a soft filter — do not clear title.
             pass
+        else:
+            try:
+                from services.welfog_api import (
+                    _user_explicitly_browses_category,
+                    query_should_use_category_id_only,
+                )
+                from utils.helpers import _text_requests_category_product_browse
+
+                comb_cat = f"{original_msg or ''} {msg_en or ''}".strip()
+                category_browse = (
+                    ai_cat_only
+                    or _text_requests_category_product_browse(comb_cat, ctx=ctx)
+                    or _user_explicitly_browses_category(comb_cat)
+                    or (
+                        not tq_keep
+                        and query_should_use_category_id_only(
+                            str(spec["category_id"]), comb_cat, ctx=ctx
+                        )
+                    )
+                )
+                if category_browse:
+                    spec["title_query"] = ""
+                    spec["_category_only_browse"] = True
+                    spec.pop("brand_aliases", None)
+                    spec.pop("brand_name_match_only", None)
+            except ImportError:
+                pass
 
     return spec, nlu or gap
 
@@ -742,10 +773,10 @@ def apply_catalog_result_filters(products: list, spec: dict) -> list:
     """Post-filter + rank OpenSearch hits to match explicit user filters."""
     if not products or not spec:
         return products or []
+    if spec.get("_post_filters_applied"):
+        return list(products)
     from services.opensearch_products import (
         apply_catalog_post_filters,
-        filter_products_by_purchase_price,
-        filter_products_by_rating_range,
         filter_products_by_requested_color,
         _post_filter_mode_for_spec,
     )
@@ -758,13 +789,13 @@ def apply_catalog_result_filters(products: list, spec: dict) -> list:
         if color_filtered:
             out = color_filtered
 
+    # apply_catalog_post_filters already enforces colour/brand/price/rating/
+    # size-related mandatory tokens — do not re-run the price refresh twice.
     out = apply_catalog_post_filters(
         out,
         spec,
         post_filter_mode=_post_filter_mode_for_spec(spec),
     )
-    out = filter_products_by_purchase_price(out, spec)
-    out = filter_products_by_rating_range(out, spec)
 
     removed = before - len(out)
     if removed > 0:
@@ -918,22 +949,6 @@ def finalize_catalog_spec_for_api(
         spec = enrich_catalog_spec_from_user_turn(
             spec, original_msg, msg_en, ai_understanding=ai_understanding
         )
-    if _user_turn_mentions_price(comb) and not (
-        ai.get("max_price") is not None
-        or ai.get("min_price") is not None
-        or spec.get("purchase_price_max") is not None
-        or spec.get("purchase_price_min") is not None
-    ):
-        try:
-            from services.opensearch_products import _extract_price_bounds
-
-            pmax, pmin = _extract_price_bounds(original_msg or comb, comb.lower())
-            if pmax is not None:
-                spec["purchase_price_max"] = pmax
-            if pmin is not None and (pmax is None or float(pmin) < float(pmax)):
-                spec["purchase_price_min"] = pmin
-        except ImportError:
-            pass
 
     if spec.get("pro_id"):
         spec["title_query"] = ""

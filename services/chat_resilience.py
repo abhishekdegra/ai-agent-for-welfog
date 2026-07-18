@@ -327,8 +327,8 @@ def build_busy_reply_html(original_msg: str = "", reply_lang: str = "") -> str:
         user_msg,
         reply_lang,
         fallback_en=(
-            "We're experiencing very high traffic right now, so I couldn't complete your reply. "
-            "Please try again in a minute or two — thank you for your patience."
+            "Sorry — I could not finish that in time. "
+            "Please send your message again and I will reply right away."
         ),
     )
     if body.strip():

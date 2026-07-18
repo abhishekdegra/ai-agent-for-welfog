@@ -471,7 +471,9 @@ def _build_route_data_from_resolution(
             intent="product",
             data_channel="catalog",
             run_catalog_search=True,
-            search_query=sq,
+            category_only_browse=True,
+            category_browse=resolved.category_name or sq,
+            search_query="",
             reasoning=f"Products in category {resolved.category_name or sq}.",
         )
     out.pop("kb_keys", None)
@@ -512,6 +514,15 @@ def guard_reconcile_catalog_menu_route(
     if brain_res:
         log_reasoning(f"Guard catalog-menu: brain locked {brain_res.kind}.")
         return _build_route_data_from_resolution(brain_res, comb, route_data)
+    # Do not run catalog-menu verifier for clear product title searches.
+    # This avoids drifting "sneakers" into "fashion category" via extra LLM hops.
+    intent0 = (route_data.get("intent") or "").strip().lower()
+    ch0 = (route_data.get("data_channel") or "").strip().lower()
+    sq0 = (route_data.get("search_query") or "").strip().lower()
+    if intent0 in ("product", "product_search") and (ch0 == "catalog" or route_data.get("run_catalog_search")) and sq0:
+        menuish = bool(re.search(r"\b(categor\w*|catagor\w*|department|section|deal|offer|discount|promo|sale)\b", f"{comb.lower()} {sq0}"))
+        if not menuish:
+            return route_data
 
     needs_ai = (
         _should_invoke_catalog_menu_classifier(route_data, original_msg, msg_en)
@@ -580,6 +591,9 @@ def catalog_menu_route_decision(
     if resolved.kind == KIND_NONE:
         return None
 
+    if ctx is not None:
+        ctx.setdefault("data", {})["_catalog_menu_kind"] = resolved.kind
+
     combined = _combined(original_msg, msg_en)
     route_data = _build_route_data_from_resolution(resolved, combined, ai_route)
     why = reasoning or resolved.source or "catalog menu"
@@ -617,10 +631,15 @@ def catalog_menu_route_decision(
                 resolve_category_product_browse_route,
             )
 
-            if ctx:
+            if ctx is not None:
+                ctx.setdefault("data", {})["_catalog_menu_kind"] = KIND_CATEGORY_BROWSE
                 ensure_expanded_categories_map_for_ctx(ctx)
             browse_text = f"{combined} {resolved.category_name}".strip()
-            cat_browse = resolve_category_product_browse_route(browse_text, ctx=ctx)
+            cat_browse = resolve_category_product_browse_route(
+                browse_text,
+                ctx=ctx,
+                force_category_browse=True,
+            )
             if cat_browse:
                 cid, sq = cat_browse
                 if ctx is not None:

@@ -299,6 +299,24 @@ def slug_from_welfog_product_link(link: str) -> str:
     return (m.group(1) or "").strip() if m else ""
 
 
+def _landed_price_fields_from_catalog_row(raw: dict) -> dict[str, object]:
+    """purchase + shipping + display price from a live catalog API row."""
+    purchase = _parse_price_number(raw.get("purchase_price"))
+    ship = _shipping_cost_from_product(raw)
+    landed = customer_landed_price(raw)
+    display = format_customer_price_display(raw, "")
+    out: dict[str, object] = {}
+    if purchase is not None and purchase >= 0:
+        out["purchase_price"] = purchase
+    if ship is not None and ship >= 0:
+        out["shipping_cost"] = ship
+    if display != "":
+        out["price"] = display
+    elif landed is not None:
+        out["price"] = int(landed) if landed == int(landed) else landed
+    return out
+
+
 def sync_product_cards_prices_from_rest_api(
     cards: list,
     query: str,
@@ -306,46 +324,87 @@ def sync_product_cards_prices_from_rest_api(
     color=None,
     category_id=None,
 ) -> list:
-    """OpenSearch often has MRP in unit_price — refresh cards from live API main_price."""
-    if not cards or not (query or "").strip():
+    """OpenSearch often has stale MRP — refresh landed prices from live catalog API."""
+    return refresh_product_cards_landed_prices(
+        cards,
+        title_query=query,
+        color=color,
+        category_id=category_id,
+    )
+
+
+def refresh_product_cards_landed_prices(
+    cards: list,
+    *,
+    title_query: str = "",
+    color=None,
+    category_id=None,
+) -> list:
+    """
+    Align card purchase_price/shipping/display price with live catalog API.
+    Required before budget post-filters — OpenSearch index prices are often wrong.
+    """
+    if not cards:
         return cards
-    try:
-        params = {"page": 1, "latitude": "", "longitude": "", "name": (query or "").strip()}
-        if color:
-            params["color"] = color
-        if category_id:
-            params["category"] = str(category_id)
-        res = requests.get(_CATALOG_SEARCH_URL, params=params, timeout=12)
-        if res.status_code != 200:
-            return cards
-        by_slug: dict[str, object] = {}
-        by_name: dict[str, object] = {}
-        for raw in res.json().get("data") or []:
-            if not isinstance(raw, dict):
-                continue
-            price = format_customer_price_display(raw, "")
-            if price == "":
-                continue
-            slug = (raw.get("slug") or "").strip()
-            name = (raw.get("name") or "").strip().lower()
-            if slug:
-                by_slug[slug] = price
-            if name:
-                by_name[name] = price
-        out = []
-        for card in cards:
-            c = dict(card)
-            slug = slug_from_welfog_product_link(c.get("link") or "")
-            if slug and slug in by_slug:
-                c["price"] = by_slug[slug]
-            else:
-                nm = (c.get("name") or "").strip().lower()
-                if nm in by_name:
-                    c["price"] = by_name[nm]
-            out.append(c)
-        return out
-    except Exception:
-        return cards
+    by_slug: dict[str, dict[str, object]] = {}
+    by_name: dict[str, dict[str, object]] = {}
+    by_pro_id: dict[str, dict[str, object]] = {}
+
+    def _index_row(raw: dict) -> None:
+        if not isinstance(raw, dict):
+            return
+        fields = _landed_price_fields_from_catalog_row(raw)
+        if not fields:
+            return
+        slug = (raw.get("slug") or "").strip()
+        name = (raw.get("name") or "").strip().lower()
+        pid = raw.get("pro_id")
+        if slug:
+            by_slug[slug] = fields
+        if name:
+            by_name[name] = fields
+        if pid is not None and str(pid).strip():
+            by_pro_id[str(pid).strip()] = fields
+
+    q = (title_query or "").strip()
+    if q or color or category_id:
+        try:
+            params = {"page": 1, "latitude": "", "longitude": "", "name": q}
+            if color:
+                params["color"] = color
+            if category_id:
+                params["category"] = str(category_id)
+            res = requests.get(_CATALOG_SEARCH_URL, params=params, timeout=4)
+            if res.status_code == 200:
+                for raw in res.json().get("data") or []:
+                    _index_row(raw)
+        except Exception:
+            pass
+
+    # One bounded catalog name/color search (4s) is enough for budget post-filter.
+    # Never fan out per-pro_id REST pages here — those 12s calls stacked into 45s
+    # chat-deadline hangs. Cards that miss the batch keep their OpenSearch price;
+    # the post-filter still applies against that value.
+    out = []
+    for card in cards:
+        c = dict(card)
+        fields: dict[str, object] | None = None
+        slug = slug_from_welfog_product_link(c.get("link") or "")
+        if slug and slug in by_slug:
+            fields = by_slug[slug]
+        if fields is None:
+            nm = (c.get("name") or "").strip().lower()
+            if nm and nm in by_name:
+                fields = by_name[nm]
+        if fields is None:
+            pid = c.get("pro_id")
+            if pid is not None and str(pid).strip() in by_pro_id:
+                fields = by_pro_id[str(pid).strip()]
+        if fields:
+            for k, v in fields.items():
+                c[k] = v
+        out.append(c)
+    return out
 
 
 def fetch_api(endpoint, order_id, user_id=None):
@@ -1332,6 +1391,34 @@ def check_pincode_delivery(pincode):
         return {"result": None, "message": str(e), "error": "exception", "pincode": pin}
 
 
+def submit_support_contact(name, email, phone, message):
+    """
+    Forward an in-chat support request to the live Welfog contact API.
+    Server-to-server call (avoids browser CORS). Returns (status_code, payload_dict).
+    """
+    url = "https://welfogapi.welfog.com/api/contact"
+    body = {
+        "name": str(name or "").strip(),
+        "email": str(email or "").strip(),
+        "phone": str(phone or "").strip(),
+        "message": str(message or "").strip(),
+    }
+    try:
+        res = requests.post(url, json=body, timeout=15)
+        try:
+            data = res.json() if res.content else {}
+        except ValueError:
+            data = {"success": False, "message": "Invalid response from support service."}
+        if not isinstance(data, dict):
+            data = {"success": False, "message": "Unexpected support service response."}
+        return res.status_code, data
+    except requests.Timeout:
+        return 504, {"success": False, "message": "Support service timed out. Please retry."}
+    except Exception as e:
+        print(f"❌ Contact API Exception: {e}")
+        return 502, {"success": False, "message": "Could not reach support service. Please retry."}
+
+
 def fetch_nav_categories():
     try:
         url = "https://welfogapi.welfog.com/api/nav_cat_data"
@@ -1365,11 +1452,11 @@ _CATEGORY_BROWSE_FILLER = frozenset(
     {
         "mereko", "mujhe", "meko", "mere", "mera", "meri", "please", "plz",
         "product", "products", "item", "items", "show", "list", "dikhao", "dikha",
-        "dikhe", "dikhaa", "dekho", "dekh", "batao", "btao", "bata", "bta", "btana", "batana",
+        "dikhe", "dikhaa", "dika", "dekho", "dekh", "batao", "btao", "bata", "bta", "btana", "batana",
         "chahiye", "chiye", "category", "categories", "ke", "ki", "ka", "ko", "se",
         "me", "in", "all", "saare", "saari", "sab", "want", "need", "give", "dena",
         "lao", "la", "de", "do", "wale", "wali", "some", "any", "bhi", "also", "too",
-        "k", "pls", "yar", "yrr", "bhai", "na",
+        "k", "pls", "yar", "yrr", "yrrr", "bhai", "na", "bro", "yaar",
         # Store / channel name — not a product token when stripping for leftover intent.
         "welfog",
     }
@@ -1407,10 +1494,12 @@ def _expand_category_query_text(text: str) -> str:
     return t
 
 
-def _message_has_product_search_filters(text: str) -> bool:
+def _message_has_product_search_filters(text: str, ai_route: Optional[dict] = None) -> bool:
     """True when the turn targets a specific product (brand, type, color, price…) — not dept browse."""
     if not (text or "").strip():
         return False
+    if _message_has_structured_product_attrs(text, ai_route):
+        return True
     if _message_targets_specific_product(text):
         return True
     low = (text or "").lower()
@@ -1419,14 +1508,10 @@ def _message_has_product_search_filters(text: str) -> bool:
         return True
     try:
         from services.opensearch_products import (
-            _extract_price_bounds,
             color_hue_mentioned_in_text,
             normalize_color_fuzzy,
         )
 
-        pmax, pmin = _extract_price_bounds(text, low)
-        if pmax is not None or pmin is not None:
-            return True
         hue = normalize_color_fuzzy(low)
         if hue and color_hue_mentioned_in_text(hue, low):
             return True
@@ -1437,67 +1522,110 @@ def _message_has_product_search_filters(text: str) -> bool:
     return False
 
 
-def message_requests_category_browse(text: str) -> bool:
-    """True when user wants products from a named live-nav department (any language/style)."""
+def _ai_route_from_ctx(ctx=None) -> Optional[dict]:
+    if not isinstance(ctx, dict):
+        return None
+    route = (ctx.get("data") or {}).get("ai_route")
+    return route if isinstance(route, dict) else None
+
+
+def _brain_route_indicates_category_browse(ai_route: dict | None) -> bool:
+    """
+    Category browse intent comes from Brain / catalog-menu LLM JSON — never from
+    customer-language keyword leftover probes.
+    """
+    if not isinstance(ai_route, dict):
+        return False
+    if ai_route.get("category_only_browse"):
+        return True
+    cat = (ai_route.get("category_browse") or "").strip()
+    if not cat:
+        return False
+    entities = ai_route.get("entities") if isinstance(ai_route.get("entities"), dict) else {}
+    pe = ai_route.get("product_entities") or ai_route.get("_product_entities") or {}
+    if not isinstance(pe, dict):
+        pe = {}
+    if any(
+        (entities.get(k) or pe.get(k))
+        for k in (
+            "product_name",
+            "sku",
+            "pro_id",
+            "product_id",
+            "brand",
+            "color",
+            "size",
+            "model",
+            "product_type",
+        )
+    ):
+        return False
+    return True
+
+
+def _catalog_menu_ctx_indicates_category_browse(ctx=None) -> bool:
+    if not isinstance(ctx, dict):
+        return False
+    kind = ((ctx.get("data") or {}).get("_catalog_menu_kind") or "").strip().lower()
+    return kind == "category_browse"
+
+
+def message_requests_category_browse(
+    text: str,
+    ai_route: dict | None = None,
+    ctx=None,
+) -> bool:
+    """
+    True when Brain or catalog-menu LLM classified department product browse and
+    live nav resolves a category id. No customer-language keyword routing.
+    """
     if not (text or "").strip():
         return False
     try:
         from utils.helpers import message_asks_welfog_categories_list
 
-        # Full menu ask ("which categories exist") — not products inside one dept.
         if message_asks_welfog_categories_list(text):
             return False
     except ImportError:
         pass
 
-    if _message_has_product_search_filters(text):
+    ai_route = ai_route or _ai_route_from_ctx(ctx)
+    if not (
+        _brain_route_indicates_category_browse(ai_route)
+        or _catalog_menu_ctx_indicates_category_browse(ctx)
+    ):
         return False
-    if _message_has_concrete_product_intent(text):
-        return False
-    # Live nav / fuzzy department label match — no customer-language keyword lists.
-    return bool(resolve_nav_category_id_fast(text))
+
+    browse_text = (text or "").strip()
+    if isinstance(ai_route, dict) and (ai_route.get("category_browse") or "").strip():
+        browse_text = f"{browse_text} {ai_route.get('category_browse')}".strip()
+    return bool(resolve_nav_category_id_fast(browse_text, ctx))
 
 
-def _product_intent_probe_text(text: str) -> str:
-    """
-    Tokens left after removing live-nav department labels + browse filler.
-
-    Intent routing uses this leftover only — never typo/noun dictionaries —
-    so any language/style that resolves to a department still category-browses
-    when nothing product-specific remains.
-    """
-    stripped = _strip_message_for_category_lookup(text) or ""
-    leftover = set(re.findall(r"[a-z0-9]{3,}", stripped.lower()))
-    try:
-        nav = _get_nav_categories_map(None) or {}
-        cat_toks: set[str] = set()
-        for name in nav.keys():
-            cat_toks.update(re.findall(r"[a-z0-9]{3,}", (name or "").lower()))
-        leftover -= cat_toks
-    except Exception:
-        pass
-    leftover = {t for t in leftover if not _is_category_browse_filler_token(t)}
-    return " ".join(sorted(leftover)).strip()
-
-
-def _message_has_structured_product_attrs(text: str) -> bool:
-    """Brand / price / color / SKU — catalog filters, not language keyword maps."""
+def _message_has_structured_product_attrs(text: str, ai_route: Optional[dict] = None) -> bool:
+    """Brand / price / color / SKU — from Brain entities or catalog filters, not keyword maps."""
     if not (text or "").strip():
         return False
+    route = ai_route or {}
+    pe = route.get("product_entities") or route.get("_product_entities") or {}
+    if isinstance(pe, dict) and (
+        pe.get("price_min") is not None
+        or pe.get("price_max") is not None
+        or pe.get("color")
+        or pe.get("brand")
+        or pe.get("sku")
+    ):
+        return True
     low = (text or "").lower()
     words = set(re.findall(r"[a-z0-9]{3,}", low))
     if words & PHONE_BRANDS:
         return True
     try:
         from services.opensearch_products import (
-            _extract_price_bounds,
             color_hue_mentioned_in_text,
             normalize_color_fuzzy,
         )
 
-        pmax, pmin = _extract_price_bounds(text, low)
-        if pmax is not None or pmin is not None:
-            return True
         hue = normalize_color_fuzzy(low)
         if hue and color_hue_mentioned_in_text(hue, low):
             return True
@@ -1506,19 +1634,39 @@ def _message_has_structured_product_attrs(text: str) -> bool:
     return bool(re.search(r"\bsku\b", low))
 
 
-def _message_has_concrete_product_intent(text: str) -> bool:
+def _message_has_concrete_product_intent(
+    text: str,
+    ai_route: dict | None = None,
+    ctx=None,
+) -> bool:
     """
-    True when the turn asks for a specific item/filter — not bare department browse.
-
-    Production rule: live-nav labels + filler stripped; leftover empty ⇒ browse.
-    Any leftover token (any language/orthography) ⇒ product ask.
-    Typo/noun maps are intentionally not consulted here.
+    Product vs department browse — Brain / catalog-menu LLM only (+ catalog filters).
     """
     if not (text or "").strip():
         return False
-    if _message_has_structured_product_attrs(text):
+    ai_route = ai_route or _ai_route_from_ctx(ctx)
+    if _brain_route_indicates_category_browse(ai_route):
+        return False
+    if _catalog_menu_ctx_indicates_category_browse(ctx):
+        return False
+    if _message_has_structured_product_attrs(text, ai_route):
         return True
-    return bool(_product_intent_probe_text(text))
+    if isinstance(ai_route, dict):
+        pe = ai_route.get("product_entities") or ai_route.get("_product_entities") or {}
+        ent = ai_route.get("entities") if isinstance(ai_route.get("entities"), dict) else {}
+        if isinstance(pe, dict) and any(
+            (pe.get(k) or "").strip()
+            for k in ("product_name", "sku", "pro_id", "product_id", "brand", "model", "product_type")
+        ):
+            return True
+        if isinstance(ent, dict) and any(
+            (ent.get(k) or "").strip() for k in ("product_name", "sku", "pro_id", "product_id")
+        ):
+            return True
+        sq = (ai_route.get("search_query") or "").strip()
+        if sq and not ai_route.get("category_only_browse"):
+            return True
+    return False
 
 
 def resolve_nav_category_id_fast(text: str, ctx=None) -> Optional[str]:
@@ -1580,33 +1728,53 @@ def resolve_category_browse_for_catalog(
     ctx=None,
     *,
     allow_inner_lookup: bool = True,
+    ai_route: dict | None = None,
+    force_category_browse: bool = False,
 ) -> Optional[tuple[str, str]]:
     """
     Category-only or category-first browse — nav-fast first, inner tree only when needed.
     Returns (category_id, product_search_query); empty query = whole department.
     """
-    if not message_requests_category_browse(text):
+    ai_route = ai_route or _ai_route_from_ctx(ctx)
+    if force_category_browse:
+        try:
+            from utils.helpers import message_asks_welfog_categories_list
+
+            if message_asks_welfog_categories_list(text):
+                return None
+        except ImportError:
+            pass
+    elif not message_requests_category_browse(text, ai_route=ai_route, ctx=ctx):
         return None
-    if _message_has_product_search_filters(text):
+    if _message_has_structured_product_attrs(text, ai_route) and not force_category_browse:
         return None
-    cid = resolve_nav_category_id_fast(text, ctx)
-    if not cid and allow_inner_lookup and _user_explicitly_browses_category(text):
+    browse_text = (text or "").strip()
+    if isinstance(ai_route, dict) and (ai_route.get("category_browse") or "").strip():
+        browse_text = f"{browse_text} {ai_route.get('category_browse')}".strip()
+    cid = resolve_nav_category_id_fast(browse_text, ctx)
+    if not cid and allow_inner_lookup and (
+        force_category_browse
+        or _user_explicitly_browses_category(browse_text, ai_route=ai_route, ctx=ctx)
+    ):
         if ctx:
             ensure_expanded_categories_map_for_ctx(ctx)
-        cid = _resolve_inner_category_id(text, ctx)
+        cid = _resolve_inner_category_id(browse_text, ctx)
     if not cid:
         return None
-    if not is_top_level_main_category(cid, ctx) and not _user_explicitly_browses_category(text):
+    if not is_top_level_main_category(cid, ctx) and not (
+        force_category_browse
+        or _user_explicitly_browses_category(browse_text, ai_route=ai_route, ctx=ctx)
+    ):
         return None
     sq = ""
-    if _message_targets_specific_product(text):
+    if _message_targets_specific_product(browse_text, ai_route=ai_route, ctx=ctx):
         from utils.helpers import extract_product_search_query
 
-        sq = (extract_product_search_query(text, text, "") or "").strip()
-        if query_should_use_category_id_only(cid, sq or text, ctx):
-            sq = category_browse_search_name(cid, sq or text, ctx) or sq
+        sq = (extract_product_search_query(browse_text, browse_text, "") or "").strip()
+        if query_should_use_category_id_only(cid, sq or browse_text, ctx):
+            sq = category_browse_search_name(cid, sq or browse_text, ctx) or sq
     else:
-        sq = category_browse_search_name(cid, text, ctx)
+        sq = category_browse_search_name(cid, browse_text, ctx)
     return str(cid), sq
 
 
@@ -2275,9 +2443,9 @@ def _is_category_browse_filler_token(tok: str) -> bool:
             return False
     except ImportError:
         pass
-    # Morphological extensions of filler stems (≥4 chars): dekh→dekhne, dikha→dikhao.
+    # Morphological extensions of filler stems (≥3 chars): dekh→dekhne, yrr→yrrr.
     for f in _CATEGORY_BROWSE_FILLER:
-        if len(f) >= 4 and len(t) > len(f) and t.startswith(f):
+        if len(f) >= 3 and len(t) > len(f) and t.startswith(f):
             return True
     # Truncated verb stems (bta←bata/batao) — token is a prefix of a filler word.
     if len(t) >= 3:
@@ -2476,31 +2644,39 @@ def _should_ignore_wrong_covers_category(text: str, category_id: str) -> bool:
     return False
 
 
-def _user_explicitly_browses_category(text: str) -> bool:
+def _user_explicitly_browses_category(
+    text: str,
+    ai_route: dict | None = None,
+    ctx=None,
+) -> bool:
     """
-    User named a live Welfog department (from nav API), not a concrete SKU ask.
-    No language/phrase keyword maps — department match is dynamic catalog labels.
+    Brain / catalog-menu LLM marked department browse and live nav resolves a dept.
     """
     if not (text or "").strip():
         return False
-    expanded = _expand_category_query_text(text)
-    hint = _main_category_hint_from_text(text) or _main_category_hint_from_text(
+    ai_route = ai_route or _ai_route_from_ctx(ctx)
+    if not (
+        _brain_route_indicates_category_browse(ai_route)
+        or _catalog_menu_ctx_indicates_category_browse(ctx)
+    ):
+        return False
+    browse_text = (text or "").strip()
+    if isinstance(ai_route, dict) and (ai_route.get("category_browse") or "").strip():
+        browse_text = f"{browse_text} {ai_route.get('category_browse')}".strip()
+    expanded = _expand_category_query_text(browse_text)
+    hint = _main_category_hint_from_text(browse_text) or _main_category_hint_from_text(
         expanded
     )
-    if not hint:
-        return False
-    return not _message_has_concrete_product_intent(text)
+    return bool(hint or resolve_nav_category_id_fast(browse_text, ctx))
 
 
-def _message_targets_specific_product(text: str) -> bool:
-    """
-    True when the message names something beyond bare department browse.
-
-    Production rule (no customer-language / typo dictionaries):
-    leftover after live-nav label + filler strip ⇒ product search.
-    Empty leftover + named department ⇒ department browse.
-    """
-    return _message_has_concrete_product_intent(text)
+def _message_targets_specific_product(
+    text: str,
+    ai_route: dict | None = None,
+    ctx=None,
+) -> bool:
+    """Product item ask vs department browse — delegated to Brain/catalog-menu classification."""
+    return _message_has_concrete_product_intent(text, ai_route=ai_route, ctx=ctx)
 
 
 def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]:
@@ -2512,7 +2688,7 @@ def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]
 
     ctx = ctx or {}
 
-    if _message_has_product_search_filters(text):
+    if _message_has_product_search_filters(text, _ai_route_from_ctx(ctx)):
         return None
 
     # Fresh category browse in this message always wins over sticky prior dept.
@@ -2525,6 +2701,22 @@ def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]
 
     prior = (ctx.get("data") or {}).get("selected_category_id")
     if prior:
+        # Sticky category is only for follow-ups like "aur dikhao" where no new
+        # product signal appears. Fresh product terms must search full catalog.
+        try:
+            from utils.helpers import extract_product_search_query
+
+            q = (extract_product_search_query(text, text, "") or "").strip()
+        except Exception:
+            q = ""
+        if _message_has_structured_product_attrs(text, _ai_route_from_ctx(ctx)):
+            return None
+        if q:
+            toks = [t for t in re.findall(r"[a-z0-9]{3,}", q.lower()) if t not in GENERIC_QUERY_TOKENS]
+            if toks:
+                return None
+        if _message_targets_specific_product(text, ctx=ctx):
+            return None
         return str(prior)
 
     if not cid:
@@ -2539,12 +2731,21 @@ def resolve_category_id_for_product_search(text: str, ctx=None) -> Optional[str]
 def resolve_category_product_browse_route(
     text: str,
     ctx=None,
+    *,
+    ai_route: dict | None = None,
+    force_category_browse: bool = False,
 ) -> Optional[tuple[str, str]]:
     """
     User wants products filtered by a Welfog category name (not the full category list).
     Returns (category_id, product_search_query) — empty query means category-only browse.
     """
-    return resolve_category_browse_for_catalog(text, ctx, allow_inner_lookup=True)
+    return resolve_category_browse_for_catalog(
+        text,
+        ctx,
+        allow_inner_lookup=True,
+        ai_route=ai_route,
+        force_category_browse=force_category_browse,
+    )
 
 
 def resolve_search_category_id(category_id: str, ctx=None) -> str:

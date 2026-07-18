@@ -1004,7 +1004,101 @@ def _ai_meaning_denies_order_tracking(blob: str) -> bool:
     )
 
 
-def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
+def promote_brain_department_browse_route(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    ctx=None,
+) -> dict:
+    """
+    Brain often puts a live-nav department label in search_query/product_name
+    (electronics, home kitchen) without category_only_browse. Promote to
+    category-id catalog browse using live nav API — not customer keyword lists.
+    """
+    import re
+
+    out = dict(route or {})
+    if out.get("category_only_browse") or (out.get("category_browse") or "").strip():
+        return out
+
+    pe = out.get("product_entities") if isinstance(out.get("product_entities"), dict) else {}
+    pe2 = out.get("_product_entities") if isinstance(out.get("_product_entities"), dict) else {}
+    named = (
+        (pe.get("product_name") or "").strip()
+        or (pe2.get("product_name") or "").strip()
+        or (out.get("search_query") or "").strip()
+    )
+    if not named:
+        return out
+
+    combined = f"{original_msg or ''} {msg_en or ''}".strip()
+    um = f"{out.get('user_meaning') or ''} {out.get('reasoning') or ''}".strip().lower()
+    try:
+        from services.welfog_api import (
+            _message_has_structured_product_attrs,
+            category_name_for_id,
+            resolve_nav_category_id_fast,
+        )
+    except ImportError:
+        return out
+
+    if combined and _message_has_structured_product_attrs(combined):
+        return out
+    # Promote only when the turn explicitly frames a department/category browse.
+    # Prevent product asks like "show best sneakers" from collapsing to Fashion.
+    low_comb = (combined or "").lower()
+    category_frame = (
+        bool(re.search(r"\b(categor\w*|catagor\w*|department|section)\b", low_comb))
+        or bool(re.search(r"\b(categor\w*|catagor\w*|department|section)\b", um))
+        or bool(out.get("_catalog_menu_locked"))
+        or bool((out.get("category_browse") or "").strip())
+    )
+    if not category_frame:
+        return out
+
+    cid_named = resolve_nav_category_id_fast(named, ctx)
+    if not cid_named:
+        return out
+
+    cid_msg = resolve_nav_category_id_fast(combined or named, ctx) if combined else cid_named
+    if not cid_msg or str(cid_msg) != str(cid_named):
+        return out
+
+    label = (category_name_for_id(str(cid_named), ctx) or named).strip()
+    out["category_only_browse"] = True
+    out["category_browse"] = label
+    out["search_query"] = ""
+    out["intent"] = "product"
+    out["data_channel"] = "catalog"
+    out["run_catalog_search"] = True
+    out["_product_catalog_locked"] = True
+    out["needs_order_id"] = False
+    out["order_lookup_kind"] = "none"
+    out["conversation_scope"] = "welfog_support"
+    out["scope_reply"] = ""
+    for key in ("product_entities", "_product_entities"):
+        bag = out.get(key)
+        if isinstance(bag, dict):
+            cleaned = dict(bag)
+            cleaned.pop("product_name", None)
+            cleaned["category"] = label
+            cleaned["category_id"] = str(cid_named)
+            out[key] = cleaned
+    log_reasoning(
+        f"Brain department browse promoted — {label!r} (id={cid_named}) "
+        "via live nav, not title search."
+    )
+    return out
+
+
+def reconcile_category_browse_from_brain_meaning(
+    route: dict | None,
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+    ctx=None,
+) -> dict:
     """
     Trust Brain JSON when customer wants category/department products but intent
     drifted to KB/chitchat/delivery.
@@ -1013,6 +1107,14 @@ def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
     product_name) — no apparel/department keyword tables here.
     """
     out = dict(route or {})
+    out = promote_brain_department_browse_route(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        ctx=ctx,
+    )
+    if out.get("category_only_browse"):
+        return out
     um = (out.get("user_meaning") or "").strip().lower()
     if not um:
         return out
@@ -1049,9 +1151,15 @@ def reconcile_category_browse_from_brain_meaning(route: dict | None) -> dict:
         (pe.get("product_name") or "").strip()
         or (out.get("search_query") or "").strip()
     )
-    # Brain already named a product title and did not mark category-only → keep
-    # product search (vernacular → NLU). Do not invent department-only browse.
     if named and not out.get("category_only_browse"):
+        promoted = promote_brain_department_browse_route(
+            out,
+            original_msg=original_msg or um,
+            msg_en=msg_en,
+            ctx=ctx,
+        )
+        if promoted.get("category_only_browse"):
+            return promoted
         out["intent"] = "product"
         out["data_channel"] = "catalog"
         out["run_catalog_search"] = True
@@ -2366,18 +2474,6 @@ def _repair_brain_product_entities(
         pn = re.sub(r"\b(?:under|below|upto|above|over)\s*\d+.*$", "", pn, flags=re.I).strip()
         pn = re.sub(r"\b\d+\s*(?:rs|rupees?|inr)\b", "", pn, flags=re.I).strip()
         pn = re.sub(r"\s+", " ", pn).strip()
-
-    if out.get("price_max") is None and out.get("price_min") is None and original_msg:
-        try:
-            from services.opensearch_products import _extract_price_bounds
-
-            pmax, pmin = _extract_price_bounds(original_msg, original_msg.lower())
-            if pmax is not None:
-                out["price_max"] = pmax
-            if pmin is not None:
-                out["price_min"] = pmin
-        except ImportError:
-            pass
 
     if not out.get("size") and re.search(
         r"\b(kids?|children|son|daughter|little)\b", brain_blob, re.I
@@ -4773,7 +4869,12 @@ def enrich_universal_brain_route(
     out = infer_order_lookup_from_brain_english_fields(out)
     out = reconcile_order_sub_intent_from_brain_json(out)
     out = reconcile_invoice_from_brain_meaning(out)
-    out = reconcile_category_browse_from_brain_meaning(out)
+    out = reconcile_category_browse_from_brain_meaning(
+        out,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        ctx=ctx,
+    )
     out = finalize_order_lookup_from_brain_json(out)
     out = lock_order_live_api_from_brain(
         out,

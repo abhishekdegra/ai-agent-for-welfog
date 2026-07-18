@@ -242,17 +242,54 @@ def message_eligible_for_product_ai_flow(
 
 
 def _groq_product_search_json(system_prompt: str, user_payload: str) -> Optional[dict]:
-    from services.llm_providers import llm_json_chat_completion
+    from services.llm_providers import (
+        get_fast_structured_provider_chain,
+        llm_json_with_provider_fallback,
+    )
 
-    return llm_json_chat_completion(
+    # Prefer Groq, but keep one fallback provider — a single 4s timeout must not
+    # drop the whole slot-filler (that was stuffing size/color into the title).
+    providers = get_fast_structured_provider_chain(max_providers=2)
+    if not providers:
+        return None
+    data = llm_json_with_provider_fallback(
+        providers,
         [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_payload},
         ],
-        max_tokens=420,
-        timeout_sec=14,
-        max_attempts=3,
+        # The complete entity/clarification schema is intentionally richer than
+        # the old filter-only payload. Keep enough output budget so fast models do
+        # not silently truncate the trailing confidence/clarification fields.
+        max_tokens=700,
+        timeout_sec=4,
+        max_attempts=1,
     )
+    if not isinstance(data, dict):
+        return None
+
+    # Strict schema gate: small models can occasionally answer the API-knowledge
+    # examples with fabricated product rows instead of extracting search entities.
+    # Never pass invented products to OpenSearch; reject and let the existing
+    # deterministic parser use the Brain-locked route/query.
+    requests = data.get("product_requests")
+    valid_requests = isinstance(requests, list) and any(
+        isinstance(item, dict)
+        and bool((item.get("search_terms") or item.get("label") or "").strip())
+        for item in requests
+    )
+    valid_single = bool((data.get("search_terms") or "").strip())
+    action = (data.get("action") or "").strip().lower()
+    valid_non_search = action in ("not_shopping", "clarify")
+    if (
+        "products" in data
+        or not (valid_single or valid_requests or valid_non_search)
+    ):
+        log_reasoning(
+            "Product search AI schema rejected — use safe route/entity fallback."
+        )
+        return None
+    return data
 
 
 def ai_understand_product_search(
@@ -260,19 +297,18 @@ def ai_understand_product_search(
     conversation_context: str = "",
     reply_lang: str = "en",
 ) -> Optional[dict]:
-    api_kb = get_product_search_api_knowledge_context()
-    system_prompt = f"""You are Welfog's product-search specialist. Read the PRODUCT SEARCH API KNOWLEDGE BASE.
+    # The old full API-KB dump contained legacy JSON examples (`action=search`,
+    # `response=...`) that overrode the current schema in small fast models. The
+    # entity extractor only needs the canonical catalog contract below; product
+    # and support KB retrieval remain untouched elsewhere.
+    system_prompt = f"""You are Welfog's product-search specialist.
 Return ONLY valid JSON.
-
-PRODUCT SEARCH API KNOWLEDGE BASE:
-\"\"\"
-{api_kb}
-\"\"\"
 
 JSON SCHEMA:
 {{
   "reasoning": "1-3 lines",
   "action": "search_products" | "not_shopping" | "clarify",
+  "recommendation_suggestions": ["2-4 concrete searchable product/category ideas when goal is clear but product is not"],
   "product_requests": [
     {{
       "label": "short display name e.g. iPhone cover",
@@ -283,12 +319,20 @@ JSON SCHEMA:
       "mandatory_match_tokens": [],
       "product_type": "cover, shirt, etc.",
       "size": "catalog size ONLY — 10, Free Size, M, XL — NEVER in search_terms",
+      "compatibility": "device/model this item must fit, e.g. iPhone 15 Pro, else empty",
+      "audience": ["semantic audience constraints: women, men, kids, student, gifting..."],
+      "material": ["materials explicitly requested or confidently inferred"],
+      "occasion": ["occasion/use-case constraints: gym, travel, birthday, winter..."],
+      "feature_tokens": ["searchable features the product must have"],
+      "quantity": "requested pack/count or null",
       "exclude_title_tokens": [],
       "match_mode": "strict" | "universal",
       "max_price": number or null,
       "min_price": number or null,
       "rating_min": number or null,
       "rating_max": number or null,
+      "sort": "relevance" | "price_asc" | "price_desc" | "rating_desc",
+      "in_stock_only": true when availability is required,
       "sku": "for this item only or empty",
       "pro_id": "for this item only or null"
     }}
@@ -302,6 +346,12 @@ JSON SCHEMA:
   "mandatory_match_tokens": ["product type / feature tokens required in title — e.g. cover, velvet"],
   "product_type": "main item noun (cover, shirt, rice, charger) or empty",
   "size": "size filter only — e.g. 10, Free Size, M, XL — empty if not asked. NEVER put size in search_terms.",
+  "compatibility": "device/model the item must fit; empty when not applicable",
+  "audience": ["semantic audience/gender/recipient constraints"],
+  "material": ["requested material constraints"],
+  "occasion": ["occasion/use-case constraints"],
+  "feature_tokens": ["searchable required features"],
+  "quantity": "requested pack/count or null",
   "exclude_title_tokens": ["phrases to EXCLUDE from titles, e.g. lg velvet when user wants velvet material cover"],
   "pro_id": "numeric catalog product id if user gave one, else null",
   "category_browse": "English category name when user browses a whole category (electronics, fashion, grocery, home, beauty) — empty if not category browse",
@@ -311,6 +361,13 @@ JSON SCHEMA:
   "min_price": number or null,
   "rating_min": number or null (e.g. 4 for 4+ stars; 0.01 when user wants any rated product above zero),
   "rating_max": number or null (e.g. 3 for under 3 stars / low rating browse),
+  "sort": "relevance" | "price_asc" | "price_desc" | "rating_desc",
+  "in_stock_only": true when user requires currently available products,
+  "confidence": number from 0 to 1 for the extracted shopping request,
+  "clarification_required": true only when one missing attribute materially changes results,
+  "clarification_slot": "single missing attribute name, e.g. compatibility",
+  "clarification_question": "ONE short high-value question in the customer's language",
+  "clarification_declined": true when user says any/random/no preference/show anything,
   "sku": "warehouse SKU ONLY if user explicitly said SKU/product code or pasted a real code (e.g. SSKKOO, TP-SamsungS25) — NEVER chahiye/dikhao/batana or any Hindi/English verb",
   "is_shopping": true/false
 }}
@@ -324,7 +381,10 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - MEANING FIRST (industry): Understand the LATEST message + RECENT CONVERSATION semantically — ANY language/script, typos, slang, long paragraphs, indirect phrasing. User may ask in 1000 different ways; infer intent from meaning, NOT from matching Hindi/English keyword lists. Do NOT echo the full user sentence into search_terms. Your JSON is the ONLY source for color, price, rating, brand, size, SKU, pro_id.
 - NEVER put conversational words in sku (chahiye, dikhao, batana, please, milega, shaadi, mast, …) — sku is ONLY a warehouse code with digits or explicit "SKU ABC123" from the user.
 - ALL FILTERS: Put every constraint the user meant into the correct JSON field (top-level or per product_requests[]). Long message with price + colour + product + rating → fill all fields. Multiple products with different filters → separate product_requests[] rows each with their own color/max_price/rating_min/etc.
-- NEW TURN WINS: If the user changes product type or colour, do NOT carry old budget/price from chat unless they say same/wahi/pehle wala/usi range. Colour-only follow-up → update color, keep search_terms from context.
+- SEMANTIC ATTRIBUTES: Extract compatibility/model, audience/recipient, material, occasion/use case, features, quantity, availability and sort in the SAME pass. Hidden intent may be inferred only when confidence is high (girlfriend→women, father→men, baby→kids, college→student, gym→sports, travel→travel, birthday→gifting, winter→winter). Put only catalog-searchable constraints into feature/material/audience/occasion fields.
+- SMART CLARIFICATION: Search immediately when product + constraints are sufficiently specific. Ask ONE question only when a missing attribute materially changes compatibility or result quality. Example: "iPhone cover" without a model → clarification_required=true, clarification_slot=compatibility, ask which iPhone model. Never ask multiple questions. If user says any/random/no preference/tum hi dikha do, set clarification_declined=true and search immediately; do not ask again.
+- RECOMMENDATION: When the shopping goal/occasion is clear but no exact product is named, set recommendation_suggestions to 2-4 concrete searchable product/category ideas (not generic "gift/products"). Do not ask a confusing clarification.
+- NEW TURN WINS: An explicit new product starts a new search and must not inherit stale filters. A FILTER-ONLY follow-up (colour, size, budget, rating, brand, material, feature, premium/cheap, availability, sort) automatically updates the cached shopping product even when the user does not say same/wahi. Colour-only follow-up → update color, keep search_terms from context.
 - PRO_ID: numeric product id in message → pro_id field set, search_terms="" brand="" sku="" — never search words like dikhao/dikhoa/id.
 - CATEGORY BROWSE: "electronics ke products", "fashion dikhao" → category_browse=electronics/fashion, category_only_browse=true, search_terms="" unless user also named a product type.
 - COLOUR (any language/script): Map semantically to catalog color — Black, White, Green, Grey, Sky Blue, etc. CSS names (DarkSlateGray), Hindi (kala, neeli), Tamil/Telugu, typos — YOU decide the catalog colour; never hardcode phrase lists in search_terms.
@@ -349,11 +409,11 @@ RULES (dynamic — full Welfog ecommerce: fashion, grocery, electronics, home, b
 - OpenSearch uses: title_query, color, brand, brand_aliases, sku, pro_id, purchase_price min/max (customer pays purchase_price + shipping_cost on cards — NOT unit_price/MRP), size, category.
 - max_price / min_price in JSON → purchase_price_max / purchase_price_min (landed price = purchase + shipping) — ONLY when user asked for rupees/budget, NEVER for star/rating thresholds.
 - rating_min / rating_max in JSON for star filters — NEVER put star numbers in min_price/max_price.
-- PRICE-ONLY browse (critical): "under 500 rs", "500 se kam wale item", "under 190" → max_price/min_price ONLY; search_terms="" brand="" — do NOT add Samsung/mobile/cover from old chat unless user said wahi/same/pehle wala product.
+- PRICE-ONLY browse (critical): With NO cached shopping state, "under 500 rs" / "500 se kam wale item" is a catalog-wide budget browse (empty search_terms). With a cached product, the same filter-only message automatically keeps the cached search_terms and updates max_price/min_price.
 - BUDGET + PRODUCT (critical): "I have 150 rs show mobile covers", "190 rs budget mobile cover in this range", "under 300 sports shoes" → search_terms=mobile cover / sports shoes (product noun only), max_price=150/190/300, brand="" unless user named brand THIS message.
 - Never copy brand from RECENT CONVERSATION unless user repeats that brand in the LATEST message.
 - RATING filter: set rating_min / rating_max ONLY when the LATEST message explicitly mentions stars/rating — otherwise null. NEVER default rating_min=0.01 or rating_max=5. "4 star wale" → rating_min=4; "under 3 rating" → rating_max=3. Colour/price-only messages → rating fields MUST be null.
-- PRICE filter: set max_price/min_price ONLY when the LATEST message mentions rs/rupees/budget/under/over price — otherwise null. NEVER copy 150/200 from old chat unless user repeats budget this message.
+- PRICE filter: set max_price/min_price when the latest message expresses a budget. On a filter-only follow-up, keep the cached product title but replace its old budget with the latest bound. On an explicit new-product message, do not carry the old budget.
 - PRO_ID: numeric product id in message → pro_id field set, search_terms="" brand="" sku="" — never search words like dikhao/dikhoa/id.
 - CATEGORY BROWSE: whole-category asks → category_browse=English category name, category_only_browse=true, search_terms="" unless user also named a product type.
 - not_shopping: orders, tracking, policies, purchase history / past orders list / "products I bought" / "is id se purchase" — is_shopping=false, action=not_shopping.
@@ -1175,6 +1235,20 @@ def _request_dict_to_ai_understanding(req: dict) -> dict:
         "match_mode": req.get("match_mode") or ("strict" if req.get("brand") else "universal"),
         "is_shopping": True,
     }
+    for key in (
+        "compatibility",
+        "audience",
+        "material",
+        "occasion",
+        "feature_tokens",
+        "quantity",
+        "recommendation_suggestions",
+        "sort",
+        "in_stock_only",
+    ):
+        value = req.get(key)
+        if value not in (None, "", [], {}):
+            out[key] = value
     for src, dst in (
         ("max_price", "max_price"),
         ("min_price", "min_price"),
@@ -1440,6 +1514,593 @@ def _run_multi_product_catalog_search(
         f"{len(all_products)} cards, missing={missing_labels}"
     )
     return ProductFlowResult(handled=True, reply_html=response_text, intent="product")
+
+
+def _slot_fill_product_entities(
+    original_msg: str,
+    msg_en: str,
+    conversation_context: str,
+    reply_lang: str,
+    brain_understanding: dict,
+) -> dict:
+    """Two-stage NLU: Brain routed intent → dedicated fast extractor fills the
+    product name + EVERY filter (colour/size/price/rating/brand/…) as strict JSON.
+
+    Fast models used for Brain routing frequently stuff filter words into the
+    search query and leave price/colour/size empty. This bounded slot-filler
+    (one Groq structured call, ~1-2s) reliably extracts them in any language/
+    style — no keyword lists. Brain entities remain a fallback when the
+    extractor is unavailable or declines the turn.
+    """
+    merged = dict(brain_understanding or {})
+    try:
+        llm = ai_understand_product_search(
+            # Brain/translation already provides an English semantic form for
+            # multilingual turns. Use it for catalog entities while reply_lang
+            # independently preserves the customer's response language.
+            msg_en or original_msg,
+            conversation_context,
+            reply_lang,
+        )
+    except Exception:
+        llm = None
+
+    action = (llm or {}).get("action", "search_products")
+    if not isinstance(llm, dict) or action == "not_shopping":
+        return merged
+
+    payload = dict(llm)
+    requests = payload.get("product_requests")
+    if isinstance(requests, list) and len(requests) == 1 and isinstance(requests[0], dict):
+        try:
+            for k, v in _request_dict_to_ai_understanding(requests[0]).items():
+                if v not in (None, "", []):
+                    payload[k] = v
+        except Exception:
+            pass
+
+    # Extractor is the source of truth for the searchable noun + all filters.
+    overlay_keys = (
+        "search_terms",
+        "color",
+        "size",
+        "brand",
+        "brand_aliases",
+        "product_type",
+        "mandatory_match_tokens",
+        "exclude_title_tokens",
+        "related_search_terms",
+        "allow_related_fallback",
+        "match_mode",
+        "compatibility",
+        "audience",
+        "material",
+        "occasion",
+        "feature_tokens",
+        "quantity",
+        "sort",
+        "in_stock_only",
+        "max_price",
+        "min_price",
+        "rating_min",
+        "rating_max",
+        "confidence",
+        "clarification_required",
+        "clarification_slot",
+        "clarification_question",
+        "clarification_declined",
+        "sku",
+        "pro_id",
+    )
+    for k in overlay_keys:
+        v = payload.get(k)
+        if v not in (None, "", []):
+            merged[k] = v
+
+    # Schema safety net: the AI may correctly identify a compatibility-sensitive
+    # item but omit the clarification flags. A generic compatibility value that
+    # merely repeats the brand/platform (no concrete model/number) is semantically
+    # incomplete. This is attribute-based, not a hardcoded product-name rule.
+    compatibility = str(merged.get("compatibility") or "").strip()
+    product_type = str(merged.get("product_type") or "").strip()
+    brand = str(merged.get("brand") or "").strip()
+    search_terms = str(merged.get("search_terms") or "").strip()
+    compat_words = re.findall(r"[a-z0-9]+", compatibility.lower())
+    search_words = set(re.findall(r"[a-z0-9]+", search_terms.lower()))
+    generic_compatibility = bool(
+        compatibility
+        and product_type
+        and not re.search(r"\d", compatibility)
+        and (
+            compatibility.lower() == brand.lower()
+            or (len(compat_words) == 1 and compat_words[0] in search_words)
+        )
+    )
+    if generic_compatibility and not merged.get("clarification_declined"):
+        merged["clarification_required"] = True
+        merged["clarification_slot"] = "compatibility"
+        merged.setdefault("confidence", 0.7)
+        if not merged.get("clarification_question"):
+            question = "Which exact device or model should it be compatible with?"
+            if (reply_lang or "").lower() == "hinglish":
+                question = "Ye kis exact device ya model ke liye chahiye?"
+            elif (reply_lang or "").lower() not in ("", "en"):
+                question = localize_for_customer(question, reply_lang)
+            merged["clarification_question"] = question
+
+    # Only accept category browse when the extractor clearly said so AND left the
+    # product title empty. Otherwise "bnaiyan under 500" must not become a
+    # Men-Fashion department dump via a hallucinated category_browse field.
+    st = (merged.get("search_terms") or payload.get("search_terms") or "").strip()
+    if payload.get("category_only_browse") and not st:
+        merged["category_only_browse"] = True
+        if payload.get("category_browse"):
+            merged["category_browse"] = payload["category_browse"]
+    else:
+        merged.pop("category_only_browse", None)
+        merged.pop("category_browse", None)
+
+    merged["is_shopping"] = True
+    merged["action"] = "clarify" if action == "clarify" else "search_products"
+    merged["_ai_first"] = True
+    merged["_product_nlu_from_ai"] = True
+    return merged
+
+
+def _shopping_clarification_context(ctx: Optional[dict]) -> tuple[dict, str]:
+    """Return pending clarification state + compact context for the two AI passes."""
+    if not isinstance(ctx, dict):
+        return {}, ""
+    pending = dict((ctx.get("data") or {}).get("pending_product_clarification") or {})
+    if not pending:
+        return {}, ""
+    base = dict(pending.get("understanding") or {})
+    slot = (pending.get("slot") or "").strip()
+    question = (pending.get("question") or "").strip()
+    summary = (
+        "PENDING SHOPPING CLARIFICATION:\n"
+        f"Product state: {json.dumps(base, ensure_ascii=False, separators=(',', ':'))[:900]}\n"
+        f"Missing slot: {slot or 'one high-value attribute'}\n"
+        f"Question already asked: {question}\n"
+        "The latest user message answers or declines this question. Merge it into the "
+        "product state and SEARCH now. Do not ask the same question again."
+    )
+    return pending, summary
+
+
+def _store_product_clarification(
+    ctx: Optional[dict],
+    understanding: dict,
+    *,
+    question: str,
+    slot: str,
+) -> None:
+    if not isinstance(ctx, dict):
+        return
+    safe_understanding = {
+        k: v
+        for k, v in dict(understanding or {}).items()
+        if not str(k).startswith("_")
+        and k
+        not in {
+            "reasoning",
+            "clarification_question",
+            "clarification_required",
+            "clarification_declined",
+        }
+    }
+    ctx.setdefault("data", {})["pending_product_clarification"] = {
+        "understanding": safe_understanding,
+        "question": question,
+        "slot": slot,
+    }
+    ctx["awaiting"] = "product_clarification"
+
+
+def _clear_product_clarification(ctx: Optional[dict]) -> None:
+    if not isinstance(ctx, dict):
+        return
+    ctx.setdefault("data", {}).pop("pending_product_clarification", None)
+    if ctx.get("awaiting") == "product_clarification":
+        ctx["awaiting"] = None
+
+
+def _clarification_reply(understanding: dict, original_msg: str, reply_lang: str) -> str:
+    import html
+
+    question = (understanding.get("clarification_question") or "").strip()
+    if not question:
+        question = (
+            _localized_sysmsg(
+                "product_search_clarify",
+                original_msg,
+                reply_lang=reply_lang,
+            )
+            or "Which model or option should I match it with?"
+        )
+    return f"<div>{html.escape(question)}</div>"
+
+
+def _can_reuse_shopping_memory_without_llm(
+    understanding: dict,
+    ai_route: dict,
+    ctx: Optional[dict],
+    *,
+    original_msg: str = "",
+    msg_en: str = "",
+) -> bool:
+    """Thin semantic filter follow-ups can reuse cached entities with zero extra LLM."""
+    if not isinstance(ctx, dict):
+        return False
+    last = dict((ctx.get("data") or {}).get("last_os_spec") or {})
+    if not (last.get("title_query") or last.get("category_id")):
+        return False
+    filter_keys = (
+        "color",
+        "size",
+        "brand",
+        "max_price",
+        "min_price",
+        "rating_min",
+        "rating_max",
+        "sort",
+        "in_stock_only",
+    )
+    if not any(understanding.get(k) not in (None, "", [], {}) for k in filter_keys):
+        return False
+    current_title = (understanding.get("search_terms") or "").strip().lower()
+    last_title = (last.get("title_query") or "").strip().lower()
+    if current_title and last_title:
+        try:
+            from services.opensearch_products import strip_price_tokens_from_title
+
+            current_without_budget = (
+                strip_price_tokens_from_title(current_title) or current_title
+            ).strip().lower()
+            if current_without_budget == last_title:
+                return True
+        except ImportError:
+            pass
+    if ai_route.get("continue_previous_topic"):
+        return not current_title or current_title == last_title
+    # Brain occasionally misses continue_previous_topic for a pure structural
+    # filter ("under 250", "XL", colour-only). Reuse memory only when no new
+    # product/category was extracted; explicit new products still start fresh.
+    product_type = (understanding.get("product_type") or "").strip()
+    has_new_product = bool(
+        product_type
+        or understanding.get("category_only_browse")
+        or (understanding.get("category_browse") or "").strip()
+    )
+    if product_type:
+        try:
+            from services.catalog_spec_semantics import catalog_title_unusable
+
+            if catalog_title_unusable(
+                product_type,
+                understanding=understanding,
+                ai_route=ai_route,
+            ):
+                has_new_product = False
+        except ImportError:
+            pass
+    if has_new_product:
+        return False
+    if not current_title:
+        return True
+    try:
+        from services.catalog_spec_semantics import catalog_title_unusable
+
+        return catalog_title_unusable(
+            current_title,
+            understanding=understanding,
+            ai_route=ai_route,
+        )
+    except ImportError:
+        return False
+
+
+def _run_authoritative_brain_catalog_search(
+    original_msg: str,
+    msg_en: str,
+    *,
+    ctx: Optional[dict],
+    reply_lang: str,
+    understanding: dict,
+    ai_route: dict,
+    conversation_context: str = "",
+) -> ProductFlowResult:
+    """Brain intent + fast slot-filler → full catalog spec → OpenSearch → filtered rail.
+
+    Brain owns intent; a bounded fast entity extractor fills the product name and
+    EVERY filter (colour, size, price, rating, brand, product_type, mandatory/
+    exclude tokens, category browse) in any language/style. Those entities map into
+    OpenSearch and are enforced on the hits — no keyword lists, no heavy legacy graph.
+    """
+    from services.kb_service import sysmsg
+    from services.opensearch_products import (
+        build_product_rail_with_pagination,
+        catalog_search_live,
+        product_search_show_view_more,
+    )
+    from services.product_filter_pipeline import (
+        apply_catalog_result_filters,
+        build_catalog_spec_for_product_turn,
+    )
+    from services.product_query_understanding import (
+        spec_uses_strict_filter_not_found,
+    )
+
+    pending, pending_context = _shopping_clarification_context(ctx)
+    pending_base: dict = {}
+    if pending:
+        pending_base = dict(pending.get("understanding") or {})
+        base = dict(pending_base)
+        for key, value in dict(understanding or {}).items():
+            if value not in (None, "", [], {}):
+                base[key] = value
+        understanding = base
+    slot_context = conversation_context
+    if pending_context:
+        slot_context = f"{slot_context}\n\n{pending_context}".strip()
+    elif isinstance(ctx, dict):
+        last_spec = dict((ctx.get("data") or {}).get("last_os_spec") or {})
+        if last_spec:
+            memory_view = {
+                k: last_spec.get(k)
+                for k in (
+                    "title_query",
+                    "brand",
+                    "color",
+                    "size",
+                    "purchase_price_min",
+                    "purchase_price_max",
+                    "rating_min",
+                    "rating_max",
+                    "product_type",
+                    "compatibility",
+                    "audience_tokens",
+                    "material_tokens",
+                    "occasion_tokens",
+                    "feature_tokens",
+                    "quantity",
+                    "sort",
+                    "in_stock_only",
+                )
+                if last_spec.get(k) not in (None, "", [], {})
+            }
+            if memory_view:
+                memory_note = (
+                    "CACHED SHOPPING STATE (reuse only for a true follow-up; latest "
+                    "message wins and a new product starts a new search):\n"
+                    f"{json.dumps(memory_view, ensure_ascii=False, separators=(',', ':'))}"
+                )
+                slot_context = f"{slot_context}\n\n{memory_note}".strip()
+
+    reuse_memory = not pending and _can_reuse_shopping_memory_without_llm(
+        understanding,
+        ai_route,
+        ctx,
+        original_msg=original_msg,
+        msg_en=msg_en,
+    )
+    if reuse_memory:
+        from services.product_filter_pipeline import merge_session_product_understanding
+
+        understanding = merge_session_product_understanding(
+            understanding,
+            original_msg=original_msg,
+            msg_en=msg_en,
+            ctx=ctx,
+            ai_route=ai_route,
+            force=True,
+        )
+        understanding["_product_nlu_from_ai"] = True
+        log_reasoning(
+            "Shopping memory: thin semantic filter follow-up reused cached entities; "
+            "product slot-filler skipped."
+        )
+    else:
+        understanding = _slot_fill_product_entities(
+            original_msg,
+            msg_en,
+            slot_context,
+            reply_lang,
+            understanding,
+        )
+    if pending:
+        # One answer/refusal completes this clarification turn. The extractor was
+        # explicitly told to merge and search, so never loop on the same question.
+        if (pending.get("slot") or "").strip() == "compatibility":
+            base_title = (pending_base.get("search_terms") or "").strip()
+            base_type = (pending_base.get("product_type") or "").strip()
+            base_compat = (pending_base.get("compatibility") or "").strip().lower()
+            new_compat = (understanding.get("compatibility") or "").strip()
+            specific_compat = bool(
+                new_compat
+                and new_compat.lower() != base_compat
+                and (
+                    re.search(r"\d", new_compat)
+                    or len(re.findall(r"[a-z0-9]+", new_compat.lower())) >= 2
+                )
+            )
+            if not specific_compat and re.search(r"\d", original_msg or msg_en):
+                # In an explicit pending compatibility slot, a short model answer
+                # such as "15 Pro" is itself structured state, not a fresh search.
+                new_compat = (msg_en or original_msg).strip()
+                specific_compat = True
+            if specific_compat:
+                understanding["compatibility"] = new_compat
+                if base_type:
+                    understanding["search_terms"] = f"{new_compat} {base_type}".strip()
+                elif base_title:
+                    understanding["search_terms"] = f"{new_compat} {base_title}".strip()
+            else:
+                # No concrete compatibility arrived: this is a no-preference/
+                # random-choice response. Search the original product family and
+                # never reinterpret it as a new "Random Product" query.
+                if base_title:
+                    understanding["search_terms"] = base_title
+                if pending_base.get("product_type"):
+                    understanding["product_type"] = pending_base["product_type"]
+                if pending_base.get("brand"):
+                    understanding["brand"] = pending_base["brand"]
+                understanding["clarification_declined"] = True
+        understanding["clarification_required"] = False
+        understanding["action"] = "search_products"
+        _clear_product_clarification(ctx)
+    else:
+        try:
+            confidence = float(understanding.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        needs_clarification = bool(
+            understanding.get("clarification_required")
+            or (understanding.get("action") or "").strip().lower() == "clarify"
+        )
+        declined = bool(understanding.get("clarification_declined"))
+        question = (understanding.get("clarification_question") or "").strip()
+        if needs_clarification and not declined and question:
+            slot = (understanding.get("clarification_slot") or "").strip()
+            _store_product_clarification(
+                ctx,
+                understanding,
+                question=question,
+                slot=slot,
+            )
+            log_reasoning(
+                f"Shopping clarification: slot={slot or '-'} confidence={confidence:.2f}; "
+                "skip OpenSearch until one answer."
+            )
+            return ProductFlowResult(
+                handled=True,
+                reply_html=_clarification_reply(understanding, original_msg, reply_lang),
+                intent="product",
+            )
+
+    title = (
+        understanding.get("search_terms")
+        or understanding.get("product_name")
+        or ai_route.get("search_query")
+        or ""
+    )
+    title = str(title).strip()
+
+    local_ctx = ctx if ctx is not None else {}
+    spec, _nlu = build_catalog_spec_for_product_turn(
+        original_msg,
+        msg_en,
+        reply_lang=reply_lang,
+        ctx=local_ctx,
+        ai_route=ai_route,
+        locked_understanding=understanding,
+        brain_search_query=title,
+        allow_product_nlu_llm=False,
+    )
+    spec["_ai_single_pass"] = True
+    spec["_product_nlu_from_ai"] = True
+    # Named product + filters must search by title, not a guessed department id.
+    # Small models sometimes emit category_browse=fashion for "bnaiyan under 500",
+    # which wipes title_query and dumps Men-Fashion noise (socks/sunglasses).
+    ai_title = (
+        (understanding.get("search_terms") or "").strip()
+        or (understanding.get("product_name") or "").strip()
+        or title
+    )
+    try:
+        from services.opensearch_products import strip_price_tokens_from_title
+
+        if ai_title:
+            ai_title = strip_price_tokens_from_title(ai_title) or ai_title
+    except ImportError:
+        pass
+    explicit_cat_only = bool(understanding.get("category_only_browse"))
+    if ai_title and not explicit_cat_only:
+        if not (spec.get("title_query") or "").strip():
+            spec["title_query"] = ai_title
+        spec.pop("category_id", None)
+        spec.pop("_category_only_browse", None)
+
+    products, spec, _total, has_more = catalog_search_live(
+        spec,
+        original_msg=original_msg,
+        msg_en=msg_en,
+        page=1,
+        ctx=local_ctx,
+    )
+    # Enforce the Brain-extracted filters on the returned hits (color/size/price/
+    # rating/brand/product_type). OpenSearch narrows; these guarantee the cards
+    # actually satisfy what the user asked for.
+    products = apply_catalog_result_filters(products, spec)
+    display_title = (spec.get("title_query") or title or "").strip() or title
+    log_reasoning(
+        "Product authoritative OpenSearch: "
+        f"title={display_title!r} color={spec.get('color')!r} "
+        f"size={spec.get('size')!r} price_max={spec.get('purchase_price_max')!r} "
+        f"price_min={spec.get('purchase_price_min')!r} results={len(products)}."
+    )
+    if not products:
+        suggestions = understanding.get("recommendation_suggestions") or []
+        if isinstance(suggestions, str):
+            suggestions = [suggestions]
+        suggestions = [
+            str(item).strip()
+            for item in suggestions
+            if item and str(item).strip()
+        ][:4]
+        if suggestions:
+            import html
+
+            items = ", ".join(f"<b>{html.escape(item)}</b>" for item in suggestions)
+            intro = (
+                "I couldn't find one exact match, but these are good options for "
+                f"what you described: {items}. Which one should I show?"
+            )
+            if (reply_lang or "").lower() == "hinglish":
+                intro = (
+                    "Exact match nahi mila, lekin aapke use ke liye ye options achhe "
+                    f"rahenge: {items}. Kaunsa dikhaun?"
+                )
+            elif (reply_lang or "").lower() not in ("", "en"):
+                intro = localize_for_customer(
+                    re.sub(r"<[^>]+>", "", intro),
+                    reply_lang,
+                )
+            return ProductFlowResult(
+                handled=True,
+                reply_html=f"<div>{intro}</div>",
+                intent="product",
+                os_spec=spec,
+            )
+        if spec_uses_strict_filter_not_found(spec):
+            body = _localized_sysmsg(
+                "products_filtered_not_found",
+                original_msg,
+                reply_lang=reply_lang,
+                query=display_title,
+            ) or sysmsg("product_not_found", query=display_title)
+        else:
+            body = _localized_sysmsg(
+                "product_not_found",
+                original_msg,
+                reply_lang=reply_lang,
+                query=display_title,
+            ) or sysmsg("product_not_found", query=display_title)
+        return ProductFlowResult(
+            handled=True, reply_html=body, intent="product", os_spec=spec
+        )
+
+    body = sysmsg("products_title_query", query=display_title)
+    body += build_product_rail_with_pagination(
+        products,
+        sysmsg,
+        has_more=product_search_show_view_more(products, has_more),
+        next_page=2,
+        browse_more_url="",
+    )
+    return ProductFlowResult(
+        handled=True, reply_html=body, intent="product", os_spec=spec
+    )
 
 
 def _run_locked_catalog_search_fast(
@@ -2348,6 +3009,71 @@ def run_product_search_ai_flow(
     ai_route: Optional[dict] = None,
 ) -> ProductFlowResult:
     comb = f"{original_msg} {msg_en}"
+
+    # Universal Brain already owns intent and entities. Execute its catalog spec
+    # immediately; do not run legacy SKU/pro-id/session-merge detectors first
+    # (those semantic graphs added 8–30s before the actual OpenSearch request).
+    if isinstance(ai_route, dict) and ai_route.get("_product_catalog_locked"):
+        route_intent = (ai_route.get("intent") or "").strip().lower()
+        route_channel = (ai_route.get("data_channel") or "").strip().lower()
+        if route_intent in ("product", "product_search") and route_channel == "catalog":
+            route_entities = (
+                ai_route.get("_product_entities")
+                or ai_route.get("product_entities")
+                or ai_route.get("entities")
+                or {}
+            )
+            if not isinstance(route_entities, dict):
+                route_entities = {}
+            route_sq = (ai_route.get("search_query") or "").strip()
+            # Map Brain entities through the standard resolver so colour/size/
+            # price land in the right fields. Never stamp a noisy Brain
+            # search_query (e.g. "XXL size t shirts") over product_name —
+            # that is what used to erase the size filter.
+            try:
+                from services.product_catalog_resolver import entities_to_understanding
+
+                locked_u = (
+                    entities_to_understanding(
+                        route_entities,
+                        search_query="",
+                        original_msg=original_msg or msg_en,
+                    )
+                    or {}
+                )
+            except ImportError:
+                locked_u = dict(route_entities)
+            if not (locked_u.get("search_terms") or "").strip():
+                pname = (route_entities.get("product_name") or "").strip()
+                if pname:
+                    locked_u["search_terms"] = pname
+                elif route_sq:
+                    locked_u["search_terms"] = route_sq
+            # Brain routes the intent; a dedicated fast slot-filler extracts the
+            # product name + every filter (see _run_authoritative_brain_catalog_search).
+            # Do NOT stamp _product_nlu_from_ai here — Brain's inline entities are a
+            # fallback only, not authoritative slot-filled filters.
+            locked_u.update(
+                {
+                    "action": "search_products",
+                    "is_shopping": True,
+                    "_ai_first": True,
+                }
+            )
+            ai_route.setdefault("_ai_single_pass", True)
+            log_reasoning(
+                "Product authoritative fast path — Brain intent + fast entity slot-filler."
+            )
+            return _run_authoritative_brain_catalog_search(
+                original_msg,
+                msg_en,
+                ctx=ctx,
+                reply_lang=reply_lang,
+                understanding=locked_u,
+                ai_route=ai_route,
+                conversation_context=conversation_context,
+            )
+
     from utils.helpers import extract_product_id
 
     # Fast pro_id / SKU — skip brain-locked stack when message has explicit catalog id.

@@ -40,6 +40,17 @@ _DEFAULT_ORDER = ("groq", "openai", "gemini", "deepseek")
 _PROVIDER_COOLDOWN_UNTIL: dict[str, float] = {}
 _PROVIDER_TPD_COOLDOWN_SEC = float(os.getenv("LLM_PROVIDER_TPD_COOLDOWN_SEC") or "180")
 
+# Dead / unreachable providers (bad key, no network, stuck TLS) time out on EVERY
+# call. Without a cooldown, each turn pays the full per-provider hard timeout for
+# every dead provider before reaching the one that works (this was the 34–77s
+# product-search "traffic" timeout). Track consecutive transport failures and put
+# the provider on a short cooldown so the rest of the session skips it.
+_PROVIDER_FAIL_STREAK: dict[str, int] = {}
+_PROVIDER_UNREACHABLE_STREAK = int(os.getenv("LLM_PROVIDER_UNREACHABLE_STREAK") or "2")
+_PROVIDER_UNREACHABLE_COOLDOWN_SEC = float(
+    os.getenv("LLM_PROVIDER_UNREACHABLE_COOLDOWN_SEC") or "120"
+)
+
 
 def _mark_provider_cooldown(provider_name: str, *, seconds: float | None = None) -> None:
     name = (provider_name or "").strip().lower()
@@ -51,6 +62,40 @@ def _mark_provider_cooldown(provider_name: str, *, seconds: float | None = None)
     if until > prev:
         _PROVIDER_COOLDOWN_UNTIL[name] = until
         log_reasoning(f"LLM provider {name} cooldown {wait:.0f}s (rate/TPD).")
+
+
+def _note_provider_transport_failure(provider_name: str, *, hard_timeout: bool = False) -> None:
+    """
+    Timeout / network / stuck-TLS failure — cooldown so later calls skip a dead provider.
+
+    hard_timeout=True (provider did not respond within the wall-clock budget) is a
+    strong "stuck / unreachable" signal → cooldown immediately (one 20s stall is
+    already too slow for a shopping assistant). Fast network errors use a short
+    streak so a single blip does not disable a healthy provider.
+    """
+    name = (provider_name or "").strip().lower()
+    if not name:
+        return
+    streak = int(_PROVIDER_FAIL_STREAK.get(name) or 0) + 1
+    _PROVIDER_FAIL_STREAK[name] = streak
+    if hard_timeout or streak >= _PROVIDER_UNREACHABLE_STREAK:
+        _PROVIDER_FAIL_STREAK[name] = 0
+        wait = _PROVIDER_UNREACHABLE_COOLDOWN_SEC
+        until = time.monotonic() + max(15.0, wait)
+        prev = float(_PROVIDER_COOLDOWN_UNTIL.get(name) or 0.0)
+        if until > prev:
+            _PROVIDER_COOLDOWN_UNTIL[name] = until
+        reason = "stuck timeout" if hard_timeout else f"unreachable x{streak}"
+        log_reasoning(
+            f"LLM provider {name} {reason} — cooldown {wait:.0f}s "
+            "(skip on next calls this session)."
+        )
+
+
+def _note_provider_success(provider_name: str) -> None:
+    name = (provider_name or "").strip().lower()
+    if name:
+        _PROVIDER_FAIL_STREAK.pop(name, None)
 
 
 def _provider_on_cooldown(provider_name: str) -> bool:
@@ -251,6 +296,31 @@ def get_fast_chitchat_provider_chain(*, max_providers: int = 1) -> list[dict[str
     return ordered[:cap]
 
 
+def get_fast_structured_provider_chain(*, max_providers: int = 1) -> list[dict[str, Any]]:
+    """
+    Low-latency JSON extraction chain for routing/product entities.
+
+    Prefer the configured fast provider (Groq Instant by default) even when the
+    Admin UI pins a slower general-answer model. Structured routing is on the
+    request critical path and must have a small, deterministic wall-clock budget.
+    """
+    chain = get_llm_provider_chain()
+    if not chain:
+        return []
+    prefer = (
+        os.getenv("FAST_STRUCTURED_AI_PREFER_PROVIDER") or "groq"
+    ).strip().lower()
+    preferred = [
+        p for p in chain if (p.get("name") or "").strip().lower() == prefer
+    ]
+    rest = [
+        p for p in chain if (p.get("name") or "").strip().lower() != prefer
+    ]
+    ordered = preferred + rest if preferred else list(chain)
+    cap = max(1, min(2, int(max_providers or 1)))
+    return filter_providers_not_on_cooldown(ordered)[:cap]
+
+
 def provider_chain_label(chain: list[dict[str, Any]] | None = None) -> str:
     """Human-readable chain for logs, e.g. groq→openai→gemini→deepseek."""
     specs = chain if chain is not None else get_standard_fallback_chain()
@@ -375,6 +445,7 @@ def llm_json_with_retry(
                 except concurrent.futures.TimeoutError:
                     timed_out = True
                     set_last_llm_failure("timeout")
+                    _note_provider_transport_failure(provider_name, hard_timeout=True)
                     log_reasoning(
                         f"{provider_name} hard timeout ({read_to}s) — next provider."
                     )
@@ -398,7 +469,9 @@ def llm_json_with_retry(
                     from services.ai_route_semantics import strip_markdown_json_fence
 
                     content = strip_markdown_json_fence(content)
-                    return json.loads(content)
+                    parsed = json.loads(content)
+                    _note_provider_success(provider_name)
+                    return parsed
                 except Exception:
                     req["max_tokens"] = max(120, int(req.get("max_tokens", 300) * 0.7))
                     time.sleep(0.5)
@@ -450,10 +523,12 @@ def llm_json_with_retry(
             return None
         except requests.exceptions.Timeout:
             set_last_llm_failure("timeout")
+            _note_provider_transport_failure(provider_name, hard_timeout=True)
             log_reasoning(f"{provider_name} request timeout ({timeout_sec}s) — next provider.")
             return None
         except requests.exceptions.RequestException as e:
             set_last_llm_failure("timeout")
+            _note_provider_transport_failure(provider_name)
             log_reasoning(f"{provider_name} network error: {e}")
             return None
         except Exception as e:

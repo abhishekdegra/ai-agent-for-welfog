@@ -305,7 +305,8 @@ CORE RULES (latest message only; follow ROUTING PLAYBOOK for details):
 - Personal life, marriage, dating, jokes, homework, sports scores, weather, travel plans, hangouts, other apps/companies, general advice unrelated to buying on Welfog — ANY language/script/slang → intent=out_of_domain, is_welfog_related=false, data_channel=none, conversation_scope=out_of_domain, run_catalog_search=false, search_query="", product_entities empty, AND scope_reply=1-2 short sentences acknowledging THEIR topic then redirecting to Welfog shopping/orders/delivery (never answer the off-topic ask). UNLESS the user is asking about Welfog platform rules/policies that appear in the Admin knowledge catalog (e.g. allowed/prohibited content on Welfog Reels/shorts). Catalog-covered platform policy questions → data_channel=kb, conversation_scope=welfog_support, is_welfog_related=true. user_meaning = one clear English sentence (never echo customer text verbatim). NEVER channel=kb without real kb_keys when catalog keys exist; empty kb_keys is OK when unsure — retrieval will pick semantically.
 - CRITICAL — do NOT misroute personal/leisure as product search: invitations to go somewhere, travel, nature trips, hanging out, "can you come with me…", medical/home/life advice with no Welfog purchase ask → out_of_domain (never fill search_query with the full sentence, never intent=product).
 - Self-harm / suicide distress → conversation_scope=harm_sensitive, intent=out_of_domain or general, data_channel=none, run_catalog_search=false, scope_reply=empathetic safety in their language (helplines), NEVER product/catalog/KB.
-- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") (ANY language) → conversation_scope=general_chitchat, scope_reply=1-2 sentences mirroring the user's EXACT language/script/slang (Hinglish stays Hinglish — never stiff English stock greeting) THEN soft invite how you can help with Welfog shopping/orders/delivery/returns; you are Welfog support, not inventing personal meetups, run_catalog_search=false. NEVER product search for words like free/busy when user talks to the bot.
+- Greeting / thanks / bye / "how are you" / "what are you doing" / "are you free busy" / casual openers ("sun na", "bhai sun", "yaar") / playful affection or banter ("love you", "bolo love you pehle", "pehli love you bol fir shopping") (ANY language) → conversation_scope=general_chitchat OR out_of_domain when it is a personal demand, scope_reply=1-2 sentences mirroring the user's EXACT language/script/slang (Hinglish stays Hinglish — never stiff English stock greeting) THEN soft invite how you can help with Welfog shopping/orders/delivery/returns; you are Welfog support, not inventing personal meetups, run_catalog_search=false. NEVER product search / NEVER welfog_support just because the word "shopping" appears in banter. NEVER product search for words like free/busy when user talks to the bot.
+- Unclear / gibberish / no actionable ask (AI cannot tell product vs order vs FAQ) → conversation_scope=general_chitchat, data_channel=none, run_catalog_search=false, scope_reply=1-2 short sentences in their language asking them to simplify: what they want (product search, order/refund with Order ID, or Welfog help) — never invent a product search or KB answer.
 - General delivery timeline (any language/phrasing) → data_channel=kb, kb_keys from catalog (whichever file describes delivery/shipping) — NOT pincode_check unless they ask if Welfog delivers to a specific PIN/city.
 - Who is THIS bot → meta_kind=assistant_intro. What is Welfog company / owner / customer care → kb company/support (NOT assistant_intro, NOT product catalog).
 - MIXED messages (hello/bhai/bro/darling/yaar/thanks/jokes PLUS a real request): classify by the REAL goal — ecommerce action beats Welfog KB beats casual chitchat. Ignore conversational filler when shopping/order/KB/support intent is present.
@@ -352,6 +353,12 @@ Return JSON only."""
             providers = filter_providers_not_on_cooldown(providers)
         except ImportError:
             pass
+        # Keep routing under chat deadline: at most 2 providers (≈16s worst case).
+        if len(providers) > 2:
+            # Prefer fast Groq when present, then first remaining cloud provider.
+            groq = [p for p in providers if (p.get("name") or "").lower() == "groq"]
+            rest = [p for p in providers if (p.get("name") or "").lower() != "groq"]
+            providers = (groq[:1] + rest)[:2]
         out = _llm_json_with_provider_fallback(
             providers,
             messages,
@@ -395,8 +402,19 @@ Return JSON only."""
                     repair_brain_json_quality,
                 )
 
-                out = _normalize_llm_route(out)
-                out = repair_brain_json_quality(out, user_msg, msg_en=msg_en)
+                raw_intent = (out.get("intent") or "").strip().lower()
+                if raw_intent in ("product", "product_search"):
+                    # The routing LLM already returned product entities/search
+                    # terms. Generic repair can traverse translation, order,
+                    # support and KB helpers, adding ~8–45s before OpenSearch.
+                    out = dict(out)
+                    out["intent"] = "product"
+                    out["data_channel"] = "catalog"
+                    out["run_catalog_search"] = True
+                    out["needs_order_id"] = False
+                else:
+                    out = _normalize_llm_route(out)
+                    out = repair_brain_json_quality(out, user_msg, msg_en=msg_en)
                 um = (out.get("user_meaning") or "").strip()
                 log_reasoning(
                     um

@@ -2,6 +2,7 @@ import json
 import os
 import re
 import hashlib
+import threading
 from pathlib import Path
 from secrets import token_hex
 
@@ -19,26 +20,107 @@ ensure_dotenv_loaded()
 # Not a secret — UTF8 collation name only (override via MYSQL_COLLATION in .env).
 MYSQL_COLLATION = (os.getenv("MYSQL_COLLATION") or "utf8mb4_unicode_ci").strip()
 
+# Process-wide pool — Windows/XAMPP exhausts ephemeral ports (WinError 10048) when every
+# chat/KB call opens a fresh TCP connect. Reuse connections instead.
+_POOL_LOCK = threading.Lock()
+_POOL: list = []
+try:
+    _POOL_SIZE = max(2, min(32, int(os.getenv("MYSQL_POOL_SIZE") or "8")))
+except ValueError:
+    _POOL_SIZE = 8
+_POOL_CREATED = 0
+
 
 def sql_collate(expr: str) -> str:
     """Wrap a SQL expression so string comparisons use MYSQL_COLLATION."""
     return f"{expr} COLLATE {MYSQL_COLLATION}"
 
 
+class _PooledMySQLConnection:
+    """Thin wrapper — close() returns the live connection to the pool."""
+
+    __slots__ = ("_conn", "_closed")
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._closed = False
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        conn = self._conn
+        self._conn = None
+        if conn is None:
+            return
+        global _POOL_CREATED
+        try:
+            conn.rollback()
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            with _POOL_LOCK:
+                _POOL_CREATED = max(0, _POOL_CREATED - 1)
+            return
+        with _POOL_LOCK:
+            if len(_POOL) < _POOL_SIZE:
+                _POOL.append(conn)
+                return
+        try:
+            conn.close()
+        except Exception:
+            pass
+        with _POOL_LOCK:
+            _POOL_CREATED = max(0, _POOL_CREATED - 1)
+
+    def __getattr__(self, name):
+        if self._closed or self._conn is None:
+            raise pymysql.err.Error("MySQL connection already closed")
+        return getattr(self._conn, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 def get_mysql_connection():
     """
     Public chat history MySQL — credentials only from support/.env
     (MYSQL_HOST, MYSQL_PORT, MYSQL_USER, MYSQL_PASSWORD, MYSQL_DATABASE).
+    Connections are pooled to avoid Windows WinError 10048 under chat load.
     """
+    global _POOL_CREATED
     try:
         kwargs = mysql_connect_kwargs(with_database=True)
         if not kwargs:
             return None
-        return pymysql.connect(
+
+        with _POOL_LOCK:
+            while _POOL:
+                conn = _POOL.pop()
+                try:
+                    conn.ping(reconnect=False)
+                    return _PooledMySQLConnection(conn)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    _POOL_CREATED = max(0, _POOL_CREATED - 1)
+
+        conn = pymysql.connect(
             **kwargs,
             cursorclass=pymysql.cursors.DictCursor,
             autocommit=False,
         )
+        with _POOL_LOCK:
+            _POOL_CREATED += 1
+        return _PooledMySQLConnection(conn)
     except Exception as e:
         # Avoid emoji in logs (Windows console encoding can crash on unicode)
         print(f"MySQL Connection Error: {e}")
